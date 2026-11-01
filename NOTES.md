@@ -1,5 +1,9 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+> **Second target in progress (2026-11-01): Galaxy A8 2018 (`jackpotlte`, Exynos 7885).** Everything about it is in
+> `docs/HANDOFF_JACKPOTLTE.md` (state, rules, next steps) and `docs/PORTING_JACKPOTLTE.md` (verified hardware facts).
+> The sweet notes below are unchanged.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

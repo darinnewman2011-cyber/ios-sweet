@@ -1,9 +1,16 @@
 #pragma once
 #include <stdint.h>
 
+/* sweet defaults; other devices override with -DFB_BASE=... -DFB_H=... (shim/a8/build.sh) */
+#ifndef FB_BASE
 #define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
+#endif
+#ifndef FB_W
 #define FB_W		1080
+#endif
+#ifndef FB_H
 #define FB_H		2400
+#endif
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
 
 #define RED	0xffff0000U

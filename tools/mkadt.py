@@ -41,6 +41,35 @@ QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
+# --device jackpotlte: Samsung Galaxy A8 (2018), SM-A530F, Exynos 7885.
+# Source of the facts below: mainline Linux exynos7885.dtsi and
+# exynos7885-jackpotlte.dts. Anything marked UNVERIFIED has to be checked
+# against the phone's own live FDT before a boot attempt
+# (see docs/PORTING_JACKPOTLTE.md).
+# GIC-400 is a GICv2 (distributor + CPU interface), NOT the GICv3 of sweet.
+JP_GIC = [(0x12301000, 0x1000),   # GICD
+          (0x12302000, 0x1000),   # GICC (Samsung's DTB; mainline says 0x2000)
+          (0x12304000, 0x2000),   # GICH
+          (0x12306000, 0x2000)]   # GICV
+JP_TIMEBASE = 26000000            # oscclk; the arch timer runs from it
+JP_VTIMER_INTID = 27              # <GIC_PPI 11 ...> -> 16 + 11
+# DRAM on the 4 GB unit: 0x80000000 (0x3da00000), 0xc0000000 (1 GiB), 0x8_80000000
+# (2 GiB). The boot.img DTB lists only 1 GiB in the upper bank; S-Boot extends it on
+# 4 GB units (mainline agrees: 2 GiB). XNU wants one contiguous range, so the upper
+# bank is used; it has no reserved-memory carve-outs in any revision.
+# Verify against the live FDT and pass --mem-size if it differs.
+JP_PHYS_BASE, JP_MEM_SIZE = 0x880000000, 0x80000000
+# Internal storage is eMMC 5.1 (DW-MSHC), not UFS.
+JP_MMC, JP_MMC_SIZE = 0x13500000, 0x2000
+# Cores as (MPIDR, compatible, Hz), boot core first. UNVERIFIED: which core
+# S-Boot/EL3 enters the payload on (assumed the first little core).
+JP_CORES = ([(m, 'arm,cortex-a53', 1600000000) for m in (0x100, 0x101, 0x102, 0x103, 0x200, 0x201)] +
+            [(m, 'arm,cortex-a73', 2200000000) for m in (0x0, 0x1)])
+# Panel s6e3fa7_fhd: 1080x2220, DSI command mode (decon psr_mode=2, HW TE trigger).
+# S-Boot hands over a framebuffer at 0xEC000000 (0x1400000 bytes), same in all revisions.
+JP_FB_W, JP_FB_H = 1080, 2220
+JP_FB_PHYS = 0xEC000000
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -74,13 +103,22 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=None):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    device='jackpotlte': Galaxy A8 (2018) / Exynos 7885 (GICv2, eMMC, 26 MHz timer).
+    fb=(phys, width, height) overrides the framebuffer ABL/S-Boot leaves (required for jackpotlte)."""
+    jp = device == 'jackpotlte'
+    if jp and qemu:
+        raise SystemExit('--device jackpotlte has no QEMU variant')
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if jp:
+        phys_base, mem_size = JP_PHYS_BASE, (mem or JP_MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    if jp:
+        timebase = JP_TIMEBASE
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -134,12 +172,16 @@ def build(seed=None, qemu=False, highmem=False):
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core in range(len(JP_CORES) if jp else (1 if qemu else 8)):
+        if jp:
+            mpidr, cpu_compat, cpu_hz = JP_CORES[core]
+        else:
+            mpidr, cpu_compat, cpu_hz = core << 8, 'qcom,kryo470', (2304000000 if core >= 6 else 1804800000)
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', cstr(cpu_compat) + cstr('ARM,v8')),
+            ('reg', u32(mpidr)),  # actual MPIDR Aff2:Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -149,7 +191,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(cpu_hz)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -158,13 +200,24 @@ def build(seed=None, qemu=False, highmem=False):
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
-    gic = node('gic', [
-        ph(),
-        ('compatible', cstr('arm,gic-v3')),
-        ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
-    ])
+    if jp:
+        # GICv2: reg = GICD, GICC, GICH, GICV. The kernel needs a GICv2
+        # driver for this (sweet's is GICv3 system-register based).
+        gic = node('gic', [
+            ph(),
+            ('compatible', cstr('arm,gic-400')),
+            ('interrupt-controller', b''),
+            ('virtual-timer-intid', u32(JP_VTIMER_INTID)),
+            ('reg', u64(*[v for base, size in JP_GIC for v in (base - SOC_BASE, size)])),
+        ])
+    else:
+        gic = node('gic', [
+            ph(),
+            ('compatible', cstr('arm,gic-v3')),
+            ('interrupt-controller', b''),
+            ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+            ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
+        ])
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
@@ -189,12 +242,18 @@ def build(seed=None, qemu=False, highmem=False):
             ('canvas-height', u32(2436)),
         ])])
 
+    if jp:
+        fb_phys, fb_w, fb_h = fb if fb else (JP_FB_PHYS, JP_FB_W, JP_FB_H)
+        fb_stride = fb_w * 4
+        fb_size = (fb_stride * fb_h + 0xfff) & ~0xfff
+    else:
+        fb_phys, fb_w, fb_h, fb_stride, fb_size = FB, FB_W, FB_H, FB_STRIDE, FB_SIZE
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(fb_phys, fb_size)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_stride)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -203,6 +262,14 @@ def build(seed=None, qemu=False, highmem=False):
         ('compatible', cstr('qcom,ufshc')),
         ('reg', u64(UFS, UFS_SIZE)),
     ])
+    if jp:
+        # Galaxy A8 (2018) has eMMC on the DW-MSHC controller; the kernel
+        # needs a new root-device driver (replaces bsd/dev/sweet_ufs.c).
+        ufs = node('sweet-mmc', [
+            ph(),
+            ('compatible', cstr('samsung,exynos7885-dw-mshc-smu')),
+            ('reg', u64(JP_MMC, JP_MMC_SIZE)),
+        ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -229,9 +296,15 @@ def build(seed=None, qemu=False, highmem=False):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    compat = cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')
+    if jp:
+        # 'xiaomi,sweet' is kept only so the existing SweetPlatformExpert
+        # matches during bring-up; rename it together with the kernel patch.
+        compat = (cstr('D22AP') + cstr('iPhone10,3') + cstr('samsung,jackpotlte') +
+                  cstr('samsung,exynos7885') + cstr('xiaomi,sweet') + cstr('AppleARM'))
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', compat),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -241,8 +314,27 @@ def build(seed=None, qemu=False, highmem=False):
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
 
 
+def _opt(name):
+    """Value of '--name VALUE' or '--name=VALUE' in argv, else None."""
+    for i, a in enumerate(sys.argv):
+        if a == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(name + '='):
+            return a.split('=', 1)[1]
+    return None
+
+
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    device = _opt('--device') or 'sweet'
+    if device not in ('sweet', 'jackpotlte'):
+        raise SystemExit(f'unknown --device {device!r} (sweet, jackpotlte)')
+    fb = None
+    if _opt('--fb'):   # --fb 0x9d000000[,1080x2220]
+        addr, _, dims = _opt('--fb').partition(',')
+        w, h = (int(x) for x in dims.split('x')) if dims else (JP_FB_W, JP_FB_H)
+        fb = (int(addr, 0), w, h)
+    mem = int(_opt('--mem-size'), 0) if _opt('--mem-size') else None
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, device=device, fb=fb, mem=mem)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
