@@ -10,6 +10,19 @@ in this repo is the reference; a Snapdragon S9 (SM-G9600) port exists in `PatoKu
 (Samsung command-mode AMOLED display fix = its patch 0095 + `sweetfb_hz=60`; boots by `dd` of the shim into `boot`
 from TWRP). Treat third-party forks as untrusted reading material; do not run their code unreviewed.
 
+## Update 2026-11-01 (Claude Code session on the user's PC)
+- **Observed:** the diagnostic image (SHA-256 `19d11df…0396e`) was `dd`'d to BOOT from TWRP; BOOT read back with the
+  same hash. On reboot the screen **kept showing the S-Boot splash** ("SAMSUNG Galaxy A8 / powered by android"); no
+  blue or red screen. **Guess:** the command-mode panel keeps its last frame (the splash) in panel RAM, so our
+  framebuffer writes never reach the glass without a DECON trigger. It could also mean S-Boot never jumped to us.
+- To tell the two apart, `diag.c` gained a proof-of-entry probe (`EXTRA_CFLAGS=-DA8_PROBE_RESET=4 shim/a8/build.sh`):
+  after drawing it waits 4 s, then writes PMU SWRESET (`0x11C80400` = 1, the mainline exynos7 syscon-reboot value,
+  unverified on this SoC). Reboot loop ⇒ the shim runs and the display trigger is the blocker. Splash that stays ⇒
+  S-Boot did not start us, or something before the reset hung. Not built yet: this PC has no aarch64 clang/lld.
+- **Verified:** `mkadt.py` sweet output is byte-identical to `45263be` (seed `\0`*64, highmem off and on);
+  `--device jackpotlte` builds (10200 bytes). Open question: every jackpotlte CPU node has `cluster-id` 0, although
+  the A53s sit in two clusters (`0x1xx`, `0x2xx`) and the A73s in a third.
+
 ## State at handoff
 - Done (not yet run on hardware): `tools/mkadt.py --device jackpotlte` (GICv2, 8 real MPIDRs, 26 MHz timer, 2 GiB
   upper DRAM bank, S-Boot framebuffer `0xEC000000` 1080×2220, `sweet-mmc` node); `shim/a8/` milestone-1

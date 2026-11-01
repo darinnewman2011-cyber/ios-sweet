@@ -4,7 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CFLAGS="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fno-pic -fno-stack-protector \
  -mgeneral-regs-only -mstrict-align -Wall -Wextra \
- -DFB_BASE=0xEC000000UL -DFB_H=2220"
+ -DFB_BASE=0xEC000000UL -DFB_H=2220 ${EXTRA_CFLAGS:-}"
+# Proof-of-entry probe (reboots after N seconds): EXTRA_CFLAGS=-DA8_PROBE_RESET=4 shim/a8/build.sh
 mkdir -p out
 clang $CFLAGS -c start.S -o out/start.o
 clang $CFLAGS -c diag.c -o out/diag.o

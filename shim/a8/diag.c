@@ -23,6 +23,30 @@ static uint32_t be32(uintptr_t a)
 	return __builtin_bswap32(*(volatile uint32_t *)a);
 }
 
+#ifdef A8_PROBE_RESET
+/*
+ * Proof-of-entry probe for a command-mode panel that keeps showing the S-Boot
+ * splash: wait a few seconds, then reset through the PMU. If the phone
+ * reboots by itself, S-Boot jumped to us. SWRESET (PMU 0x11C80000 + 0x400,
+ * bit 0) is the exynos7 syscon-reboot value from mainline; unverified here.
+ */
+#define PMU_SWRESET	0x11C80400UL
+
+static void probe_reset(void)
+{
+	uint64_t f = rsr("cntfrq_el0");
+	uint64_t t0 = rsr("cntvct_el0");
+
+	if (!f)
+		f = 26000000;
+	while (rsr("cntvct_el0") - t0 < A8_PROBE_RESET * f)
+		;
+	*(volatile uint32_t *)PMU_SWRESET = 1;
+	for (;;)
+		__asm__ volatile("wfe");
+}
+#endif
+
 static uint64_t smc(uint64_t fn)
 {
 	register uint64_t x0 __asm__("x0") = fn;
@@ -75,6 +99,10 @@ void a8_main(uintptr_t dtb)
 	con_hex("GICCCTL", mmio32(GICC_BASE + 0x000));
 	con_hex("GICCIID", mmio32(GICC_BASE + 0x0fc));
 	bars(FB_H - 160);
+#ifdef A8_PROBE_RESET
+	con_str("PROBE", "resetting via PMU");
+	probe_reset();
+#endif
 	con_str("PSCI", "calling smc...");
 	con_hex("PSCIVER", smc(0x84000000UL));	/* PSCI_VERSION; -1 means unsupported */
 	con_str("DONE", "halted. hold power+vol down");
