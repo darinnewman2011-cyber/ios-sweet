@@ -37,6 +37,15 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   running, idle, I80/command mode), HW_SW_TRIG_CONTROL `0x1290` (**MASK_DECON set**: why the splash stayed;
   TRIG_AUTO_MASK_EN set; bit 9 set, undocumented), SHADOW 0, DPP0 IDMA_IN_BASE_ADDR_Y `0xEC000000` (buffer 0; the
   copy into the second buffer in `fb_mirror()` is not needed for this S-Boot). PSCI_VERSION was not called (probe build).
+- **Observed — MILESTONE 2 PASSES (commit `138c504`, boot image `fe6d56aa…9a27`):** GICv2 interrupts and SMP work.
+  GICD_CTLR 0 → 1 (NS EnableGrp1). GICD_ISENABLER0 was `0x7EFF` (S-Boot left SGIs 0-7, 9-14 enabled), now
+  `0x08007EFF`. IPRIORITYR[27] reads back `0xA0`, GICC_PMR `0xF0`. **Virtual timer: 30 IRQs in 300 ms at a 10 ms
+  period, all INTID 27 (0x1B), none stray**; before unmasking, ISPENDR0 = `0x08000000` and CNTV_CTL = 5 (ISTATUS).
+  **Self-SGI 1: 1 IRQ**, ISPENDR0 `0x2` before unmask. **PSCI_VERSION = -1** (not supported: v0.1 firmware, use DT
+  IDs only). **CPU_ON (`0xC4000003`, x1 = MPIDR, x2 = entry, x3 = index) returns 0 for all seven** (0x101-0x103,
+  0x200, 0x201, 0x0, 0x1), and all seven ran `secondary_entry` (alive mask `0x3E3`, MPIDR-derived stacks) and
+  called CPU_OFF (`0x84000002`). Both A73s and the second A53 cluster come up without extra cluster power-up.
+  Step 2 is done; next is step 3 (DW-MSHC eMMC, read-only first).
 - **Verified:** `mkadt.py` sweet output is byte-identical to `45263be` (seed `\0`*64, highmem off and on);
   `--device jackpotlte` builds (10200 bytes). Open question: every jackpotlte CPU node has `cluster-id` 0, although
   the A53s sit in two clusters (`0x1xx`, `0x2xx`) and the A73s in a third.
@@ -92,7 +101,7 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 1. **DONE 2026-11-01** (see Update above; XNU's present path must do the same re-arm per frame). Original note: if black, build the DECON trigger / TE-paced present path. Reference: S9
    port patch 0095 and the 4.4 Samsung DECON driver (`decon_f`, `psr_mode=2`, `trig_mode=0`, TE pinctrl `0x139B0A38`).
    S-Boot leaves DSIM running ("PLL is stabled in bootloader") and the framebuffer holds two 1080×2220 32 bpp buffers.
-2. GICv2 in the shim: port `shim/shim.c`'s GICv3 timer IRQ self-test to GICD `0x12301000` / GICC `0x12302000`,
+2. **DONE 2026-11-01** (see Update above). Original note: GICv2 in the shim: port `shim/shim.c`'s GICv3 timer IRQ self-test to GICD `0x12301000` / GICC `0x12302000`,
    virtual-timer INTID 27 (PPI 11), 26 MHz. Then PSCI `cpu_on` (`0xc4000003`, `smc`, v0.1 IDs from DT) for the 7
    other cores with the MPIDR table in `mkadt.py` (`JP_CORES`).
 3. DW-MSHC eMMC driver (`0x13500000`, v270a, 64-bit IDMAC, HS400/enhanced strobe/CMDQ were enabled by Android;
