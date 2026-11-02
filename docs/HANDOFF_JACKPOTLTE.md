@@ -314,7 +314,15 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - **Run 41462686989 (commit 1868ab1): success**, ISA 0. Kernel `27aaf291…9386`, payload `823d77c7…537a`
     (reproduced locally with the same cmdline). **`a8-xnu8-boot.img` SHA-256
     `bce40ffcf1123e3688a6ca509792743a4a3fc6dfc811e0c312ffcb966d0ce696`**, flashed to BOOT, readback matched, `adb reboot`.
-    **Result: pending.**
+    **Observed (user photo, xnu8):** identical to xnu6/xnu7. The last line is `SWEET FB: AppleCLCD … presented as
+    1125x2436` (after `SWEET: platform expert registered`). No `bsd_init:` line, no 0092 heartbeat, no `SWEET UFS/MMC`
+    line. So the boot thread probably never reaches `bsd_init()`; the eMMC driver can't be judged yet. (Guess, not
+    verified: printing works, since the earlier lines and the progress meter keep updating.)
+  - **Diagnostic: 0094-jackpotlte-boot-thread-heartbeat.patch** (commit ef5328e): `kernel_bootstrap_thread` arms a 5 s
+    thread call right after `spllo()`, printing `SWEET A8: Ns stage '<last stage>' state … event 0x… hint …` for the
+    boot thread. Stages: initialize_screen done, commpage done, trust caches done, kext bootstrap removed,
+    machine_lockdown done, PE_lockdown_iokit returned, calling bsd_init. Symbolize the wait event with llvm-symbolizer
+    (kernel unslid). CI run 41466209363. **Result: pending.**
   - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
