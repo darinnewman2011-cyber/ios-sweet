@@ -352,7 +352,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     `arm,cortex-a53` / `arm,cortex-a73`. No CPU driver starts, so max_cpus is never set. That's also why xnu6–xnu8
     stopped after `SWEET FB`.
   - **Fix: 0096-jackpotlte-cpu-driver-match.patch** (commit c05a1e7): on jackpotlte `IONameMatch = ('arm,cortex-a53',
-    'arm,cortex-a73')`. CI run 41471902922. **Result: pending.**
+    'arm,cortex-a73')`. CI run 41471902922: success, ISA 0.
+    **`a8-xnu11-boot.img` SHA-256 `26045fd2bb83eacb6a72ea93d241e00dc5cafa89f08be428a342da0b76831b69`**, flashed to BOOT,
+    readback matched, hands-off run (back in TWRP after ~120 s, log 13802 bytes, PC only: `_tmp/xnu11-log.txt`).
+  - **Observed (xnu11):** `SWEET CPU: cpu=0 mpidr=0x100 came alive; SGI1 OK`, `bsd_init: start`, all bsd_init steps
+    through networking, then `SWEET UFS: "USERDATA" on LUN 0: first block 0x11ac800, 20770 MiB, read-only`,
+    `BSD root: ufsroot0`, `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : a04b`,
+    `cannot mount root, errno = 19`, retried every 5 s (`mount(13) failed` at 90 s), then the sweetreboot.
+  - **eMMC read path verified:** USERDATA start in TWRP is sector 18532352 = 0x11ac800, and bytes 1024..1025 of
+    mmcblk0p29 are `a0 4b` (ext4 superblock), exactly the signature HFS reported. **0093 works, byte-exact.**
+  - **Next blocker: an HFS+ iOS root on the eMMC.** Decision pending with the user: GPT split (plan below, wipes
+    Android data) or an image file inside the ext4 USERDATA (no wipe, the driver needs an extent map; the file must
+    live outside FBE-encrypted dirs, e.g. `/data/sweet/`, so it is plaintext on disk; 14 GB free on 2026-11-02).
   - The public GitHub API allows 60 requests/hour without a token: poll every 90 s, or read the Actions page in the browser.
   - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
