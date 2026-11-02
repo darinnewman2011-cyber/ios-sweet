@@ -322,7 +322,25 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     thread call right after `spllo()`, printing `SWEET A8: Ns stage '<last stage>' state … event 0x… hint …` for the
     boot thread. Stages: initialize_screen done, commpage done, trust caches done, kext bootstrap removed,
     machine_lockdown done, PE_lockdown_iokit returned, calling bsd_init. Symbolize the wait event with llvm-symbolizer
-    (kernel unslid). CI run 41466209363. **Result: pending.**
+    (kernel unslid). CI run 41466209363 failed (block inserted between `static` and `void`); fixed in 0396369, run
+    41467822450 succeeded (not flashed: superseded by 0095).
+- **Hands-off test loop (2026-11-02, user asked for no button presses):**
+  - **Reboot into TWRP from our code, VERIFIED:** Samsung's reset reason (Exynos 7885 kernel
+    `drivers/staging/samsung/sec_reboot.c` + `include/linux/sec_ext.h`, from `Exynos7885-Dev/android_kernel_samsung_exynos7885`
+    lineage-18.1, read only): PMU `0x11C80000` + INFORM2 `0x808` = `0x12345678` (SEC_POWER_RESET), INFORM3 `0x80C` =
+    `0x12345674` (SEC_RESET_REASON_RECOVERY), then SWRESET `0x400` = 1. Shim test image
+    (`EXTRA_CFLAGS="-DA8_PROBE_RESET=5 -DA8_REBOOT_RECOVERY"`, SHA-256 `4c94c958…f808`): after `adb reboot` the phone was
+    back in TWRP over adb **34 s later, untouched**.
+  - **Log channel without eMMC writes:** TWRP's kernel has ramoops (`mem_address` 0x92400000, `mem_size` 0x8000,
+    `record_size` 0x4000, `pmsg_size` 0x4000, `ecc` 0; no `/dev/mem`). A 2026-11-01 Android `dmesg-ramoops-0` was still
+    there after many XNU boots, so S-Boot and XNU leave that RAM alone.
+  - **0095-jackpotlte-ramoops-log-twrp-reboot.patch** (commit 3c713cd): `sweet_a8_snapshot()` writes the last ~16 KB of the
+    console ring as a persistent_ram_buffer (sig `0x43474244`, start 0, size n, data with a `====1.0-D` header, which Linux
+    needs for dmesg records) at 0x92400000, from the 0094 heartbeat every 5 s. After `sweetreboot` s (default 90, 0 = off)
+    the heartbeat calls `sweet_a8_reboot_recovery()`. `panic_spin_forever()` waits `sweetpanicsecs` (default 10), then
+    does the same. Read it in TWRP: `adb shell cat /sys/fs/pstore/dmesg-ramoops-0`.
+  - Not covered: a hang with interrupts off (no heartbeat). The Exynos watchdog would cover it (TODO).
+  - CI run 41469279085. **Result: pending.**
   - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
