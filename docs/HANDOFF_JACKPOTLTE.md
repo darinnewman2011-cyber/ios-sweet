@@ -295,7 +295,23 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   kernel-side maximum. Kernel alive all night, never handed off to userland.
 - **Run 41460201332 (commit bae8324): success**, ISA 0. Kernel `2c9b7250…`, payload `84353b06…` (reproduced
   locally). **`a8-xnu7-boot.img` SHA-256 `d8a030e73f67405c10a0669001099a2cff5c9b920e40296619c792324d1fadcd`**,
-  flashed to BOOT, readback matched, `adb reboot`. **Result: pending.**
+  flashed to BOOT, readback matched, `adb reboot`.
+- **Observed (user, xnu7):** "back to how it was before the bar". No photo, so it's unclear whether any `bsd_init:` or
+  heartbeat line appeared. The user chose to move on to the eMMC driver. Without `rd=`, `IOFindBSDRoot` waits forever
+  for an IOMedia root, which fits the earlier observations (guess).
+- **eMMC root device: 0093-jackpotlte-emmc-root-device.patch** (commit 9e21588, workflow fix 1868ab1):
+  - `bsd/dev/sweet_ufs.c` keeps its BSD half (bdevsw/cdevsw `ufsroot0`/`rufsroot0`, GPT lookup, strategy, ioctls) and on
+    jackpotlte swaps the UFS layer for DW-MSHC PIO: CMD13 at RCA 1 must report TRAN; reads are polled CMD17
+    sectors through the 64-bit FIFO, exactly the shim milestone 3 method. `UFS_BLOCK` is 512 (the eMMC GPT uses
+    512-byte LBAs). The ADT node is `/sweet-mmc`, and the default partition is `USERDATA`.
+  - Read-only: `ufsrw` is ignored, writes return EROFS, so the log ring is off too. sweet's PMIC keys, GENI touch
+    and DWC3 probes are skipped on the A8 (they would touch Qualcomm MMIO).
+  - `xnu.yml` (jackpotlte) passes `--cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0'` to mkpayload.
+  - Expected first result: `SWEET UFS: "USERDATA" on LUN 0: first block …, read-only`, then HFS fails to mount
+    Android's f2fs/ext4 USERDATA (`cannot mount root, errno = …` repeating). That proves the read path without
+    touching any data. The iOS root image itself needs space on the eMMC: wiping USERDATA or the dual-boot GPT
+    change, which needs the user's explicit OK.
+  - CI run 41462686989. **Result: pending.**
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
     `out/Image`), and `adb push` from Git Bash needs `MSYS_NO_PATHCONV=1`.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
