@@ -68,6 +68,43 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 - **Verified:** `mkadt.py` sweet output is byte-identical to `45263be` (seed `\0`*64, highmem off and on);
   `--device jackpotlte` builds (10200 bytes). Open question: every jackpotlte CPU node has `cluster-id` 0, although
   the A53s sit in two clusters (`0x1xx`, `0x2xx`) and the A73s in a third.
+- **XNU step 4a, GICv2 (commit `2a044b2`, patch `0082-jackpotlte-gicv2.patch`, CI run `41370797532`).**
+  - **Observed (shim milestone 1 ID dump):** ID_AA64MMFR0_EL1 = `0x1122`, so TGran16 = 0: **the cores have no 16K
+    translation granule.** Sweet's XNU (`__ARM_16K_PG__`) cannot run here. The A8 kernel uses 4K pages like XNU's
+    BCM2837 (Raspberry Pi 3, also Cortex-A53) config.
+  - Design: no new MACHINE_CONFIG (dozens of patches test `SWEET` / `ARM64_BOARD_CONFIG_SWEET` /
+    `CURRENT_MACHINE_CONFIG`). Instead, `SWEET_BOARD=jackpotlte` in the environment (xnu.yml input `board`) switches
+    `MakeInc.def` to `-DARM64_BOARD_CONFIG_SWEET -DSWEET_JACKPOTLTE -march=armv8-a`. `SWEET.h` then drops
+    `__ARM_16K_PG__`, PAN and the crypto define (not verified on this SoC), adds `__ARM64_PMAP_SUBPAGE_L1__` (as in
+    BCM2837), sets `SWEET_GICV2` instead of `HAS_GIC_V3`, and sets vtimer INTID 27. `board=sweet` (the default)
+    builds exactly what it did before.
+  - The GICv2 driver is in `pe_fiq.c`: ADT `/arm-io/gic` reg = GICD, GICC (GICH/GICV unused). The boot CPU sets
+    GICD_CTLR=1. Every CPU sets its banked SGI/PPI priority to 0xA0, enables the vtimer and SGI1, sets PMR 0xF0 and
+    GICC_CTLR=1, and records its CPU-interface mask from its banked GICD_ITARGETSR0. `sleh_irq` acks and EOIs
+    through GICC_IAR/EOIR, using the full IAR because GICv2 SGIs carry the source CPU. `SweetCPU::signalCPU` writes
+    GICD_SGIR. `sweet_secondary_entry`'s EL2 path skips `ICC_SRE_EL2` (UNDEFINED without GICv3 sysregs).
+  - **CI result (observed):**
+    - Run `41370797532` compiled every 0082 file, with only XNU's usual warnings. It failed in one place: a
+      `pmap.c` static assert. With 4K pages, XNU requires the commpage (`0xFFFFFC000`) to sit above
+      MACH_VM_MAX_ADDRESS, and blacktop builds the macOS platform, whose user VA ends at `0x7FFFFE000000`.
+    - Patch `0083-jackpotlte-ios-user-va.patch` (commit `2d79fa0`) uses the iOS value `0xFC0000000` for
+      SWEET_JACKPOTLTE, the same as 4K-page iOS devices, and the layout the iPhone userland expects.
+    - **Run `41371924237` succeeds.** It links `kernel.development.sweet` (16,799,808 bytes; artifact
+      `xnu-kernel-jackpotlte`, with the build tree in `xnu-buildtree-jackpotlte`). All 1,108 compile commands carry
+      `-DSWEET_JACKPOTLTE -march=armv8-a`, and none carries `armv8.2-a`. The file name is still `.sweet` because
+      MACHINE_CONFIG stays SWEET.
+    - Not run on hardware yet. The kernel would not boot as is (see below).
+    - Reading the logs: the API needs a token and `gh` is not installed. Open
+      `github.com/<repo>/commit/<full sha>/checks/<job id>/logs` in the signed-in browser, take the
+      redirected blob URL (it expires after about 10 minutes) and `curl` it. The log is about 30 MB, so grep for
+      ` error: `.
+  - **Known to break the first A8 XNU boot (later steps, not in 0082):**
+    - `SweetCPU::start`/`startAll` require boot MPIDR 0 and MPIDRs `0xN00` (A8 boots on `0x100`; MPIDRs use Aff0).
+    - `start.s` hard-codes sweet's framebuffer `0x9c000000` (stage-0 white band, MMU off) and a 32 MB L2 block that
+      is only valid with 16K pages. On the A8, `0x9c000000` is plain RAM.
+    - The bootstrap code assumes all RAM is below 4 GB.
+    - Apple's closed KDK libraries linked into the kernel may contain ARMv8.1+ instructions (LSE atomics), which
+      are UNDEFINED on A53/A73. Disassemble them before the first boot.
 
 ## State at handoff
 - Done (not yet run on hardware): `tools/mkadt.py --device jackpotlte` (GICv2, 8 real MPIDRs, 26 MHz timer, 2 GiB
@@ -126,7 +163,8 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 3. **Shim read path DONE 2026-11-01** (see Update above; XNU driver still to do). DW-MSHC eMMC driver (`0x13500000`, v270a, 64-bit IDMAC, HS400/enhanced strobe/CMDQ were enabled by Android;
    check whether S-Boot leaves the controller usable, otherwise full init with the `samsung,dw-mshc-*` timings).
    First read-only in the shim, then the XNU root-device driver replacing `bsd/dev/sweet_ufs.c` (patches 0028–0034, 0069).
-4. XNU patches: GICv2 interrupt controller, SMP MPIDR map (0065), ARMv8.0 (A53/A73) machine config, GPIO keys
+4. XNU patches: **GICv2 interrupt controller and ARMv8.0/4K board variant written (0082, see Update above)**;
+   next: SMP MPIDR map (0065), the 4K-page/framebuffer/>4 GB fixes in `start.s`, GPIO keys
    (`gpa1` 5/6/7 at `0x11CB0000`), `sec_ts` touch on `i2c@13870000` addr `0x48` (Samsung protocol, fw v0.0.2.20),
    panel present path. Rename the `xiaomi,sweet` compatible fallback in `mkadt.py` together with the platform expert.
 5. Payload placement: S-Boot puts the boot.img ramdisk at `0x89000000` and reports it in `/chosen`, but `BOOT` is only

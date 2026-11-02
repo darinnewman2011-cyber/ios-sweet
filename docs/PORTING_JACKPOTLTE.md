@@ -33,6 +33,7 @@ Fact sources, best first:
 | Area | sweet | jackpotlte | Work |
 | --- | --- | --- | --- |
 | Interrupts | GICv3, `ICC_*`/`GICR_*` | GICv2 (above) | **New GICv2 driver** in shim and XNU (patches 0016–0018 area) |
+| Pages / ISA | 16K, ARMv8.2 | **4K only** (ID_AA64MMFR0 `0x1122`: no 16K granule), ARMv8.0 | `SWEET_BOARD=jackpotlte` variant (patch 0082) |
 | Timer | 19.2 MHz, INTID 19 | 26 MHz, INTID 27 | constants (ADT already updated; shim has `VTIMER_INTID`) |
 | SMP | MPIDR = core<<8 | table above | patch 0065 logical→MPIDR map |
 | Storage | UFS | eMMC DW-MSHC | **New root-device driver** replacing 0028–0034/0069; new read path in the shim |
