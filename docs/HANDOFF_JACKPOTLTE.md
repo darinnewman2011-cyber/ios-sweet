@@ -263,7 +263,9 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - On SWEET, `pmap_virtual_region()` keeps at least 16 MB reserved at `LOW_GLOBAL_BASE_ADDRESS`, which covers
     the early FB/DECON alias (to +14 MB). Insurance: with 16 KB VM pages (131,008 pages = 2 GB) XNU already
     reserves 32 MB.
-  - CI run 41389836692 is building it.
+- **Run 41389836692 (commit ef5b97e): success**, ISA 0. Kernel `632dd999…15b0`, payload `e398b202…0d3f`
+  (reproduced locally). **`a8-xnu5-boot.img` SHA-256 `c0f586c329b8735aac933c66d05a2f22f5356cee453cf9f5e8cd4a5334aa604e`**,
+  flashed to BOOT with all checks passing, `adb reboot`. **Result: not yet reported.**
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
