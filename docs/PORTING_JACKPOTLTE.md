@@ -105,3 +105,11 @@ to the 32 MiB `BOOT` partition. Its id formula reproduces the template's own SHA
 Flash from TWRP (backup first!): `dd` the image to `/dev/block/by-name/BOOT`, read it back and compare SHA-256, reboot.
 Recover: force power off (Power + Volume Down ~8 s), boot TWRP (Power + Bixby + Volume Up), `dd` the saved `BOOT.img` back.
 If the screen stays black the display path needs the DECON trigger (see "Display" above) and that is the next thing to build.
+
+## Milestone 4: XNU loader (`PAYLOAD=... shim/a8/build.sh`)
+
+With `PAYLOAD` set, `build.sh` links a `tools/mkpayload.py` payload into the shim Image (S-Boot loads Images of
+the stock kernel's 22 MB size, and this keeps clear of the ramdisk at `0x89000000` and the DTB at `0x8A000000`).
+The shim then acts as iBoot through `shim/loader.c`: kernel to `0x880000000 + (va - virt_base)`, ADT and
+boot_args behind it, jump at EL1 with the MMU off. The `xnu.yml` jackpotlte run uploads the matching
+`jackpotlte.adt` and `xnu-jackpotlte.payload`. Wrap with `tools/mka8boot.py` as for the diagnostics.

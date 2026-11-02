@@ -122,7 +122,8 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - Not covered yet: the regular framebuffer console and the IOMFB driver (after early-console stage 20) still
     need a present path, which is step "panel present path".
   - **Still blocking the first A8 XNU boot:** the A8 boot shim and payload placement (boot args with phys
-    base and size, ADT, DPP0 on `SWEET_FB_PA`). (ARMv8.1+ hits: resolved in step 4c, count is 0.)
+    base and size, ADT, DPP0 on `SWEET_FB_PA`). (ARMv8.1+ hits: resolved in step 4c, count is 0. Shim: built in
+    step 5; only the flash remains.)
   - **Was blocking before 0084/0085 (now addressed):**
     - `SweetCPU::start`/`startAll` require boot MPIDR 0 and MPIDRs `0xN00` (A8 boots on `0x100`; MPIDRs use Aff0).
     - `start.s` hard-codes sweet's framebuffer `0x9c000000` (stage-0 white band, MMU off) and a 32 MB L2 block that
@@ -151,8 +152,46 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     `'OTHER_CFLAGS=$(inherited) $(SWEET_ARCH_CFLAGS_$(CURRENT_ARCH))' 'SWEET_ARCH_CFLAGS_arm64=-mcpu=generic -march=armv8-a'`
     to that xcodebuild line. `OTHER_CFLAGS[arch=arm64]=` on the command line is misparsed: run 41376911349
     failed with `clang: no such file 'arm64]=-mkernel'`.
-- Caveat: the ISA regex covers LSE, RDM, RCpc (`ldapr`), non-hint PAC and dot product. It does not cover every
+- Caveat (ISA check): the ISA regex covers LSE, RDM, RCpc (`ldapr`), non-hint PAC and dot product. It does not cover every
   v8.2+ extension (e.g. FP16 arithmetic, `dc cvap`), and kexts in the kernelcache/userland are a separate question.
+
+### Step 5: A8 XNU boot shim, milestone 4 (2026-11-01, built, NOT flashed)
+- **Design:** the SWEETXNU payload (`tools/mkpayload.py`) is linked into the shim Image itself
+  (`PAYLOAD=... shim/a8/build.sh`, `.incbin` in the generated `out/payload.S`), not put in the ramdisk.
+  - S-Boot already loads the 22 MB stock kernel (template `kernel_size` `0x1539520`) at `0x80080000`, so a
+    ~16 MB Image is normal for it.
+  - A >16 MB ramdisk at `0x89000000` would run into the DTB S-Boot places at `0x8A000000`.
+  - With a payload linked in, `a8_main` boots XNU through `shim/loader.c`; without one, the milestone 1–3
+    diagnostics run unchanged.
+- **Code:**
+  - `loader.c`: `loader_boot_payload(start, end)` is split out of `loader_boot(dtb)`, plus two weak board hooks.
+    sweet behaves the same.
+  - `diag.c`: the A8 hooks `dc civac` each destination range before the MMU-off copy (S-Boot ran with
+    caches on; no stale dirty line may be written back over the kernel once XNU enables caches), and call
+    `a8_present()` before the jump so DECON is presenting.
+  - `start.S`: `adrp` for `.bss` and the stacks (`adr`'s ±1 MB range is too small past a 17 MB payload).
+- **boot_args** (same as sweet): physBase/memSize from the ADT `/chosen dram-base/size` = `0x880000000` /
+  `0x7FF00000` (the panic log takes the top 1 MiB). The video base is `0xEC000000` 1080×2220, stride 4320; x0
+  is the boot_args PA. The shim enters at EL1 with the MMU off and the I-cache invalidated.
+- **CI:** `xnu.yml` (jackpotlte) now also runs `mkadt.py --device jackpotlte` and `mkpayload.py` on the fresh
+  kernel. Results:
+  - Run 41378975010 (commit 1942adc): ISA 0. `out/xnu-jackpotlte.payload` 16,241,952 bytes; no chained
+    fixups.
+  - `virt_base 0xfffffe0006000000`, entry `0xfffffe0007429488`, kernel_end `0xfffffe000846c000`. So text is at
+    PA `0x881004000` and the kernel ends at `0x88246c000`. Both are in the artifact `xnu-kernel-jackpotlte`.
+  - CI has no `research/ipsw-x/d22ap.adt`, so that ADT has **no `/product` node**. That doesn't matter for
+    kernel entry; userland may need it.
+- **Local check (synthetic 17 MB payload):** Image 17.9 MB, payload at offset `0x40e0`, embedded size word
+  correct. `mka8boot.py` output fits the 32 MiB BOOT with ~14 MB to spare. The diag build (no payload) is
+  unchanged at 101,600 bytes.
+- **To build the first XNU boot image** (on the PC, artifact downloaded, LLVM on PATH):
+  `PAYLOAD=<artifact>/xnu-jackpotlte.payload shim/a8/build.sh`, then
+  `python tools/mka8boot.py <BOOT backup> shim/a8/out/Image <out>.img`. Flash from TWRP as before. Get the
+  user's confirmation; recovery is unchanged.
+- **Expected on the phone:**
+  - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
+  - Then XNU's early console (0085: stage-0 white band, then text).
+  - A red EXC screen means the shim faulted. Text that stops after JUMP means XNU died before its console.
 
 ## State at handoff
 - Done (not yet run on hardware): `tools/mkadt.py --device jackpotlte` (GICv2, 8 real MPIDRs, 26 MHz timer, 2 GiB
@@ -213,7 +252,8 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
    First read-only in the shim, then the XNU root-device driver replacing `bsd/dev/sweet_ufs.c` (patches 0028–0034, 0069).
 4. XNU patches: **GICv2 interrupt controller and ARMv8.0/4K board variant written (0082, see Update above)**;
    **SMP MPIDR map (0084) and 4K early framebuffer/DECON present (0085) written; ARMv8.0-clean build with ISA
-   count 0 (0086 + firehose CFLAGS, run 41377484152)**; next: A8 boot shim/payload for the first kernel entry, GPIO keys
+   count 0 (0086 + firehose CFLAGS, run 41377484152); A8 XNU boot shim built (step 5, not flashed)**; next: first
+   XNU boot on the phone, then GPIO keys
    (`gpa1` 5/6/7 at `0x11CB0000`), `sec_ts` touch on `i2c@13870000` addr `0x48` (Samsung protocol, fw v0.0.2.20),
    panel present path. Rename the `xiaomi,sweet` compatible fallback in `mkadt.py` together with the platform expert.
 5. Payload placement: S-Boot puts the boot.img ramdisk at `0x89000000` and reports it in `/chosen`, but `BOOT` is only
