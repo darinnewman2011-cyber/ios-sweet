@@ -58,8 +58,9 @@ jobs:
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           if [ "$SWEET_BOARD" = jackpotlte ]; then
             # Apple clang's default arm64 CPU has LSE; Cortex-A53/A73 are ARMv8.0
-            sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\"/& 'OTHER_CFLAGS[arch=arm64]=\$(inherited) -mcpu=generic -march=armv8-a'/" dxb/build.sh
-            grep -c 'OTHER_CFLAGS\[arch=arm64\]' dxb/build.sh
+            # (xcodebuild rejects [arch=...] conditionals on the command line)
+            sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\"/& 'OTHER_CFLAGS=\$(inherited) \$(SWEET_ARCH_CFLAGS_\$(CURRENT_ARCH))' 'SWEET_ARCH_CFLAGS_arm64=-mcpu=generic -march=armv8-a'/" dxb/build.sh
+            grep -c 'SWEET_ARCH_CFLAGS_arm64=' dxb/build.sh
           fi
           ls dxb/patches
 
