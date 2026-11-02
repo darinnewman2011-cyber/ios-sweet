@@ -373,7 +373,7 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     Without the boot-arg nothing changes. CI run 41477553892. **Result: pending.** First test plan: payload rebuilt
     locally with `sweetrootino=1044512` → HFS should report `unknown Volume Signature : 5454` ("TT" from the
     pattern at file offset 1024), proving the mapping.
-  - Local tree note: the Windows checkout has CRLF patch files; strip `` before `git apply` in `_tmp/` trees.
+  - Local tree note: the Windows checkout has CRLF patch files; strip the CRs before `git apply` in `_tmp/` trees.
   - **iOS image build (WSL Ubuntu 26.04):** the WSL kernel 6.18.54.1 has no hfsplus (`# CONFIG_HFSPLUS_FS is not set`,
     modules allowed, no signing), apfs-fuse is not packaged, TWRP's kernel has no HFS+ either. Plan: build `hfsplus.ko`
     from Microsoft's `linux-msft-wsl-6.18.54.1` tag, build apfs-fuse from source, apt hfsprogs. Blocked on the user's OK
