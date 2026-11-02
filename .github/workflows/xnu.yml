@@ -142,6 +142,15 @@ jobs:
           awk -v re="$re" '/^[0-9a-f]+ <.*>:$/ {fn=$2} $0 ~ re {n[fn]++} END {for (f in n) print n[f], f}' out/kernel.dis | sort -rn | head -40 | tee out/isa-v81-functions.txt
           rm out/kernel.dis
 
+      - name: A8 payload (mkadt + mkpayload)
+        if: always() && env.SWEET_BOARD == 'jackpotlte'
+        run: |
+          # Linked into the A8 shim on the PC: PAYLOAD=... shim/a8/build.sh, then tools/mka8boot.py
+          k=$(find out -maxdepth 1 -type f -name 'kernel.*' ! -name '*.txt' ! -name '*.a' | head -1)
+          python3 -I tools/mkadt.py out/jackpotlte.adt --device jackpotlte
+          python3 -I tools/mkpayload.py "$k" out/jackpotlte.adt out/xnu-jackpotlte.payload
+          ls -l out/jackpotlte.adt out/xnu-jackpotlte.payload
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

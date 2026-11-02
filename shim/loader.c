@@ -2,7 +2,8 @@
  * Milestone 4: act as iBoot for xnu.
  *
  * mkpayload.py already resolved the kernel's chained fixups and built the
- * ADT, so this only has to: find the payload in the ABL ramdisk, copy the
+ * ADT, so this only has to: find the payload (ABL ramdisk on sweet, linked
+ * into the shim Image on the A8), copy the
  * segments to phys_base + (vmaddr - virt_base), place the ADT and
  * boot_args behind the kernel, and jump to the entry point with the MMU
  * and caches off, x0 = boot_args (physical).
@@ -76,6 +77,17 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/* Board hooks (shim/a8/diag.c); sweet uses these empty defaults. */
+__attribute__((weak)) void loader_hook_dst(uintptr_t pa, uint64_t len)
+{
+	(void)pa;
+	(void)len;
+}
+
+__attribute__((weak)) void loader_hook_jump(void)
+{
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -84,7 +96,11 @@ const char *loader_boot(uintptr_t dtb)
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+	return loader_boot_payload(rd_start, rd_end);
+}
 
+const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end)
+{
 	const struct payload *p = (const struct payload *)rd_start;
 	if (!magic_ok(p->magic))
 		return "no SWEETXNU payload";
@@ -103,6 +119,7 @@ const char *loader_boot(uintptr_t dtb)
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
+		loader_hook_dst(dst, s->vmsize);
 		copy64(dst, rd_start + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
@@ -111,9 +128,10 @@ const char *loader_boot(uintptr_t dtb)
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
-	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
+	loader_hook_dst(adt_pa, top - adt_pa);
+	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
 
 	zero64(ba_pa, PAGE_16K);
 	volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
@@ -140,6 +158,7 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
+	loader_hook_jump();
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);

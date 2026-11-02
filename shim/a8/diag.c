@@ -3,12 +3,16 @@
  * Milestone 1 (done 2026-11-01): what S-Boot hands over, on the panel.
  * Milestone 2: GIC-400 (GICv2) virtual-timer and SGI interrupts on the boot
  * CPU, PSCI version, and PSCI CPU_ON for the other seven cores.
- * No storage is touched. Every step presents the frame before it starts, so
- * if something hangs the screen shows how far it got.
+ * Milestone 3: read-only eMMC (CMD13/CMD7/CMD17 only).
+ * Milestone 4: with an XNU payload linked in (PAYLOAD=... build.sh), act as
+ * iBoot instead of running the diagnostics (shim/loader.c).
+ * Every step presents the frame before it starts, so if something hangs
+ * the screen shows how far it got.
  */
 #include <stdint.h>
 #include "../console.h"
 #include "../fdt.h"
+#include "../loader.h"
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" :: "r"((uint64_t)(v)))
@@ -193,6 +197,48 @@ static int a8_present(void)
 	wr32(DECON_BASE + DECON_TRIG_CONTROL,
 	     (mmio32(DECON_BASE + DECON_TRIG_CONTROL) & ~HW_TRIG_MASK_DECON) | HW_TRIG_EN);
 	return ok;
+}
+
+/* ---- XNU loader (milestone 4) ---- */
+
+/* payload.S (build.sh): the SWEETXNU payload linked into this Image, or nothing. */
+extern const char a8_payload[];
+extern const uint64_t a8_payload_size;
+
+/*
+ * S-Boot ran with the caches on. Clean+invalidate the destination before the
+ * MMU-off (non-cacheable) copy, so no stale dirty line can be written back
+ * over the kernel once XNU turns the caches on.
+ */
+void loader_hook_dst(uintptr_t pa, uint64_t len)
+{
+	uint64_t line = 4u << ((rsr("ctr_el0") >> 16) & 0xf);	/* DminLine, bytes */
+
+	for (uintptr_t a = pa & ~(line - 1); a < pa + len; a += line)
+		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+	a8_present();
+}
+
+/* XNU's early console re-arms the trigger itself (0085); leave DECON running. */
+void loader_hook_jump(void)
+{
+	a8_present();
+}
+
+static void a8_boot_xnu(void)
+{
+	con_clear(BLUE);
+	con_str("A8 SHIM", "milestone 4: xnu loader");
+	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
+	con_hex2("PAYLOAD", "at=", (uintptr_t)a8_payload, "size=", (uint32_t)a8_payload_size);
+	a8_present();
+	const char *why = loader_boot_payload((uintptr_t)a8_payload, (uintptr_t)a8_payload + a8_payload_size);
+	con_str("LOADER", why);
+	con_str("DONE", "halted. hold power+vol down");
+	a8_present();
+	for (;;)
+		__asm__ volatile("wfe");
 }
 
 #ifdef A8_PROBE_RESET
@@ -485,6 +531,8 @@ void a8_main(uintptr_t dtb)
 {
 	uint64_t s = 0;
 
+	if (a8_payload_size)
+		a8_boot_xnu();
 	con_clear(BLUE);
 	con_str("A8 SHIM", "milestone 3: emmc read");
 	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
