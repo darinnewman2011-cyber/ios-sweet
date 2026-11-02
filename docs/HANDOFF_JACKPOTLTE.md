@@ -250,8 +250,16 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 - **Fix: 0089-jackpotlte-ios-zone-map.patch** (commit 4b95d92): iOS sizes (8 GB max / 24 GB VA) when
   `SWEET_JACKPOTLTE`. Checked the other kmem claims: only `compressor` (dynamic) is large, 16 × 2 GB = 32 GB
   under the macOS rule, which fits. CI run 41388657761 is building it.
-- **Still open:** the nested panics after the first one (caller `0xfffffff007a2f754`) — check the symbol if
-  they recur.
+- **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
+  re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
+- **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
+  (~12 GB) becomes a new iOS root partition.
+  - This means a GPT change: back up the GPT/PIT first and change only the USERDATA entry. Android's USERDATA
+    must be reformatted once (FBE, can't be shrunk in place).
+  - Samsung's PIT may make later Odin stock flashes fail or restore the stock layout.
+  - Needs the user's explicit OK when the time comes; the BOOT pre-approval doesn't cover it.
+  - Switching could be `dd` of BOOT from TWRP, or later the shim chainloading Android's kernel from a spare
+    partition (e.g. hold Volume Down). Only after the XNU eMMC root driver exists.
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
