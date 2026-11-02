@@ -252,7 +252,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   under the macOS rule, which fits.
 - **Run 41388657761 (commit 4b95d92): success**, ISA 0. Kernel `e8dbec53…83d1`, payload `8d33ad5a…24db`
   (reproduced locally). **`a8-xnu4-boot.img` SHA-256 `1bff6defc656965acaf744032598d272fc15c8ce3734f96cca34eebc8ec2093a`**,
-  flashed to BOOT with all checks passing, `adb reboot`. **Result: not yet reported.**
+  flashed to BOOT with all checks passing, `adb reboot`.
+- **Observed (user, xnu4):** "same as last time", i.e. still the `kmem_range_init` panic.
+- **Cause:** in the iOS 4K layout, `pmap_virtual_region()` region 3 also reserves `[VM_MIN_KERNEL_ADDRESS, low
+  globals)`. Every kmem claim therefore has to fit above the physmap, ~45 GB (`virtual_space_start` ≈ kernel +
+  ≤1 GB slide + 2 GB physmap, up to `0xfffffffbffffffff`). Zones (24 GB) plus the macOS compressor reservation
+  (16 × RAM = 32 GB) don't fit; my earlier "compressor fits" estimate was wrong.
+- **Fix: 0090-jackpotlte-ios-compressor-va.patch** (commit ef5b97e):
+  - `vm_compressor.c` uses the generic iOS sizing (pool = RAM) when `SWEET_JACKPOTLTE`.
+  - On SWEET, `pmap_virtual_region()` keeps at least 16 MB reserved at `LOW_GLOBAL_BASE_ADDRESS`, which covers
+    the early FB/DECON alias (to +14 MB). Insurance: with 16 KB VM pages (131,008 pages = 2 GB) XNU already
+    reserves 32 MB.
+  - CI run 41389836692 is building it.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
