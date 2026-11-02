@@ -1,6 +1,6 @@
 # GPU on the Galaxy A8 (2018): plan
 
-Status 2026-11-02: **step 2 done on the phone** (patch 0101, `sweetgpu=2`, boot image `a8-ios9b`, SHA-256
+Status 2026-11-02: **steps 2 and 3 done on the phone** (step 2: (patch 0101, `sweetgpu=2`, boot image `a8-ios9b`, SHA-256
 `94a30287…eea1`). iOS itself still draws everything on the CPU (CoreAnimation in software, frames copied into the
 S-Boot framebuffer), like sweet.
 
@@ -18,6 +18,22 @@ SWEET GPU: L2 ready 0x1 after ~0 ms / tiler ready 0x1 after ~0 ms / shader ready
 - 2 shader cores, 1 tiler, 1 L2, 3 job slots (`JS_PRESENT 0x7`), 8 address spaces (`AS_PRESENT 0xff`),
   `MMU_FEATURES 0x2830` (VA 48 bits, PA 40 bits), coherency features `MEM 0x1`.
 - Powering L2, tiler and shaders through PWRON works; nothing hung.
+
+**Step 3 done on the phone (2026-11-02)** (patch 0104, `sweetgpu=3`, boot image `a8-ios11g`, SHA-256 `4e7a4c68…19ee`,
+CI run 41524145769, log `_tmp/ios11g-log.txt`):
+```
+SWEET GPU: AS0 transtab 0x883df4007 memattr 0x888d88, buffer PA 0x883df4000, jobs at GPU VA 0x1004000
+SWEET GPU: job rawstat 0x2 after ~1 ms; JS1 status 0 head 0x1004080; mmu rawstat 0 AS0 fault 0 at 000000000
+SWEET GPU: job0 exception 0x1 incomplete 0, job1 exception 0x1 incomplete 0; target 0 0 0x5157ee70 0xdeadbeef
+SWEET GPU: the GPU wrote RAM through its MMU (step 3 done)
+```
+- The Mali LPAE page-table format works as Panfrost uses it for G71: table = PA|3, leaf = PA|1 at every level,
+  HAP read+write, outer shareable, TRANSTAB = L0 PA | READ_INNER | ADRMODE_TABLE, MEMATTR `0x888d88`, 4 levels.
+- A chain of two WRITE_VALUE jobs (Zero, Immediate 32) on job slot 1 finished in ~1 ms (JOB_IRQ_RAWSTAT bit 1 = slot 1
+  done, no error bit). Both job headers came back with exception status 1 (DONE). No MMU fault.
+- The CPU side is non-coherent: the buffer is cleaned/invalidated with `dc civac` before submit and before reading,
+  and the job config flushes (clean+invalidate) GPU caches at job start and end. `COHERENCY_ENABLE` = 31 (none).
+- Next: step 4 (kernel job service for userland).
 
 ## The hardware (from the phone's live FDT and Samsung's Exynos 7885 kernel)
 
