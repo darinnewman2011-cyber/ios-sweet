@@ -109,6 +109,15 @@ static const uint32_t a8_mpidr[8] = { 0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 
 
 /* PMU software reset (verified 2026-11-01: reboots the SoC). */
 #define PMU_SWRESET	0x11C80400UL
+/*
+ * Samsung reset reason (drivers/staging/samsung/sec_reboot.c, include/linux/
+ * sec_ext.h in the Exynos 7885 kernel): S-Boot reads INFORM2/INFORM3 after a
+ * software reset; INFORM3 = 0x12345674 boots RECOVERY (TWRP).
+ */
+#define PMU_INFORM2	0x11C80808UL
+#define PMU_INFORM3	0x11C8080CUL
+#define SEC_POWER_RESET		0x12345678u
+#define SEC_RESET_RECOVERY	0x12345674u
 
 extern char secondary_entry[];
 
@@ -246,6 +255,12 @@ static void a8_boot_xnu(void)
 static void __attribute__((noreturn)) pmu_reset_after(unsigned s)
 {
 	delay_ms(s * 1000);
+#ifdef A8_REBOOT_RECOVERY
+	/* EXTRA_CFLAGS adds -DA8_REBOOT_RECOVERY: come back up in TWRP */
+	wr32(PMU_INFORM2, SEC_POWER_RESET);
+	wr32(PMU_INFORM3, SEC_RESET_RECOVERY);
+	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	wr32(PMU_SWRESET, 1);
 	for (;;)
 		__asm__ volatile("wfe");

@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 11f0798..7fd8083 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1022,4 +1022,125 @@ sweet_ufs_rootdev(dev_t *dev)
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * A8 bring-up channel, no eMMC writes. TWRP's kernel has ramoops at
++ * 0x92400000 (32 KiB, ecc 0: one 16 KiB dmesg record, then 16 KiB pmsg),
++ * low DRAM that XNU does not use and S-Boot keeps across a software reset.
++ * The tail of the console ring is copied into the dmesg record as a valid
++ * persistent_ram_buffer, so after a reboot TWRP shows it as
++ * /sys/fs/pstore/dmesg-ramoops-0. sweet_a8_reboot_recovery() then sets
++ * Samsung's reset reason (drivers/staging/samsung/sec_reboot.c: INFORM2
++ * SEC_POWER_RESET, INFORM3 SEC_RESET_REASON_RECOVERY) and resets the SoC,
++ * so S-Boot starts TWRP (verified with the shim on 2026-11-02).
++ */
++#define A8_OOPS_PA              0x92400000ull
++#define A8_OOPS_SIZE            0x4000u         /* ramoops record_size */
++#define A8_OOPS_SIG             0x43474244u     /* PERSISTENT_RAM_SIG ^ 0 */
++#define A8_PMU_PA               0x11C80000ull
++#define A8_PMU_SWRESET          0x0400
++#define A8_PMU_INFORM2          0x0808
++#define A8_PMU_INFORM3          0x080C
++#define A8_SEC_POWER_RESET      0x12345678u
++#define A8_SEC_RESET_RECOVERY   0x12345674u
++
++static volatile uint32_t *a8_oops;
++static volatile uint32_t *a8_pmu;
++
++void sweet_a8_channel_init(void);
++void sweet_a8_snapshot(void);
++void sweet_a8_reboot_recovery(void) __dead2;
++void sweet_a8_panic_reboot(void);
++
++/* Process context, once (before any snapshot or reboot). */
++void
++sweet_a8_channel_init(void)
++{
++	if (!a8_oops) {
++		a8_oops = (volatile uint32_t *)ml_io_map(A8_OOPS_PA, A8_OOPS_SIZE);
++	}
++	if (!a8_pmu) {
++		a8_pmu = (volatile uint32_t *)ml_io_map(A8_PMU_PA, 0x1000);
++	}
++}
++
++/*
++ * Console tail -> ramoops dmesg record. Any context, never blocks. Linux
++ * drops dmesg records without a "====sec.nsec-C\n" header, so one goes first.
++ * Device memory: 32-bit stores only.
++ */
++void
++sweet_a8_snapshot(void)
++{
++	static const char hdr[] = "====1.0-D\n";
++	const uint32_t hlen = sizeof(hdr) - 1;
++	const uint32_t cap = A8_OOPS_SIZE - 12;          /* sig, start, size */
++	volatile uint32_t *w;
++
++	if (!a8_oops) {
++		return;
++	}
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t pos = total > cap - hlen ? total - (cap - hlen) : 0;
++	uint32_t n = hlen + (uint32_t)(total - pos);
++
++	a8_oops[0] = 0;                                 /* invalid while copying */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	w = a8_oops + 3;
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t v = 0;
++		for (uint32_t k = 0; k < 4 && i + k < n; k++) {
++			uint32_t at = i + k;
++			uint8_t c = at < hlen ? (uint8_t)hdr[at] :
++			    (uint8_t)sweet_log_ring[(pos + at - hlen) % SWEET_LOG_SIZE];
++			v |= (uint32_t)c << (8 * k);
++		}
++		w[i / 4] = v;
++	}
++	a8_oops[1] = 0;                                 /* start: not wrapped */
++	a8_oops[2] = n;                                 /* size */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	a8_oops[0] = A8_OOPS_SIG;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++void
++sweet_a8_reboot_recovery(void)
++{
++	sweet_a8_snapshot();
++	if (a8_pmu) {
++		a8_pmu[A8_PMU_INFORM2 / 4] = A8_SEC_POWER_RESET;
++		a8_pmu[A8_PMU_INFORM3 / 4] = A8_SEC_RESET_RECOVERY;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		a8_pmu[A8_PMU_SWRESET / 4] = 1;
++	}
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
++/*
++ * panic_spin_forever(): leave the panic on screen for a while (boot-arg
++ * sweetpanicsecs, default 10), then save the log and come back in TWRP.
++ * Interrupts are off here, so the wait polls the counter.
++ */
++void
++sweet_a8_panic_reboot(void)
++{
++	static int entered;
++	uint32_t secs = 10;
++	uint64_t deadline;
++
++	if (entered++ || !a8_pmu) {
++		return;
++	}
++	sweet_a8_snapshot();
++	PE_parse_boot_argn("sweetpanicsecs", &secs, sizeof(secs));
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
++	while (mach_absolute_time() < deadline) {
++	}
++	sweet_a8_reboot_recovery();
++}
++#endif /* SWEET_JACKPOTLTE */
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..d5c44b8 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1158,6 +1158,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ void
+ panic_spin_forever(void)
+ {
++#if defined(SWEET_JACKPOTLTE)
++	/* A8 bring-up: save the log and reboot into TWRP (bsd/dev/sweet_ufs.c) */
++	extern void sweet_a8_panic_reboot(void);
++	sweet_a8_panic_reboot();
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 95902bc..35b79ff 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -603,6 +603,12 @@ static const char *volatile sweet_boot_stage = "start";
+ static thread_t sweet_boot_thread;
+ static thread_call_t sweet_boot_hb_call;
+ static uint32_t sweet_boot_hb_secs;
++static uint32_t sweet_boot_reboot_secs = 90;    /* boot-arg sweetreboot, 0 = never */
++
++/* bsd/dev/sweet_ufs.c: console tail to TWRP's ramoops, reboot into TWRP */
++void sweet_a8_channel_init(void);
++void sweet_a8_snapshot(void);
++void sweet_a8_reboot_recovery(void) __dead2;
+ 
+ #define SWEET_STAGE(label) do { sweet_boot_stage = (label); } while (0)
+ 
+@@ -617,6 +623,11 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	    sweet_boot_hb_secs, sweet_boot_stage, t->state, (unsigned long long)t->wait_event,
+ 	    (int)t->block_hint);
+ 	sweet_early_kick();
++	sweet_a8_snapshot();
++	if (sweet_boot_reboot_secs && sweet_boot_hb_secs >= sweet_boot_reboot_secs) {
++		printf("SWEET A8: %us up, rebooting into TWRP (sweetreboot)\n", sweet_boot_hb_secs);
++		sweet_a8_reboot_recovery();
++	}
+ 	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+ 	thread_call_enter_delayed(sweet_boot_hb_call, deadline);
+ }
+@@ -627,6 +638,8 @@ sweet_boot_hb_start(void)
+ 	uint64_t deadline;
+ 
+ 	sweet_boot_thread = current_thread();
++	sweet_a8_channel_init();
++	PE_parse_boot_argn("sweetreboot", &sweet_boot_reboot_secs, sizeof(sweet_boot_reboot_secs));
+ 	sweet_boot_hb_call = thread_call_allocate(sweet_boot_hb, NULL);
+ 	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+ 	thread_call_enter_delayed(sweet_boot_hb_call, deadline);
