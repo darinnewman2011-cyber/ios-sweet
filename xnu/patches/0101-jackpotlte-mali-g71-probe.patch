@@ -1,0 +1,202 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b20a211..570f4a6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_a8input.c			standard
++bsd/dev/sweet_a8gpu.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+new file mode 100644
+index 0000000..9e09bba
+--- /dev/null
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -0,0 +1,164 @@
++/*
++ * Galaxy A8 (2018, jackpotlte) Mali-G71 MP2 probe, step 2 of docs/GPU_JACKPOTLTE.md.
++ * Boot-arg sweetgpu: 0 (default) off; 1 logs the power domain and G3D clock
++ * state and, only if the domain is already on, the GPU's ID registers;
++ * 2 also powers the domain on (Samsung pmucal g3d_on: PMU 0x11C840A0 = 0xF,
++ * wait for 0xF in 0x11C840A4) and then the L2, tiler and shader cores.
++ * GPU registers are never touched while the domain is off (that can hang the
++ * bus). Runs in its own thread so a stuck access stalls only the probe.
++ * Facts: live FDT mali@11500000, pd-g3d@11c840a0; Samsung cmucal (CMU_G3D 0x11400000).
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_a8_gpu_init(void);
++
++#define PMU_PA          0x11c80000u
++#define PMU_G3D_CONFIG  0x40a0u
++#define PMU_G3D_STATUS  0x40a4u
++#define CMU_G3D_PA      0x11400000u
++#define GPU_PA          0x11500000u
++
++/* Mali (Bifrost Job Manager) register offsets. */
++#define GPU_ID          0x000u
++#define L2_FEATURES     0x004u
++#define CORE_FEATURES   0x008u
++#define TILER_FEATURES  0x00cu
++#define MEM_FEATURES    0x010u
++#define MMU_FEATURES    0x014u
++#define AS_PRESENT      0x018u
++#define JS_PRESENT      0x01cu
++#define GPU_IRQ_RAWSTAT 0x020u
++#define GPU_STATUS      0x034u
++#define SHADER_PRESENT  0x100u
++#define TILER_PRESENT   0x110u
++#define L2_PRESENT      0x120u
++#define SHADER_READY    0x140u
++#define TILER_READY     0x150u
++#define L2_READY        0x160u
++#define SHADER_PWRON    0x180u
++#define TILER_PWRON     0x190u
++#define L2_PWRON        0x1a0u
++
++static vm_offset_t g_pmu, g_cmu, g_gpu;
++static int g_sleep_chan;
++
++static uint32_t
++g_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++g_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++g_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Write mask to a PWRON register, wait up to ~1 s for it in the READY register. */
++static bool
++g_power(const char *what, uint32_t pwron, uint32_t ready, uint32_t mask)
++{
++	if (!mask) {
++		return true;
++	}
++	g_wr(g_gpu, pwron, mask);
++	for (int i = 0; i < 100; ++i) {
++		if ((g_rd(g_gpu, ready) & mask) == mask) {
++			printf("SWEET GPU: %s ready %#x after ~%d ms\n", what, g_rd(g_gpu, ready), i * 10);
++			return true;
++		}
++		g_sleep_ms(10);
++	}
++	printf("SWEET GPU: %s NOT ready: ready %#x want %#x, status %#x rawstat %#x\n", what,
++	    g_rd(g_gpu, ready), mask, g_rd(g_gpu, GPU_STATUS), g_rd(g_gpu, GPU_IRQ_RAWSTAT));
++	return false;
++}
++
++static void
++g_thread(void *arg, wait_result_t result)
++{
++	int level = (int)(uintptr_t)arg;
++	(void)result;
++
++	g_sleep_ms(2000);       /* after the input thread has its log lines out */
++	uint32_t cfg = g_rd(g_pmu, PMU_G3D_CONFIG), st = g_rd(g_pmu, PMU_G3D_STATUS);
++	printf("SWEET GPU: pd-g3d config %#x status %#x; CMU_G3D pll_con0 %#x switch_user %#x busd_mux %#x busp_div %#x\n",
++	    cfg, st, g_rd(g_cmu, 0x120), g_rd(g_cmu, 0x100), g_rd(g_cmu, 0x1004), g_rd(g_cmu, 0x1800));
++	if ((st & 0xf) != 0xf) {
++		if (level < 2) {
++			printf("SWEET GPU: domain off, not touching the GPU (sweetgpu=2 powers it)\n");
++			return;
++		}
++		g_wr(g_pmu, PMU_G3D_CONFIG, (cfg & ~0xfu) | 0xfu);
++		int i;
++		for (i = 0; i < 100 && (g_rd(g_pmu, PMU_G3D_STATUS) & 0xf) != 0xf; ++i) {
++			g_sleep_ms(1);
++		}
++		st = g_rd(g_pmu, PMU_G3D_STATUS);
++		printf("SWEET GPU: domain on request: status %#x after ~%d ms\n", st, i);
++		if ((st & 0xf) != 0xf) {
++			return;
++		}
++	}
++	uint32_t id = g_rd(g_gpu, GPU_ID);
++	printf("SWEET GPU: GPU_ID %#x (product %#x r%up%u) L2 %#x core %#x tiler %#x mem %#x mmu %#x as %#x js %#x status %#x\n",
++	    id, id >> 16, (id >> 12) & 0xf, (id >> 4) & 0xff,
++	    g_rd(g_gpu, L2_FEATURES), g_rd(g_gpu, CORE_FEATURES), g_rd(g_gpu, TILER_FEATURES),
++	    g_rd(g_gpu, MEM_FEATURES), g_rd(g_gpu, MMU_FEATURES), g_rd(g_gpu, AS_PRESENT),
++	    g_rd(g_gpu, JS_PRESENT), g_rd(g_gpu, GPU_STATUS));
++	uint32_t shader = g_rd(g_gpu, SHADER_PRESENT), tiler = g_rd(g_gpu, TILER_PRESENT), l2 = g_rd(g_gpu, L2_PRESENT);
++	printf("SWEET GPU: present shader %#x tiler %#x l2 %#x; ready shader %#x tiler %#x l2 %#x\n",
++	    shader, tiler, l2, g_rd(g_gpu, SHADER_READY), g_rd(g_gpu, TILER_READY), g_rd(g_gpu, L2_READY));
++	if (level < 2 || id == 0 || id == 0xffffffffu) {
++		return;
++	}
++	if (g_power("L2", L2_PWRON, L2_READY, l2) &&
++	    g_power("tiler", TILER_PWRON, TILER_READY, tiler) &&
++	    g_power("shader", SHADER_PWRON, SHADER_READY, shader)) {
++		printf("SWEET GPU: all cores powered (step 2 done)\n");
++	}
++}
++
++void
++sweet_a8_gpu_init(void)
++{
++	int level = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++	if (level <= 0) {
++		return;
++	}
++	g_pmu = ml_io_map(PMU_PA, 0x5000);
++	g_cmu = ml_io_map(CMU_G3D_PA, 0x4000);
++	g_gpu = ml_io_map(GPU_PA, 0x5000);
++	if (!g_pmu || !g_cmu || !g_gpu) {
++		printf("SWEET GPU: MMIO mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(g_thread, (void *)(uintptr_t)level, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 210383e..8b8f03e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_a8_input_init(void);
++extern void sweet_a8_gpu_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -1240,6 +1241,7 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ #else
+ 	sweet_a8_input_init();          /* GPIO keys and sec_ts touch (sweet_a8input.c) */
++	sweet_a8_gpu_init();            /* Mali-G71 probe, boot-arg sweetgpu (sweet_a8gpu.c) */
+ #endif
+ 	return 0;
+ }
