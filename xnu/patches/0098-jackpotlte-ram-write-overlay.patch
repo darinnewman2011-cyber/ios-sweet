@@ -1,0 +1,191 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ce3fd91..5feea09 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -447,7 +447,7 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	return 0;
+ }
+ 
+-/* Not implemented: su.writable is never set on the A8, so this is unreachable. */
++/* Not implemented: A8 writes go to the RAM overlay (ovl_write), never here. */
+ static int
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
+@@ -684,6 +684,129 @@ root_read_blocks(uint64_t lba, uint32_t count)
+ 	return ufs_read_blocks(su.first_block + lba, count);
+ }
+ 
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * RAM write overlay (boot-arg sweetramrw=1, cap sweetrammb MiB, default 256):
++ * the eMMC stays read-only. A write copies each 4 KiB page it touches from the
++ * root device into RAM once and changes only the copy; reads are patched with
++ * the copies. Everything written is lost at reboot. Open addressing, keys are
++ * page number + 1 (0 = empty), entries are never removed.
++ */
++#define OVL_PAGE        4096u
++static struct {
++	uint64_t *key;
++	uint8_t **page;
++	uint32_t mask;          /* table size - 1 */
++	uint32_t n, max;        /* pages in use, cap */
++	bool full_logged;
++} ovl;
++
++static bool
++ovl_init(void)
++{
++	uint32_t on = 0, mb = 256;
++
++	PE_parse_boot_argn("sweetramrw", &on, sizeof(on));
++	PE_parse_boot_argn("sweetrammb", &mb, sizeof(mb));
++	if (!on || mb == 0) {
++		return false;
++	}
++	mb = MIN(mb, 1024);
++	ovl.max = mb * (1024 * 1024 / OVL_PAGE);
++	uint32_t size = 1;
++	while (size < 2 * ovl.max) {
++		size <<= 1;
++	}
++	ovl.key = kalloc_data(size * sizeof(*ovl.key), Z_WAITOK | Z_ZERO);
++	ovl.page = kalloc_data(size * sizeof(*ovl.page), Z_WAITOK | Z_ZERO);
++	if (!ovl.key || !ovl.page) {
++		printf("SWEET RAMRW: no memory for the overlay table, staying read-only\n");
++		return false;
++	}
++	ovl.mask = size - 1;
++	printf("SWEET RAMRW: writes go to a RAM overlay (up to %u MiB), never to the eMMC\n", mb);
++	return true;
++}
++
++static uint32_t
++ovl_slot(uint64_t pg)
++{
++	uint32_t i = (uint32_t)((pg * 0x9E3779B97F4A7C15ull) >> 32) & ovl.mask;
++
++	while (ovl.key[i] && ovl.key[i] != pg + 1) {
++		i = (i + 1) & ovl.mask;
++	}
++	return i;
++}
++
++/* Copy len bytes at byte offset off of the root device from src into the overlay. */
++static int
++ovl_write(uint64_t off, const char *src, uint32_t len)
++{
++	uint64_t dev_bytes = su.nblocks * UFS_BLOCK;
++
++	while (len) {
++		uint64_t pg = off / OVL_PAGE;
++		uint32_t skip = (uint32_t)(off % OVL_PAGE);
++		uint32_t n = MIN(len, OVL_PAGE - skip);
++		uint32_t i = ovl_slot(pg);
++		if (!ovl.key[i]) {
++			if (ovl.n >= ovl.max) {
++				if (!ovl.full_logged) {
++					printf("SWEET RAMRW: overlay full (%u pages), failing writes\n", ovl.n);
++					ovl.full_logged = true;
++				}
++				return ENOSPC;
++			}
++			uint8_t *p = kalloc_data(OVL_PAGE, Z_WAITOK | Z_ZERO);
++			if (!p) {
++				return ENOMEM;
++			}
++			/* Only a partial page needs the old contents. */
++			if (skip || n != OVL_PAGE) {
++				uint64_t pos = pg * OVL_PAGE;
++				uint32_t have = (uint32_t)MIN(OVL_PAGE, dev_bytes - pos);
++				int error = root_read_blocks(pos / UFS_BLOCK, (have + UFS_BLOCK - 1) / UFS_BLOCK);
++				if (error) {
++					kfree_data(p, OVL_PAGE);
++					return error;
++				}
++				memcpy(p, (const void *)(su.dma + DMA_BOUNCE), have);
++			}
++			ovl.key[i] = pg + 1;
++			ovl.page[i] = p;
++			ovl.n++;
++		}
++		memcpy(ovl.page[i] + skip, src, n);
++		off += n;
++		src += n;
++		len -= n;
++	}
++	return 0;
++}
++
++/* Lay overlay pages over len bytes at byte offset off just read into dst. */
++static void
++ovl_patch(uint64_t off, char *dst, uint32_t len)
++{
++	if (!ovl.n) {
++		return;
++	}
++	while (len) {
++		uint64_t pg = off / OVL_PAGE;
++		uint32_t skip = (uint32_t)(off % OVL_PAGE);
++		uint32_t n = MIN(len, OVL_PAGE - skip);
++		uint32_t i = ovl_slot(pg);
++		if (ovl.key[i]) {
++			memcpy(dst, ovl.page[i] + skip, n);
++		}
++		off += n;
++		dst += n;
++		len -= n;
++	}
++}
++#endif /* SWEET_JACKPOTLTE */
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+@@ -839,6 +962,18 @@ sweet_ufs_strategy(buf_t bp)
+ 	}
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
++#if defined(SWEET_JACKPOTLTE)
++	/* Writes only ever reach the RAM overlay; see ovl_write(). */
++	if (!rd) {
++		error = ovl_write(off, vaddr, count);
++		if (!error) {
++			buf_setresid(bp, 0);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		buf_unmap(bp);
++		goto done;
++	}
++#endif
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+@@ -850,6 +985,9 @@ sweet_ufs_strategy(buf_t bp)
+ 			error = root_read_blocks(lba, blocks);
+ 			if (!error) {
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
++#if defined(SWEET_JACKPOTLTE)
++				ovl_patch(pos, vaddr + done, want);
++#endif
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+@@ -1084,7 +1222,7 @@ sweet_ufs_init(void)
+ 	if (rw) {
+ 		printf("SWEET MMC: ufsrw ignored, eMMC writes are not implemented\n");
+ 	}
+-	su.writable = false;
++	su.writable = ovl_init();
+ #else
+ 	su.writable = (rw != 0);
+ #endif
+@@ -1233,6 +1371,9 @@ sweet_log_start(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++#if defined(SWEET_JACKPOTLTE)
++	on = 0;         /* the ring writes the eMMC directly; the A8 logs through ramoops */
++#endif
+ 	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
+ 		return;
+ 	}
