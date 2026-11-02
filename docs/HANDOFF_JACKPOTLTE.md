@@ -232,7 +232,10 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   sweet). On the A8 the alias uses L2 slots 1–6 of the kernel's L1 slot, below `gVirtBase` `0xfffffff006000000`.
   In this layout the physmap and dynamic memory start above the kernel (`phystokv(topOfKernelData)`), so the
   alias is never handed to the VM. No other patch assumes `VM_MIN_KERNEL_ADDRESS` = low globals.
-  CI run 41387128412 is building it.
+- **Run 41387128412 (commit afb201a): success**, ISA 0.
+  - Kernel `bc6846c6…b340` (matches `SHA256SUMS`). Payload `3c5cc419…c6ea` (reproduced locally).
+  - **`a8-xnu3-boot.img` SHA-256 `b3a413382bab04cdc0d88182706ed31334935cfbb16bf2ad40edb45db6e22df3`.** Flashed to BOOT
+    with all checks passing (readback matches), `adb reboot`. **Result: not yet reported.**
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
