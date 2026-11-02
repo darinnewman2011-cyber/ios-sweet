@@ -35,14 +35,16 @@ diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index 9a748ea..f76b2b9 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
-@@ -61,7 +61,13 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+@@ -61,7 +61,15 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
  MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
  MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
 +# SWEET_BOARD=jackpotlte (environment): Galaxy A8 2018 variant of the same
 +# platform code. Cortex-A73/A53 are ARMv8.0: no LSE atomics, PAN or RDM.
++# -mcpu=generic: otherwise Apple clang keeps the macOS default CPU's
++# features (LSE etc.) despite -march.
 +ifeq ($(SWEET_BOARD),jackpotlte)
-+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET_JACKPOTLTE -march=armv8-a
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET_JACKPOTLTE -mcpu=generic -march=armv8-a
 +else
  MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
 +endif

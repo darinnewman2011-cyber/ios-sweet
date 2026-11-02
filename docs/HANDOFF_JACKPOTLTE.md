@@ -98,7 +98,32 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       `github.com/<repo>/commit/<full sha>/checks/<job id>/logs` in the signed-in browser, take the
       redirected blob URL (it expires after about 10 minutes) and `curl` it. The log is about 30 MB, so grep for
       ` error: `.
-  - **Known to break the first A8 XNU boot (later steps, not in 0082):**
+- **XNU step 4b, SMP + 4K early framebuffer (commit `2d64023`, patches 0084/0085, CI run `41373667993`).**
+  - 0084 (SMP): `SWEET.h` gives `SWEET_BOOT_MPIDR` (A8 `0x100`), `SWEET_MPIDR_VALID()` (A53 `0x100–0x103`,
+    `0x200/0x201`, A73 `0x0/0x1`) and `SWEET_CPU_NAME`. SweetCPU uses these instead of sweet's checks
+    ("Aff0 must be 0", "boot MPIDR 0"). No other change was needed: the ADT marks cpu0 (`0x100`) "running",
+    XNU's reset vector already matches full Aff1:Aff0, and PSCI CPU_ON is the same `0xC4000003`. SMP still
+    needs `cpus=N` (default 1). A73 + A53 run as one homogeneous cluster.
+  - 0085 (early console, 4K):
+    - `SWEET.h` defines `SWEET_FB_PA`, `SWEET_FB_WIDTH`/`HEIGHT`/`STRIDE`/`BYTES`. A8: `0xEC000000`, 1080×2220.
+    - `start.s` stage 0 uses them. The bootstrap framebuffer mapping is the new `sweet_bootstrap_blocks` macro: it
+      reuses the L2 table of an occupied L1 slot or allocates one. sweet's result is unchanged (one 32 MB block in
+      L1 slot 0). The A8 needs 5 × 2 MB blocks in L1 slot 3, plus one Device block for DECON in slot 0.
+    - `arm_vm_init` maps the same blocks for the kernel alias above low globals.
+    - Command-mode panel: the early console re-arms DECON's TE trigger (`HW_SW_TRIG_CONTROL` 0x70: clear bit 4,
+      set bit 0) after every line, after a panic, and in start.s stage 0. Samsung's DECON driver says running with
+      `TRIG_AUTO_MASK_EN=0` is forbidden, so every update has to be presented.
+    - Assumption: the A8 boot shim leaves DECON enabled and DPP0 scanning `SWEET_FB_PA` (the diag shim's
+      `a8_present` and `fb_mirror` do this).
+    - `BOOTSTRAP_TABLE_SIZE` is 12 pages on the A8 (8 upstream).
+  - `xnu.yml` has a new "ISA check" step for `board=jackpotlte`: it disassembles the kernel and counts ARMv8.1+
+    instructions (LSE atomics, RDM, RCpc, non-hint PAC, dot product) per function. Output is
+    `isa-v81-functions.txt` in the kernel artifact and in the log. This covers the closed `libcc_kext`.
+  - Not covered yet: the regular framebuffer console and the IOMFB driver (after early-console stage 20) still
+    need a present path, which is step "panel present path".
+  - **Still blocking the first A8 XNU boot:** the A8 boot shim and payload placement (boot args with phys
+    base and size, ADT, DPP0 on `SWEET_FB_PA`). Also any ARMv8.1+ hits the ISA check finds.
+  - **Was blocking before 0084/0085 (now addressed):**
     - `SweetCPU::start`/`startAll` require boot MPIDR 0 and MPIDRs `0xN00` (A8 boots on `0x100`; MPIDRs use Aff0).
     - `start.s` hard-codes sweet's framebuffer `0x9c000000` (stage-0 white band, MMU off) and a 32 MB L2 block that
       is only valid with 16K pages. On the A8, `0x9c000000` is plain RAM.
@@ -164,7 +189,7 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
    check whether S-Boot leaves the controller usable, otherwise full init with the `samsung,dw-mshc-*` timings).
    First read-only in the shim, then the XNU root-device driver replacing `bsd/dev/sweet_ufs.c` (patches 0028–0034, 0069).
 4. XNU patches: **GICv2 interrupt controller and ARMv8.0/4K board variant written (0082, see Update above)**;
-   next: SMP MPIDR map (0065), the 4K-page/framebuffer/>4 GB fixes in `start.s`, GPIO keys
+   **SMP MPIDR map (0084) and 4K early framebuffer/DECON present (0085) written**; next: GPIO keys
    (`gpa1` 5/6/7 at `0x11CB0000`), `sec_ts` touch on `i2c@13870000` addr `0x48` (Samsung protocol, fw v0.0.2.20),
    panel present path. Rename the `xiaomi,sweet` compatible fallback in `mkadt.py` together with the platform expert.
 5. Payload placement: S-Boot puts the boot.img ramdisk at `0x89000000` and reports it in `/chosen`, but `BOOT` is only
