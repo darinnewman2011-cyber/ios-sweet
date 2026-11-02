@@ -340,7 +340,20 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     the heartbeat calls `sweet_a8_reboot_recovery()`. `panic_spin_forever()` waits `sweetpanicsecs` (default 10), then
     does the same. Read it in TWRP: `adb shell cat /sys/fs/pstore/dmesg-ramoops-0`.
   - Not covered: a hang with interrupts off (no heartbeat). The Exynos watchdog would cover it (TODO).
-  - CI run 41469279085. **Result: pending.**
+  - **Run 41469279085 (commit 3c713cd): success**, ISA 0. Kernel `cb504f51…b628`, payload `2200738d…8bcd` (reproduced
+    locally). **`a8-xnu10-boot.img` SHA-256 `1f60d1cdee46c19d61065cdce049dc97c7f2effe18c0285ebd6c7a0f834061b4`**, flashed, `adb reboot`.
+    The old Android pstore record was saved to `_tmp/pstore-android-before.txt` (PC only) first.
+  - **Observed (first hands-off run): the phone came back in TWRP by itself after 118 s** and
+    `/sys/fs/pstore/dmesg-ramoops-0` held the XNU console (5738 bytes, Darwin banner through IOKit). The heartbeat says:
+    `stage 'PE_lockdown_iokit returned' state 0x9 event 0xfffffff007bd9dc4` (TH_WAIT|TH_UNINT), unchanged for 90 s, then
+    `rebooting into TWRP (sweetreboot)`. llvm-nm: `0xfffffff007bd9dc4` = **`_max_cpus_initialized`**: the boot thread is
+    in `vm_set_restrictions(machine_info.max_cpus)`, waiting for `ml_set_max_cpus()`. No `SWEET CPU:` line at all.
+  - **Cause:** SweetCPU's IOKit personality has `IONameMatch = 'qcom,kryo470'`; the A8's `/cpus` nodes are
+    `arm,cortex-a53` / `arm,cortex-a73`. No CPU driver starts, so max_cpus is never set. That's also why xnu6–xnu8
+    stopped after `SWEET FB`.
+  - **Fix: 0096-jackpotlte-cpu-driver-match.patch** (commit c05a1e7): on jackpotlte `IONameMatch = ('arm,cortex-a53',
+    'arm,cortex-a73')`. CI run 41471902922. **Result: pending.**
+  - The public GitHub API allows 60 requests/hour without a token: poll every 90 s, or read the Actions page in the browser.
   - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
