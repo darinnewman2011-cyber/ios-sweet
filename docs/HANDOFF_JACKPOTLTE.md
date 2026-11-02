@@ -11,6 +11,11 @@ in this repo is the reference; a Snapdragon S9 (SM-G9600) port exists in `PatoKu
 from TWRP). Treat third-party forks as untrusted reading material; do not run their code unreviewed.
 
 ## Update 2026-11-01 (Claude Code session on the user's PC)
+- **Repo:** the user's fork is `darinnewman2011-cyber/ios-sweet` (remote `origin`; `upstream` = dipa-studio), work on
+  branch `jackpotlte`. GitHub Actions is enabled on the fork; `xnu.yml` (workflow_dispatch, macos-14) has not been
+  run yet. Local toolchain: LLVM 23.1.4 (`C:\Program Files\LLVM\bin`, add to PATH) builds the shim; Python is
+  `python` (Espressif's), not the WindowsApps `python3` stub. Keep Git Bash paths short (MAX_PATH) and use
+  `MSYS_NO_PATHCONV=1` for `adb shell` with `/dev/...` arguments.
 - **Observed:** the diagnostic image (SHA-256 `19d11df…0396e`) was `dd`'d to BOOT from TWRP; BOOT read back with the
   same hash. On reboot the screen **kept showing the S-Boot splash** ("SAMSUNG Galaxy A8 / powered by android"); no
   blue or red screen. **Guess:** the command-mode panel keeps its last frame (the splash) in panel RAM, so our
