@@ -421,6 +421,24 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - Not seen (unverified): what the frame shows (lock screen, boot logo or blank). Nobody was watching the screen
     and the panel content is lost on reboot. securityd keeps getting `0xe00002c7` from AKS sel 10 (keybag; guess:
     harmless for now).
+  - **User watched ios5 (`sweetreboot=0`):** the screen showed the **Apple logo** (iOS's own boot frame), then the kernel
+    console text scrolled over it. 0 ⇒ `sweetfb_noconsole=1` from ios7 on: clean Apple logo, the screen still refreshes.
+  - **0099 (commit 1586691, CI 41509829383): GPIO keys + sec_ts touch work** (ios6s, 1 core): `SWEET HID: touch 0 down at
+    447,1332`, right-edge touches at x≈1050 tagged `edge`, `SWEET A8 KEYS: key=2 down=1 gpa1=0xae` →
+    `SWEET HID: key 0xea down (1 clients)` (volume down), volume up likewise; power (0x30) seen in ios7.
+  - **ios6 (cpus=6) panicked:** `cpu=1 PSCI CPU_ON rc=0`, then `NOT alive after 5s`. **0100 (commit 376afb0, CI
+    41512421744):** trampoline at PA 0x80080000 (`ldr x16,=entry; br x16`). **ios7 (cpus=6, noconsole, SHA-256
+    `e8cd02c5…b8da`) ran 460+ s with no panic: 6 A53 cores up.**
+  - **Why it stays on the Apple logo (ios7, symbolicated with `ipsw` v3.1.739 + `tools/sweet-crash.py`):** SpringBoard's
+    main thread waits in `_LSContextInitCommon` ← `-[LSApplicationRecord initWithBundleIdentifier:…]` ←
+    `-[CCSModuleRepository _queue_filterModuleMetadataByAssociatedBundleAvailability:]`; another thread is in
+    `__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__` (`_LSCopyServerStore`, sync XPC to lsd). lsd is rebuilding
+    the app database. Guess: with the RAM overlay **every boot is a first boot** (nothing persists), and the reseed is slow
+    on PIO eMMC reads. bluetoothd and fairplayd.H2 also relaunch every ~10 s. Fixes: a persistent data volume
+    (`/private/var` in a fully allocated file), faster eMMC (IDMAC/DMA), CPU clock, and the S7's BTAudioHALPlugin removal.
+  - Symbolication setup (WSL): image mounted read-only at `/mnt/iosroot` (`_tmp/wsl/mountro.sh`); ipsw needs the cache in
+    a writable dir, so `/opt/sweet/dsc` holds **relative** symlinks to the cache files (absolute ones fail, overlayfs on
+    hfsplus fails).
   - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
     volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
     read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in
