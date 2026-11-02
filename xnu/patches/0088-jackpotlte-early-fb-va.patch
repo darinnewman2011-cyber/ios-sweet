@@ -1,0 +1,19 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 6ebf014..a4eeaa9 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1832,7 +1832,13 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  * for a Normal-NC framebuffer alias (and on command-mode panels a Device
+  * alias of the DECON registers) that survives bootstrap TTBR0 teardown.
+  */
+-#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++/*
++ * LOW_GLOBAL_BASE_ADDRESS, not VM_MIN_KERNEL_ADDRESS: they are equal with
++ * ARM_LARGE_MEMORY (sweet), but in the iOS 4K layout (jackpotlte, 0087)
++ * VM_MIN_KERNEL_ADDRESS is 64 GB below the kernel's L1 slot, which has no
++ * L2 table there.
++ */
++#define SWEET_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
+ #define SWEET_EARLY_FB_BLOCKS ((SWEET_FB_BYTES + ARM_TT_L2_SIZE - 1) / ARM_TT_L2_SIZE)
+ #if defined(SWEET_DECON_PA)
+ #define SWEET_EARLY_DECON_VA (SWEET_EARLY_FB_VA + SWEET_EARLY_FB_BLOCKS * ARM_TT_L2_SIZE + 	(SWEET_DECON_PA & ARM_TT_L2_OFFMASK))
