@@ -60,6 +60,49 @@ static const uint32_t a8_mpidr[8] = { 0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 
 
 #define FB_SIZE		(FB_H * FB_STRIDE)	/* S-Boot reserves room for two buffers */
 
+/*
+ * eMMC: Synopsys DW-MSHC v270a with Samsung extensions (dw_mmc.h,
+ * dw_mmc-exynos.h in the dpu_7885-era kernel). S-Boot has already brought
+ * the card up (it loads boot.img from it), so this only issues read-side
+ * commands: CMD13 SEND_STATUS, CMD7 SELECT (only if the card is in standby)
+ * and CMD17 READ_SINGLE_BLOCK, in PIO mode. Nothing that writes the card.
+ */
+#define MMC_BASE	0x13500000UL
+#define MMC_CTRL	0x000
+#define  CTRL_FIFO_RESET	(1u << 1)
+#define  CTRL_DMA_ENABLE	(1u << 5)
+#define  CTRL_USE_IDMAC		(1u << 25)
+#define MMC_CTYPE	0x018
+#define MMC_BLKSIZ	0x01c
+#define MMC_BYTCNT	0x020
+#define MMC_CMDARG	0x028
+#define MMC_CMD		0x02c
+#define  CMD_START		(1u << 31)
+#define  CMD_USE_HOLD_REG	(1u << 29)	/* Samsung: set when CLKSEL drive phase != 0 */
+#define  CMD_PRV_DAT_WAIT	(1u << 13)
+#define  CMD_DAT_EXP		(1u << 9)
+#define  CMD_RESP_CRC		(1u << 8)
+#define  CMD_RESP_EXP		(1u << 6)
+#define MMC_RESP0	0x030
+#define MMC_RINTSTS	0x044
+#define  INT_RXDR		(1u << 5)
+#define  INT_DATA_OVER		(1u << 3)
+#define  INT_CMD_DONE		(1u << 2)
+#define  INT_RTO		(1u << 8)
+#define  INT_ERROR		0xbfc2u		/* SDMMC_INT_ERROR */
+#define MMC_STATUS	0x048
+#define  STATUS_BUSY		(1u << 9)
+#define  STATUS_FCNT(s)		(((s) >> 17) & 0x1fff)
+#define MMC_VERID	0x06c
+#define MMC_HCON	0x070
+#define MMC_UHS_REG	0x074
+#define MMC_BMOD	0x080
+#define  BMOD_IDMAC_ENABLE	(1u << 7)
+#define MMC_CLKSEL	0x0a4		/* CONFIG_MMC_DW_64BIT_DESC=y: after BUFADDRU */
+#define MMC_FIFO	0x200		/* DATA_240A_OFFSET; 64-bit entries, read as two 32-bit words */
+#define MMC_MPSEND0	0x1204		/* "protector" (SMU): secure view may fault, read last */
+#define MMC_MPSCTRL0	0x120c
+
 /* PMU software reset (verified 2026-11-01: reboots the SoC). */
 #define PMU_SWRESET	0x11C80400UL
 
@@ -214,8 +257,6 @@ static void test_gic(void)
 	uint32_t dctlr = mmio32(GICD_BASE + GICD_CTLR);
 	uint32_t en;
 
-	con_str("GIC", "configuring...");
-	a8_present();
 	wr32(GICD_BASE + GICD_CTLR, dctlr | 1);
 	con_hex2("GICD", "was=", dctlr, "now=", mmio32(GICD_BASE + GICD_CTLR));
 	en = mmio32(GICD_BASE + GICD_ISENABLER0);
@@ -259,10 +300,8 @@ static void test_smp(void)
 			con_str(label, "boot cpu");
 			continue;
 		}
-		con_hex2(label, "mpidr=", a8_mpidr[i], 0, 0);
-		a8_present();	/* if CPU_ON hangs, this is the last line */
-		con_hex2(label, "ret=", (uint32_t)smc(PSCI_CPU_ON, a8_mpidr[i],
-						     (uintptr_t)secondary_entry, i), 0, 0);
+		con_hex2(label, "mpidr=", a8_mpidr[i], "ret=",
+			 (uint32_t)smc(PSCI_CPU_ON, a8_mpidr[i], (uintptr_t)secondary_entry, i));
 	}
 	delay_ms(500);
 	for (int i = 0; i < 12; i++)
@@ -270,6 +309,169 @@ static void test_smp(void)
 			alive |= 1u << i;
 	/* expected 0x3e3: slots 0,1 (A73), 5-7 (A53 0x101-0x103), 8,9 (A53 0x200/0x201) */
 	con_hex2("SMP", "alive=", alive, "want=", 0x3e3);
+}
+
+/* ---- eMMC, read-only ---- */
+
+static uint64_t mmc_blk[512 / 8];	/* one sector; 8-byte aligned for GPT fields */
+static uint32_t mmc_hold;		/* CMD_USE_HOLD_REG or 0 */
+static uint32_t mmc_fifo64;		/* 64-bit FIFO entries */
+
+static uint32_t mmc_rd(uint32_t r)
+{
+	return mmio32(MMC_BASE + r);
+}
+
+static void mmc_wr(uint32_t r, uint32_t v)
+{
+	wr32(MMC_BASE + r, v);
+}
+
+/* Wait until (reg & mask) == want, up to ms milliseconds. */
+static int mmc_wait(uint32_t r, uint32_t mask, uint32_t want, unsigned ms)
+{
+	uint64_t t0 = now(), lim = ticks_per_sec() / 1000 * ms;
+
+	while ((mmc_rd(r) & mask) != want)
+		if (now() - t0 > lim)
+			return 0;
+	return 1;
+}
+
+/* Send one command; returns RINTSTS (0xffffffff if the CIU never took it). */
+static uint32_t mmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
+{
+	uint32_t st;
+
+	mmc_wait(MMC_STATUS, STATUS_BUSY, 0, 100);
+	mmc_wr(MMC_RINTSTS, 0xffffffff);
+	mmc_wr(MMC_CMDARG, arg);
+	__asm__ volatile("dsb sy" ::: "memory");
+	mmc_wr(MMC_CMD, CMD_START | mmc_hold | flags | idx);
+	if (!mmc_wait(MMC_CMD, CMD_START, 0, 10))
+		return 0xffffffff;
+	mmc_wait(MMC_RINTSTS, INT_CMD_DONE, INT_CMD_DONE, 100);
+	st = mmc_rd(MMC_RINTSTS);
+	*resp = mmc_rd(MMC_RESP0);
+	return st;
+}
+
+/* CMD17 one 512-byte sector into mmc_blk through the FIFO; returns RINTSTS, 0 = no error bits. */
+static uint32_t mmc_read(uint32_t lba)
+{
+	uint32_t st, resp, n = 0;
+	uint64_t t0, lim = ticks_per_sec() / 2;
+	volatile uint32_t *w = (volatile uint32_t *)mmc_blk;
+
+	mmc_wr(MMC_CTRL, mmc_rd(MMC_CTRL) | CTRL_FIFO_RESET);
+	mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10);
+	mmc_wr(MMC_BLKSIZ, 512);
+	mmc_wr(MMC_BYTCNT, 512);
+	st = mmc_cmd(17, lba, CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_PRV_DAT_WAIT, &resp);
+	if (st == 0xffffffff || (st & INT_ERROR))
+		return st;
+	t0 = now();
+	for (;;) {
+		uint32_t s = mmc_rd(MMC_STATUS), r = mmc_rd(MMC_RINTSTS);
+
+		/* FIFO count is in host-data-width entries (HCON[9:7]: 1 = 32-bit, 2 = 64-bit) */
+		for (uint32_t c = STATUS_FCNT(s); c && n < 128; c--) {
+			w[n++] = mmio32(MMC_BASE + MMC_FIFO);
+			if (mmc_fifo64)
+				w[n++] = mmio32(MMC_BASE + MMC_FIFO + 4);
+		}
+		mmc_wr(MMC_RINTSTS, INT_RXDR);
+		if (r & INT_ERROR)
+			return r | 0x80000000u;
+		if ((r & INT_DATA_OVER) && n >= 128)
+			return 0;
+		if (now() - t0 > lim)
+			return r | 0x40000000u;	/* timeout: shows what had arrived */
+	}
+}
+
+static uint16_t blk16(unsigned off)
+{
+	return ((volatile uint16_t *)mmc_blk)[off / 2];
+}
+
+static uint32_t blk32(unsigned off)
+{
+	return ((volatile uint32_t *)mmc_blk)[off / 4];
+}
+
+static uint64_t blk64(unsigned off)
+{
+	return mmc_blk[off / 8];
+}
+
+static void test_mmc(void)
+{
+	uint32_t st, resp = 0, rca, state, ents_lba, nents, boot_lba = 0;
+
+	con_hex2("MMC", "ctrl=", mmc_rd(MMC_CTRL), "verid=", mmc_rd(MMC_VERID));
+	con_hex2("MMC2", "hcon=", mmc_rd(MMC_HCON), "clksel=", mmc_rd(MMC_CLKSEL));
+	con_hex2("MMC3", "ctype=", mmc_rd(MMC_CTYPE), "uhs=", mmc_rd(MMC_UHS_REG));
+	con_hex2("MMC4", "bmod=", mmc_rd(MMC_BMOD), "status=", mmc_rd(MMC_STATUS));
+	a8_present();
+	if ((mmc_rd(MMC_CLKSEL) >> 16) & 7)
+		mmc_hold = CMD_USE_HOLD_REG;
+	mmc_fifo64 = ((mmc_rd(MMC_HCON) >> 7) & 7) == 2;
+	/* PIO: the FIFO is read by the CPU, no IDMAC descriptors */
+	mmc_wr(MMC_CTRL, mmc_rd(MMC_CTRL) & ~(CTRL_USE_IDMAC | CTRL_DMA_ENABLE));
+	mmc_wr(MMC_BMOD, mmc_rd(MMC_BMOD) & ~BMOD_IDMAC_ENABLE);
+
+	/* S-Boot's RCA is unknown: the right one answers, the others time out (RTO) */
+	for (rca = 1; rca <= 3; rca++) {
+		st = mmc_cmd(13, rca << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
+		if (st != 0xffffffff && !(st & INT_RTO))
+			break;
+	}
+	state = (resp >> 9) & 0xf;	/* 3 stby, 4 tran */
+	con_hex2("CARD", "rca=", rca, "r1=", resp);
+	if (rca <= 3 && state == 3) {
+		mmc_cmd(7, rca << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
+		mmc_cmd(13, rca << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
+		con_hex2("CMD7", "r1=", resp, 0, 0);
+	}
+	a8_present();
+
+	st = mmc_read(0);
+	con_hex2("LBA0", "rint=", st, "sig=", blk16(510));	/* protective MBR: 0xAA55 */
+	a8_present();
+	if (st)
+		goto smu;
+	st = mmc_read(1);
+	con_hex2("GPT", "rint=", st, "magic=", blk32(0));	/* "EFI " = 0x20494645 */
+	if (st || blk64(0) != 0x5452415020494645ULL)		/* "EFI PART" */
+		goto smu;
+	ents_lba = (uint32_t)blk64(72);
+	nents = blk32(80);
+	con_hex2("GPT2", "ents=", ents_lba, "n=", nents);
+	/* find "BOOT" (UTF-16LE name at +56 in each 128-byte entry) */
+	for (uint32_t i = 0; i < nents && i < 64 && !boot_lba; i++) {
+		unsigned off = (i % 4) * 128;
+
+		if (i % 4 == 0 && mmc_read(ents_lba + i / 4))
+			break;
+		if (blk16(off + 56) == 'B' && blk16(off + 58) == 'O' && blk16(off + 60) == 'O' &&
+		    blk16(off + 62) == 'T' && blk16(off + 64) == 0)
+			boot_lba = (uint32_t)blk64(off + 32);
+	}
+	con_hex2("BOOTPART", "lba=", boot_lba, 0, 0);
+	a8_present();
+	if (!boot_lba)
+		goto smu;
+	st = mmc_read(boot_lba);
+	/* our own boot.img: "ANDR" = 0x52444e41, kernel_size = this shim's Image size */
+	con_hex2("BOOTHDR", "magic=", blk32(0), "ksize=", blk32(8));
+	if (st)
+		con_hex2("BOOTRD", "rint=", st, 0, 0);
+smu:
+	con_str("SMU", "reading protector...");
+	a8_present();	/* if this read faults, the red screen shows FAR */
+	con_hex2("SMU", "ctrl0=", mmc_rd(MMC_MPSCTRL0), "end0=", mmc_rd(MMC_MPSEND0));
+	a8_present();
 }
 
 /* ---- main ---- */
@@ -284,7 +486,7 @@ void a8_main(uintptr_t dtb)
 	uint64_t s = 0;
 
 	con_clear(BLUE);
-	con_str("A8 SHIM", "milestone 2: gic + smp");
+	con_str("A8 SHIM", "milestone 3: emmc read");
 	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
 	con_hex2("ID", "midr=", rsr("midr_el1"), "sctlr=", rsr("sctlr_el1"));
 	if (dtb && be32(dtb) == 0xd00dfeed)
@@ -295,11 +497,10 @@ void a8_main(uintptr_t dtb)
 		 "trig=", mmio32(DECON_BASE + DECON_TRIG_CONTROL));
 	con_str("PRESENT", a8_present() ? "run ok" : "no run status");
 	test_gic();
-	con_str("PSCI", "calling version...");
-	a8_present();
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), 0, 0);
-	a8_present();
 	test_smp();
+	a8_present();
+	test_mmc();
 #ifdef A8_PROBE_RESET
 	con_str("DONE", "PMU reset soon");
 	a8_present();
