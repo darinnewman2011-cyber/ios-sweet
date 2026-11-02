@@ -1,7 +1,23 @@
 # GPU on the Galaxy A8 (2018): plan
 
-Status 2026-11-02: **plan only, nothing written or tested.** Today iOS on the A8 draws everything on the CPU
-(CoreAnimation in software, frames copied into the S-Boot framebuffer), like sweet.
+Status 2026-11-02: **step 2 done on the phone** (patch 0101, `sweetgpu=2`, boot image `a8-ios9b`, SHA-256
+`94a30287…eea1`). iOS itself still draws everything on the CPU (CoreAnimation in software, frames copied into the
+S-Boot framebuffer), like sweet.
+
+Observed (ramoops log, 6 cores, 45 s run):
+```
+SWEET GPU: pd-g3d config 0xf status 0x3000f; CMU_G3D pll_con0 0xa1570d11 switch_user 0 busd_mux 0 busp_div 0x3
+SWEET GPU: GPU_ID 0x60a00002 ... L2 0x7120206 core 0 tiler 0x809 mem 0x1 mmu 0x2830 as 0xff js 0x7 status 0
+SWEET GPU: present shader 0x3 tiler 0x1 l2 0x1; ready shader 0 tiler 0 l2 0
+SWEET GPU: L2 ready 0x1 after ~0 ms / tiler ready 0x1 after ~0 ms / shader ready 0x3 after ~10 ms
+```
+- S-Boot leaves the G3D domain **on** (config/status `0xF`) and PLL_G3D enabled and locked (bits 31 and 29 of
+  `0xa1570d11`), so no PMU or clock write was needed.
+- `GPU_ID 0x60a00002` = arch 6.0 (Bifrost), product major 0 = **TMIx (Mali-G71)**, version r0p0, status 2.
+  (The probe's own "product/rNpN" printout uses the old Midgard layout; ignore it.)
+- 2 shader cores, 1 tiler, 1 L2, 3 job slots (`JS_PRESENT 0x7`), 8 address spaces (`AS_PRESENT 0xff`),
+  `MMU_FEATURES 0x2830` (VA 48 bits, PA 40 bits), coherency features `MEM 0x1`.
+- Powering L2, tiler and shaders through PWRON works; nothing hung.
 
 ## The hardware (from the phone's live FDT and Samsung's Exynos 7885 kernel)
 
