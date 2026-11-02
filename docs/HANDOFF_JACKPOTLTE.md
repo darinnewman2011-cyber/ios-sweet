@@ -364,6 +364,20 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - **Next blocker: an HFS+ iOS root on the eMMC.** Decision pending with the user: GPT split (plan below, wipes
     Android data) or an image file inside the ext4 USERDATA (no wipe, the driver needs an extent map; the file must
     live outside FBE-encrypted dirs, e.g. `/data/sweet/`, so it is plaintext on disk; 14 GB free on 2026-11-02).
+  - **User chose the image file (no wipe), 2026-11-02.** Verified in TWRP: `/data/sweet/t.bin` (4 MiB, inode 1044512,
+    flags `0x80000` = extents, no encrypt flag) maps to one extent at partition block 4228096, and the raw eMMC
+    bytes there are the plaintext test pattern. `tools/ext4map.py DEV INODE` does this walk over adb.
+  - **0097-jackpotlte-file-backed-root.patch** (commit 4238c0d): boot-arg `sweetrootino=N` makes the root device the
+    ext4 file with inode N in USERDATA (superblock → group descriptor → inode → extent tree, up to 8192 extents;
+    holes/unwritten read as zeros; read-only). Prints `SWEET ROOT: "USERDATA" inode N: … MiB, … extents`.
+    Without the boot-arg nothing changes. CI run 41477553892. **Result: pending.** First test plan: payload rebuilt
+    locally with `sweetrootino=1044512` → HFS should report `unknown Volume Signature : 5454` ("TT" from the
+    pattern at file offset 1024), proving the mapping.
+  - Local tree note: the Windows checkout has CRLF patch files; strip `` before `git apply` in `_tmp/` trees.
+  - **iOS image build (WSL Ubuntu 26.04):** the WSL kernel 6.18.54.1 has no hfsplus (`# CONFIG_HFSPLUS_FS is not set`,
+    modules allowed, no signing), apfs-fuse is not packaged, TWRP's kernel has no HFS+ either. Plan: build `hfsplus.ko`
+    from Microsoft's `linux-msft-wsl-6.18.54.1` tag, build apfs-fuse from source, apt hfsprogs. Blocked on the user's OK
+    to download/build/run that code as root in WSL. PC: C: freed to 35 GB (WSL swap 32→4 GB in `.wslconfig`).
   - The public GitHub API allows 60 requests/hour without a token: poll every 90 s, or read the Actions page in the browser.
   - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
