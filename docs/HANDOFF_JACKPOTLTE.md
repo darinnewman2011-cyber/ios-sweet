@@ -198,7 +198,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - The image stays on the PC (`_tmp/`, not in git).
 - **Flashed 2026-11-01 (user approved):** pushed to `/sdcard/a8-xnu1-boot.img` (hash OK on the phone), `dd` to
   `/dev/block/by-name/BOOT` (= `mmcblk0p12`), readback SHA-256 matches `270f5102…4772`, `adb reboot` from TWRP.
-  `/sdcard/a8bak/BOOT.img` re-checked as `c87a1336…` before writing. **Result on screen: not yet reported.**
+  `/sdcard/a8bak/BOOT.img` re-checked as `c87a1336…` before writing.
+- **Observed (user photos):** the shim's blue screen is complete (PAYLOAD size `F7D520`, 10 segments, JUMP
+  `0x881429488`; S-Boot placed the shim at `0x800CC000`; con_hex2 shows only the low 32 bits of the 64-bit
+  addresses). XNU's start.s stage-0 white block (bottom left) appeared, then nothing: no `arm_init` text.
+- **Cause (from the binary):** the boot TCR has T1SZ 26 (4K + `__ARM64_PMAP_SUBPAGE_L1__`: 38-bit kernel VA from
+  `0xffffffc000000000`), but the macOS platform links the kernel at `0xfffffe0007004000` (ARM_LARGE_MEMORY,
+  −2 TB). The branch to the kernel VA after the MMU is enabled faults, and so does the exception vector.
+- **Fix: 0087-jackpotlte-ios-kernel-va.patch** (commit 7525da0): for jackpotlte, `-UARM_LARGE_MEMORY` and link
+  at `0xfffffff007004000` (iOS 4K layout). A CI build with board=jackpotlte has been dispatched. **Next:** check
+  it builds, that "Applying patch ...0087" is in the log and the ISA count is still 0, and that the payload's
+  virt_base is now `0xfffffff006000000`. Then rebuild the boot image (download artifact,
+  `PAYLOAD=... shim/a8/build.sh`, `mka8boot.py`) and flash only with the user's OK.
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
