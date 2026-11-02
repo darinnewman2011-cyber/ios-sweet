@@ -1,0 +1,378 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 08e52c4..2d193c4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -313,7 +313,8 @@ ufs_sync_cache(void)
+  * phone): PIO, DDR52 8-bit, card selected at RCA 1 in TRAN state, Samsung
+  * protector (SMU) in bypass. Like the shim, this reuses that state and reads
+  * polled single sectors (CMD17) through the FIFO. "Device blocks" are 512-byte
+- * sectors here (the eMMC GPT uses them too). No writes yet.
++ * sectors here (the eMMC GPT uses them too). Writes (CMD24) exist only for the
++ * file-backed root and only inside the USERDATA partition (mmc_wr_lo/hi).
+  */
+ #define MMC_CTRL        0x000
+ #define CTRL_FIFO_RESET         (1u << 1)
+@@ -326,17 +327,20 @@ ufs_sync_cache(void)
+ #define CMD_START               (1u << 31)
+ #define CMD_USE_HOLD_REG        (1u << 29)      /* Samsung: when CLKSEL drive phase != 0 */
+ #define CMD_PRV_DAT_WAIT        (1u << 13)
++#define CMD_READ_WRITE          (1u << 10)      /* data direction: card <- host */
+ #define CMD_DAT_EXP             (1u << 9)
+ #define CMD_RESP_CRC            (1u << 8)
+ #define CMD_RESP_EXP            (1u << 6)
+ #define MMC_RESP0       0x030
+ #define MMC_RINTSTS     0x044
+ #define INT_RXDR                (1u << 5)
++#define INT_TXDR                (1u << 4)
+ #define INT_DATA_OVER           (1u << 3)
+ #define INT_CMD_DONE            (1u << 2)
+ #define INT_ERROR               0xbfc2u         /* SDMMC_INT_ERROR */
+ #define MMC_STATUS      0x048
+-#define STATUS_BUSY             (1u << 9)
++#define STATUS_BUSY             (1u << 9)       /* DAT0 low: card busy */
++#define STATUS_FIFO_FULL        (1u << 3)
+ #define STATUS_FCNT(s)          (((s) >> 17) & 0x1fff)
+ #define MMC_HCON        0x070
+ #define MMC_BMOD        0x080
+@@ -350,6 +354,7 @@ ufs_sync_cache(void)
+ 
+ static uint32_t mmc_hold;                       /* CMD_USE_HOLD_REG or 0 */
+ static bool mmc_fifo64;
++static uint64_t mmc_wr_lo, mmc_wr_hi;           /* writable sectors [lo, hi): USERDATA, 0 = none */
+ 
+ /* Wait until (reg & mask) == want; false on timeout. */
+ static bool
+@@ -431,6 +436,89 @@ mmc_read_sector(uint64_t lba, uint32_t *dst)
+ 	}
+ }
+ 
++/* R1 error bits: everything in 31..19 except CARD_IS_LOCKED (25). */
++#define R1_ERRORS       0xfdf80000u
++#define R1_STATE(r)     (((r) >> 9) & 0xf)
++#define R1_READY        (1u << 8)
++
++/* After a write or an R1b command: DAT0 released, then CMD13 until TRAN and ready. */
++static int
++mmc_wait_tran(uint64_t lba)
++{
++	uint32_t st, resp = 0;
++
++	if (!mmc_wait(MMC_STATUS, STATUS_BUSY, 0, MMC_DATA_NS)) {
++		printf("SWEET MMC: 0x%llx: card still busy\n", lba);
++		return ETIMEDOUT;
++	}
++	for (int i = 0; i < 1000; i++) {
++		st = mmc_cmd(13, MMC_RCA << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
++		if (st != UINT32_MAX && !(st & INT_ERROR)) {
++			if (resp & R1_ERRORS) {
++				printf("SWEET MMC: 0x%llx: card status 0x%x\n", lba, resp);
++				return EIO;
++			}
++			if (R1_STATE(resp) == 4 && (resp & R1_READY)) {
++				return 0;
++			}
++		}
++		delay(10);
++	}
++	printf("SWEET MMC: 0x%llx: card not back in TRAN, r1 0x%x\n", lba, resp);
++	return ETIMEDOUT;
++}
++
++/* CMD24: one 512-byte sector from src (4-byte aligned), only inside [mmc_wr_lo, mmc_wr_hi). */
++static int
++mmc_write_sector(uint64_t lba, const uint32_t *src)
++{
++	uint32_t st, resp = 0, n = 0;
++	uint64_t deadline;
++
++	if (lba < mmc_wr_lo || lba >= mmc_wr_hi || lba > UINT32_MAX) {
++		printf("SWEET MMC: refusing write at 0x%llx (writable 0x%llx-0x%llx)\n", lba, mmc_wr_lo, mmc_wr_hi);
++		return EPERM;
++	}
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
++	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
++	ufs_wr(MMC_BLKSIZ, 512);
++	ufs_wr(MMC_BYTCNT, 512);
++	st = mmc_cmd(24, (uint32_t)lba,
++	    CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_READ_WRITE | CMD_PRV_DAT_WAIT, &resp);
++	if (st == UINT32_MAX || (st & INT_ERROR) || (resp & R1_ERRORS)) {
++		printf("SWEET MMC: CMD24 0x%llx: rintsts 0x%x r1 0x%x\n", lba, st, resp);
++		return EIO;
++	}
++	nanoseconds_to_absolutetime(MMC_DATA_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t r = ufs_rd(MMC_RINTSTS);
++
++		/* A 64-bit FIFO takes whole 64-bit entries (Linux dw_mmc: writeq). */
++		while (n < 128 && !(ufs_rd(MMC_STATUS) & STATUS_FIFO_FULL)) {
++			if (mmc_fifo64) {
++				*(volatile uint64_t *)(su.regs + MMC_FIFO) = ((uint64_t)src[n + 1] << 32) | src[n];
++				n += 2;
++			} else {
++				ufs_wr(MMC_FIFO, src[n++]);
++			}
++		}
++		ufs_wr(MMC_RINTSTS, INT_TXDR);
++		if (r & INT_ERROR) {
++			printf("SWEET MMC: write 0x%llx: rintsts 0x%x after %u words\n", lba, r, n);
++			return EIO;
++		}
++		if ((r & INT_DATA_OVER) && n >= 128) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: write 0x%llx timed out: rintsts 0x%x, %u words\n", lba, r, n);
++			return ETIMEDOUT;
++		}
++	}
++	return mmc_wait_tran(lba);
++}
++
+ /* count sectors at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -449,17 +537,30 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	return 0;
+ }
+ 
+-/* Not implemented: A8 writes go to the RAM overlay (ovl_write), never here. */
++/* Raw partition writes stay off on the A8: only file_write_blocks() writes. */
+ static int
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
+-	printf("SWEET MMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++	printf("SWEET MMC: refusing raw write of %u blocks at 0x%llx\n", count, lba);
+ 	return EROFS;
+ }
+ 
++/* CMD6 SWITCH EXT_CSD[32] FLUSH_CACHE = 1 (R1b); harmless if the cache is off. */
+ static int
+ ufs_sync_cache(void)
+ {
++	static bool logged;
++	uint32_t resp = 0, st;
++
++	if (!mmc_wr_hi) {
++		return 0;
++	}
++	st = mmc_cmd(6, (3u << 24) | (32u << 16) | (1u << 8), CMD_RESP_EXP | CMD_RESP_CRC, &resp);
++	int error = (st == UINT32_MAX || (st & INT_ERROR)) ? EIO : mmc_wait_tran(0);
++	if (error && !logged) {
++		printf("SWEET MMC: cache flush failed (rintsts 0x%x r1 0x%x), ignoring\n", st, resp);
++		logged = true;
++	}
+ 	return 0;
+ }
+ 
+@@ -619,42 +720,105 @@ ext4_map_file(uint32_t ino)
+ 	return error;
+ }
+ 
++/*
++ * Partition sector of file sector lba, UINT64_MAX for a hole or an unwritten
++ * extent; *n = sectors (<= count) that continue the same way.
++ */
++static uint64_t
++file_extent(uint64_t lba, uint32_t count, uint32_t *n)
++{
++	uint32_t spb = xf.bsz / UFS_BLOCK;
++	uint64_t fblk = lba / spb;
++	uint32_t lo = 0, hi = xf.nrun;
++
++	/* last run with fblk >= run.fblk */
++	while (lo < hi) {
++		uint32_t mid = (lo + hi) / 2;
++		if (xf.run[mid].fblk <= fblk) {
++			lo = mid + 1;
++		} else {
++			hi = mid;
++		}
++	}
++	const struct ext4_run *r = lo ? &xf.run[lo - 1] : NULL;
++	if (r && fblk < (uint64_t)r->fblk + r->len) {
++		uint64_t end = ((uint64_t)r->fblk + r->len) * spb;
++		*n = (uint32_t)MIN(count, end - lba);
++		return r->pblk == UINT64_MAX ? UINT64_MAX : (r->pblk + (fblk - r->fblk)) * spb + lba % spb;
++	}
++	/* hole up to the next run */
++	uint64_t end = lo < xf.nrun ? (uint64_t)xf.run[lo].fblk * spb : UINT64_MAX;
++	*n = (uint32_t)MIN(count, end - lba);
++	return UINT64_MAX;
++}
++
++/*
++ * Writing the root file in place is safe only if every block of it is an
++ * initialized extent: then each write lands in a block ext4 already gave the
++ * file, and nothing else on USERDATA can be touched. A sparse image (holes,
++ * fallocate's unwritten extents) stays on the RAM overlay instead.
++ */
++static bool
++file_fully_written(void)
++{
++	uint64_t next = 0;
++
++	for (uint32_t i = 0; i < xf.nrun; i++) {
++		if (xf.run[i].fblk != next || xf.run[i].pblk == UINT64_MAX) {
++			printf("SWEET ROOT: not fully written at file block %llu (run %u)\n", next, i);
++			return false;
++		}
++		next += xf.run[i].len;
++	}
++	if (next * xf.bsz < xf.size) {
++		printf("SWEET ROOT: extents end at block %llu, file has %llu bytes\n", next, xf.size);
++		return false;
++	}
++	return true;
++}
++
++/* count 512-byte sectors from the bounce buffer to file sector lba. */
++static int
++file_write_blocks(uint64_t lba, uint32_t count)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++
++	if (count > BOUNCE_SIZE / UFS_BLOCK || lba + count > su.nblocks) {
++		return EINVAL;
++	}
++	while (count) {
++		uint32_t n;
++		uint64_t pba = file_extent(lba, count, &n);
++		if (pba == UINT64_MAX) {
++			printf("SWEET ROOT: no block behind file sector 0x%llx, refusing write\n", lba);
++			return EIO;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			int error = mmc_write_sector(su.first_block + pba + i,
++			    (const uint32_t *)(const void *)(b + i * UFS_BLOCK));
++			if (error) {
++				return error;
++			}
++		}
++		b += n * UFS_BLOCK;
++		lba += n;
++		count -= n;
++	}
++	return 0;
++}
++
+ /* count 512-byte sectors of the file at sector lba into the bounce buffer. */
+ static int
+ file_read_blocks(uint64_t lba, uint32_t count)
+ {
+ 	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
+-	uint32_t spb = xf.bsz / UFS_BLOCK;
+ 
+ 	if (count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
+ 	while (count) {
+-		uint64_t fblk = lba / spb;
+-		uint32_t lo = 0, hi = xf.nrun, n;
+-		uint64_t pba = UINT64_MAX;
+-
+-		/* last run with fblk >= run.fblk */
+-		while (lo < hi) {
+-			uint32_t mid = (lo + hi) / 2;
+-			if (xf.run[mid].fblk <= fblk) {
+-				lo = mid + 1;
+-			} else {
+-				hi = mid;
+-			}
+-		}
+-		const struct ext4_run *r = lo ? &xf.run[lo - 1] : NULL;
+-		if (r && fblk < (uint64_t)r->fblk + r->len) {
+-			uint64_t end = ((uint64_t)r->fblk + r->len) * spb;
+-			n = (uint32_t)MIN(count, end - lba);
+-			if (r->pblk != UINT64_MAX) {
+-				pba = (r->pblk + (fblk - r->fblk)) * spb + lba % spb;
+-			}
+-		} else {
+-			/* hole up to the next run */
+-			uint64_t end = lo < xf.nrun ? (uint64_t)xf.run[lo].fblk * spb : UINT64_MAX;
+-			n = (uint32_t)MIN(count, end - lba);
+-		}
++		uint32_t n;
++		uint64_t pba = file_extent(lba, count, &n);
+ 		if (pba == UINT64_MAX) {
+ 			bzero(b, n * UFS_BLOCK);
+ 		} else {
+@@ -686,6 +850,17 @@ root_read_blocks(uint64_t lba, uint32_t count)
+ 	return ufs_read_blocks(su.first_block + lba, count);
+ }
+ 
++/* count blocks from the bounce buffer to block lba of the root device. */
++static int
++root_write_blocks(uint64_t lba, uint32_t count)
++{
++#if defined(SWEET_JACKPOTLTE)
++	return mmc_wr_hi ? file_write_blocks(lba, count) : EROFS;
++#else
++	return ufs_write_blocks(su.first_block + lba, count);
++#endif
++}
++
+ #if defined(SWEET_JACKPOTLTE)
+ /*
+  * RAM write overlay (boot-arg sweetramrw=1, cap sweetrammb MiB, default 256):
+@@ -967,8 +1142,8 @@ sweet_ufs_strategy(buf_t bp)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ #if defined(SWEET_JACKPOTLTE)
+-	/* Writes only ever reach the RAM overlay; see ovl_write(). */
+-	if (!rd) {
++	/* With the RAM overlay on, writes only ever reach it; see ovl_write(). */
++	if (!rd && ovl.key) {
+ 		error = ovl_write(off, vaddr, count);
+ 		if (!error) {
+ 			buf_setresid(bp, 0);
+@@ -996,11 +1171,11 @@ sweet_ufs_strategy(buf_t bp)
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
+-				error = ufs_read_blocks(su.first_block + lba, blocks);
++				error = root_read_blocks(lba, blocks);
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
++				error = root_write_blocks(lba, blocks);
+ 			}
+ 		}
+ 		if (error) {
+@@ -1192,6 +1367,7 @@ sweet_ufs_init(void)
+ 	}
+ #if defined(SWEET_JACKPOTLTE)
+ 	uint32_t rootino = 0;
++	uint64_t part_blocks = su.nblocks;      /* USERDATA's size, before su.nblocks becomes the file's */
+ 	if (!error && PE_parse_boot_argn("sweetrootino", &rootino, sizeof(rootino)) && rootino) {
+ 		error = ext4_map_file(rootino);
+ 		if (!error) {
+@@ -1224,9 +1400,25 @@ sweet_ufs_init(void)
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ #if defined(SWEET_JACKPOTLTE)
+ 	if (rw) {
+-		printf("SWEET MMC: ufsrw ignored, eMMC writes are not implemented\n");
++		printf("SWEET MMC: ufsrw ignored: raw partition writes are off (see sweetrootrw)\n");
++	}
++	/*
++	 * sweetrootrw=1: write the file-backed root in place, if it is fully
++	 * written (file_fully_written). Otherwise sweetramrw's RAM overlay.
++	 */
++	uint32_t rootrw = 0;
++	PE_parse_boot_argn("sweetrootrw", &rootrw, sizeof(rootrw));
++	if (rootrw && xf.nrun && file_fully_written()) {
++		mmc_wr_lo = su.first_block;
++		mmc_wr_hi = su.first_block + part_blocks;
++		su.writable = true;
++		printf("SWEET ROOT: read-write in place: writes go only into the file's own %u extents\n", xf.nrun);
++	} else {
++		if (rootrw) {
++			printf("SWEET ROOT: sweetrootrw refused (no file root or not fully written)\n");
++		}
++		su.writable = ovl_init();
+ 	}
+-	su.writable = ovl_init();
+ #else
+ 	su.writable = (rw != 0);
+ #endif
