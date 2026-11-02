@@ -278,7 +278,19 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   multiple of PAGE_RATIO (no-op on sweet, PAGE_RATIO 1).
 - **Run 41391199403 (commit 00d7f75): success**, ISA 0. Kernel `3c70084c…4884`, payload `6f667a80…4553`
   (reproduced locally). **`a8-xnu6-boot.img` SHA-256 `152519a34dd1ebca3eaee5daa976d35af851f4a329639fa38322484299a3f3d4`**,
-  flashed to BOOT, readback matched, `adb reboot`. **Result: pending.**
+  flashed to BOOT, readback matched, `adb reboot`.
+- **Observed (user photos, xnu6):** no panic. Boot passes the commpage and reaches IOKit: platform expert, AKS, WDT,
+  SURF, HID buttons/touch, battery (static fallback), `SWEET FB: AppleCLCD 1080x2220 stride 4320 at 0xec000000,
+  default surface 1, presented as 1125x2436`. Nothing printed after that line for minutes (user: "frozen"), but XNU's
+  macOS boot progress meter (white bar, ~1/3) is drawn and the user saw it move.
+  - Interpretation (guess): the kernel is alive, so timer interrupts through GICv2 work (the meter is driven by a
+    delayed thread_call that slows down by design). Likely waiting for a root device (none exists on the A8 yet).
+    Unconfirmed: on the command-mode panel, text printed after the last DECON trigger may simply not be shown,
+    because only the early console and panics re-arm TRIG. `sweethidtest` is not in the default cmdline, so no key
+    lines were expected.
+- **Diagnostic: 0092-jackpotlte-bsd-init-heartbeat.patch** (commit bae8324): on jackpotlte, bsd_init's
+  `bsd_init_kprintf` steps print via printf, plus `bsd_init: start` and a 5 s `SWEET A8: alive Ns, rootdevice '...'`
+  heartbeat. Each print calls `sweet_early_kick()` (re-arms the DECON trigger). Run 41460201332. **Result: pending.**
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
     `out/Image`), and `adb push` from Git Bash needs `MSYS_NO_PATHCONV=1`.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
