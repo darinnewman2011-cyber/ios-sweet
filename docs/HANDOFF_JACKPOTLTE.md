@@ -391,8 +391,36 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     `_tmp/a8art12/jackpotlte-product.adt`, 12884 bytes (CI's has none, 10200 bytes).
   - **Ready, not flashed:** `a8-ios1-boot.img` SHA-256 `1870593347a52ffabea9547f44b99252eb2306ffc149b826b7b4fffee5e62842`
     = run 41477553892 kernel + product ADT, cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0
-    sweetrootino=1044513 sweetreboot=240`. Phone is back on stock Android BOOT for the user (restore it after each
-    test session).
+    sweetrootino=1044513 sweetreboot=240`. (User later: no need to restore Android between tests.)
+  - **Observed (ios1, flashed, hands-off):** `SWEET ROOT: … inode 1044513`, then HFS `journal_create` failed with
+    EROFS. Cause: Linux `mkfs.hfsplus -J` leaves the journal info block flagged NeedInit (4) and the journal header
+    zeroed, so XNU tries to create the journal at mount. Fix: `tools/hfs-jnl-init.py IMAGE` writes the header the way
+    XNU's `journal_create()` does (JNLx, little-endian, start = end = 512, size 0x800000) and clears NeedInit. Applied
+    to the WSL image and to the phone copy in place (bytes `[0x81000,+4)` and `[0x82000,+512)` only).
+  - **Observed (second run, after the journal fix; log `_tmp/ios2-log.txt`):** **HFS root mounts** (`hfs: mounted
+    iOSRoot`, `jnl: journal start/end pointers reset!`, `bsd_init: done`), then launchd is killed with exit reason
+    namespace 9 (EXEC) code 14 = `EXEC_EXIT_REASON_WRONG_PLATFORM`: the kernel is built for the macOS platform.
+    Fix: boot-arg `unentitled_ios_sim_launch=1` (as in sweet's README cmdline).
+  - **Observed (`a8-ios2-boot.img` SHA-256 `345340da…b598`, cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress
+    rd=ufsroot0 sweetrootino=1044513 sweetreboot=300 unentitled_ios_sim_launch=1 ignition_level=1
+    launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin`; log `_tmp/ios3-log.txt`): **launchd runs**
+    ("Darwin Bootstrapper Version 7.0.0", ondemand mode, fsck boot task). Then mount-phase-1: `GetMasterBlock: Error
+    16 opening /dev/ufsroot0`, `mount_hfs: Read-only file system`, `mount: / failed with 1`, and a panic when
+    `mount[3]` exits 1. launchd needs `/` remounted read-write.
+  - **0098-jackpotlte-ram-write-overlay.patch** (commit f172c7e): boot-arg `sweetramrw=1` (cap `sweetrammb`, default
+    256 MiB) makes the root device writable; every write goes to 4 KiB pages in RAM (copied from the image on first
+    touch), reads are patched with them. The eMMC is never written (writing into the sparse image file could hit
+    holes that ext4 never allocated). The eMMC log ring is forced off on the A8. CI run 41504404196: success, ISA 0,
+    kernel hash matches `SHA256SUMS`. **`a8-ios4-boot.img` SHA-256 `86605144cf568e681987c606c19f62992d6e8ee7a6f12d8150424befa3bd4102`**
+    (= ios2 cmdline with `sweetramrw=1`, `sweetreboot=360`; built by `_tmp/mkios.sh`), flashed, readback matched.
+  - **Observed (ios4, hands-off, back in TWRP after ~6.5 min; log `_tmp/ios4-log.txt`, last 16 KB only):** the
+    mount-phase-1 failure is gone. Userland runs: 118 `exec` lines in the last 16 KB alone (xpcproxy, bluetoothd,
+    contactsd, homed, healthd, watchdogd, …), configd sets up lo0. The 0096 sampler shows **SpringBoard (pid 27)
+    and backboardd (pid 57) running**, and `SWEET FB: swap 8 layer 0 surface 3 1125x2436` at ~280 s, i.e.
+    backboardd presented a full frame. No panic; the run ended with the planned sweetreboot.
+  - Not seen (unverified): what the frame shows (lock screen, boot logo or blank). Nobody was watching the screen
+    and the panel content is lost on reboot. securityd keeps getting `0xe00002c7` from AKS sel 10 (keybag; guess:
+    harmless for now).
   - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
     volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
     read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in
