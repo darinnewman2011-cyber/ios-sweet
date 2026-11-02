@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f35786a..383cf94 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -343,9 +343,15 @@ ufs_sync_cache(void)
+ #define STATUS_FIFO_FULL        (1u << 3)
+ #define STATUS_FCNT(s)          (((s) >> 17) & 0x1fff)
+ #define MMC_HCON        0x070
++#define MMC_UHS_REG     0x074
+ #define MMC_BMOD        0x080
+ #define BMOD_IDMAC_ENABLE       (1u << 7)
+-#define MMC_CLKSEL      0x0a4
++/*
++ * Samsung CLKSEL with 64-bit IDMAC registers: BUFADDRU (0xa4) + 4 (Samsung
++ * dw_mmc-exynos.h). 0xa4 was read before, so the drive phase looked like 0,
++ * USE_HOLD_REG stayed off and every write failed with DCRC (ios13).
++ */
++#define MMC_CLKSEL      0x0a8
+ #define MMC_FIFO        0x200                   /* 64-bit entries, read as two words */
+ 
+ #define MMC_RCA         1u                      /* S-Boot's, verified by milestone 3 */
+@@ -1141,10 +1147,13 @@ ufs_take_over_host(void)
+ {
+ 	uint32_t resp = 0, st;
+ 
+-	if ((ufs_rd(MMC_CLKSEL) >> 16) & 7) {
++	uint32_t clksel = ufs_rd(MMC_CLKSEL);
++	if ((clksel >> 16) & 7) {
+ 		mmc_hold = CMD_USE_HOLD_REG;
+ 	}
+ 	mmc_fifo64 = ((ufs_rd(MMC_HCON) >> 7) & 7) == 2;
++	printf("SWEET MMC: CLKSEL 0x%x (divider %u, drive %u, sample %u), hold register %s, uhs 0x%x\n",
++	    clksel, (clksel >> 24) & 7, (clksel >> 16) & 7, clksel & 7, mmc_hold ? "on" : "off", ufs_rd(MMC_UHS_REG));
+ 	/* PIO: the CPU drains the FIFO, no IDMAC descriptors */
+ 	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) & ~(CTRL_USE_IDMAC | CTRL_DMA_ENABLE));
+ 	ufs_wr(MMC_BMOD, ufs_rd(MMC_BMOD) & ~BMOD_IDMAC_ENABLE);
