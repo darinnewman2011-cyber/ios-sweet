@@ -148,7 +148,8 @@ jobs:
           # Linked into the A8 shim on the PC: PAYLOAD=... shim/a8/build.sh, then tools/mka8boot.py
           k=$(find out -maxdepth 1 -type f -name 'kernel.*' ! -name '*.txt' ! -name '*.a' | head -1)
           python3 -I tools/mkadt.py out/jackpotlte.adt --device jackpotlte
-          python3 -I tools/mkpayload.py "$k" out/jackpotlte.adt out/xnu-jackpotlte.payload
+          # rd=ufsroot0: root on the eMMC GPT partition USERDATA (0093, read-only)
+          python3 -I tools/mkpayload.py "$k" out/jackpotlte.adt out/xnu-jackpotlte.payload \n            --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0'
           ls -l out/jackpotlte.adt out/xnu-jackpotlte.payload
 
       - uses: actions/upload-artifact@v4

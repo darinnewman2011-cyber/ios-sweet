@@ -1,0 +1,298 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..11f0798 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -69,7 +69,11 @@ extern void sweet_usb_probe(void);
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
++#if defined(SWEET_JACKPOTLTE)
++#define UFS_BLOCK       512u                    /* eMMC sector (see the A8 block below) */
++#else
+ #define UFS_BLOCK       4096u
++#endif
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+@@ -129,6 +133,7 @@ ufs_wr(uint32_t off, uint32_t v)
+ 	*(volatile uint32_t *)(su.regs + off) = v;
+ }
+ 
++#if !defined(SWEET_JACKPOTLTE)
+ static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
+@@ -298,6 +303,163 @@ ufs_sync_cache(void)
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
++#else /* SWEET_JACKPOTLTE */
++/*
++ * Galaxy A8 (2018): eMMC on the Exynos 7885 DW-MSHC (v2.70a). S-Boot leaves
++ * the controller and the card ready (shim/a8 milestone 3, verified on the
++ * phone): PIO, DDR52 8-bit, card selected at RCA 1 in TRAN state, Samsung
++ * protector (SMU) in bypass. Like the shim, this reuses that state and reads
++ * polled single sectors (CMD17) through the FIFO. "Device blocks" are 512-byte
++ * sectors here (the eMMC GPT uses them too). No writes yet.
++ */
++#define MMC_CTRL        0x000
++#define CTRL_FIFO_RESET         (1u << 1)
++#define CTRL_DMA_ENABLE         (1u << 5)
++#define CTRL_USE_IDMAC          (1u << 25)
++#define MMC_BLKSIZ      0x01c
++#define MMC_BYTCNT      0x020
++#define MMC_CMDARG      0x028
++#define MMC_CMD         0x02c
++#define CMD_START               (1u << 31)
++#define CMD_USE_HOLD_REG        (1u << 29)      /* Samsung: when CLKSEL drive phase != 0 */
++#define CMD_PRV_DAT_WAIT        (1u << 13)
++#define CMD_DAT_EXP             (1u << 9)
++#define CMD_RESP_CRC            (1u << 8)
++#define CMD_RESP_EXP            (1u << 6)
++#define MMC_RESP0       0x030
++#define MMC_RINTSTS     0x044
++#define INT_RXDR                (1u << 5)
++#define INT_DATA_OVER           (1u << 3)
++#define INT_CMD_DONE            (1u << 2)
++#define INT_ERROR               0xbfc2u         /* SDMMC_INT_ERROR */
++#define MMC_STATUS      0x048
++#define STATUS_BUSY             (1u << 9)
++#define STATUS_FCNT(s)          (((s) >> 17) & 0x1fff)
++#define MMC_HCON        0x070
++#define MMC_BMOD        0x080
++#define BMOD_IDMAC_ENABLE       (1u << 7)
++#define MMC_CLKSEL      0x0a4
++#define MMC_FIFO        0x200                   /* 64-bit entries, read as two words */
++
++#define MMC_RCA         1u                      /* S-Boot's, verified by milestone 3 */
++#define MMC_CMD_NS      (100ull * NSEC_PER_MSEC)
++#define MMC_DATA_NS     (500ull * NSEC_PER_MSEC)
++
++static uint32_t mmc_hold;                       /* CMD_USE_HOLD_REG or 0 */
++static bool mmc_fifo64;
++
++/* Wait until (reg & mask) == want; false on timeout. */
++static bool
++mmc_wait(uint32_t r, uint32_t mask, uint32_t want, uint64_t ns)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime(ns, &deadline);
++	deadline += mach_absolute_time();
++	while ((ufs_rd(r) & mask) != want) {
++		if (mach_absolute_time() > deadline) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* One command; returns RINTSTS, or UINT32_MAX if the CIU never took it. */
++static uint32_t
++mmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
++{
++	(void)mmc_wait(MMC_STATUS, STATUS_BUSY, 0, MMC_CMD_NS);
++	ufs_wr(MMC_RINTSTS, 0xffffffff);
++	ufs_wr(MMC_CMDARG, arg);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ufs_wr(MMC_CMD, CMD_START | mmc_hold | flags | idx);
++	if (!mmc_wait(MMC_CMD, CMD_START, 0, 10 * NSEC_PER_MSEC)) {
++		return UINT32_MAX;
++	}
++	(void)mmc_wait(MMC_RINTSTS, INT_CMD_DONE, INT_CMD_DONE, MMC_CMD_NS);
++	*resp = ufs_rd(MMC_RESP0);
++	return ufs_rd(MMC_RINTSTS);
++}
++
++/* CMD17: one 512-byte sector into dst (4-byte aligned). */
++static int
++mmc_read_sector(uint64_t lba, uint32_t *dst)
++{
++	uint32_t st, resp = 0, n = 0;
++	uint64_t deadline;
++
++	if (lba > UINT32_MAX) {
++		return EINVAL;
++	}
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
++	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
++	ufs_wr(MMC_BLKSIZ, 512);
++	ufs_wr(MMC_BYTCNT, 512);
++	st = mmc_cmd(17, (uint32_t)lba, CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_PRV_DAT_WAIT, &resp);
++	if (st == UINT32_MAX || (st & INT_ERROR)) {
++		printf("SWEET MMC: CMD17 0x%llx: rintsts 0x%x r1 0x%x\n", lba, st, resp);
++		return EIO;
++	}
++	nanoseconds_to_absolutetime(MMC_DATA_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t s = ufs_rd(MMC_STATUS), r = ufs_rd(MMC_RINTSTS);
++
++		/* FIFO count is in host-data-width entries (HCON[9:7] 2 = 64-bit) */
++		for (uint32_t c = STATUS_FCNT(s); c && n < 128; c--) {
++			dst[n++] = ufs_rd(MMC_FIFO);
++			if (mmc_fifo64) {
++				dst[n++] = ufs_rd(MMC_FIFO + 4);
++			}
++		}
++		ufs_wr(MMC_RINTSTS, INT_RXDR);
++		if (r & INT_ERROR) {
++			printf("SWEET MMC: read 0x%llx: rintsts 0x%x after %u words\n", lba, r, n);
++			return EIO;
++		}
++		if ((r & INT_DATA_OVER) && n >= 128) {
++			return 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET MMC: read 0x%llx timed out: rintsts 0x%x status 0x%x, %u words\n",
++			    lba, r, s, n);
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/* count sectors at lba into the bounce buffer. */
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	uint32_t *b = (uint32_t *)(su.dma + DMA_BOUNCE);
++
++	if (count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		int error = mmc_read_sector(lba + i, b + i * (UFS_BLOCK / 4));
++		if (error) {
++			return error;
++		}
++	}
++	return 0;
++}
++
++/* Not implemented: su.writable is never set on the A8, so this is unreachable. */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	printf("SWEET MMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++	return EROFS;
++}
++
++static int
++ufs_sync_cache(void)
++{
++	return 0;
++}
++#endif /* SWEET_JACKPOTLTE */
+ 
+ static int
+ ufs_find_partition(const char *want)
+@@ -353,6 +515,7 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++#if !defined(SWEET_JACKPOTLTE)
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -386,6 +549,28 @@ ufs_take_over_host(void)
+ 	}
+ 	return 0;
+ }
++#else /* SWEET_JACKPOTLTE */
++static int
++ufs_take_over_host(void)
++{
++	uint32_t resp = 0, st;
++
++	if ((ufs_rd(MMC_CLKSEL) >> 16) & 7) {
++		mmc_hold = CMD_USE_HOLD_REG;
++	}
++	mmc_fifo64 = ((ufs_rd(MMC_HCON) >> 7) & 7) == 2;
++	/* PIO: the CPU drains the FIFO, no IDMAC descriptors */
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) & ~(CTRL_USE_IDMAC | CTRL_DMA_ENABLE));
++	ufs_wr(MMC_BMOD, ufs_rd(MMC_BMOD) & ~BMOD_IDMAC_ENABLE);
++	st = mmc_cmd(13, MMC_RCA << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
++	if (st == UINT32_MAX || (st & INT_ERROR) || ((resp >> 9) & 0xf) != 4) {
++		printf("SWEET MMC: card not in TRAN at RCA %u (rintsts 0x%x r1 0x%x)\n",
++		    MMC_RCA, st, resp);
++		return ENXIO;
++	}
++	return 0;
++}
++#endif /* SWEET_JACKPOTLTE */
+ 
+ static int
+ sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+@@ -484,7 +669,7 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		if (is_char) {
+ 			return ENODEV;
+ 		}
+-		if (*f < DEV_BSIZE || *f > UFS_BLOCK || (*f & (*f - 1))) {
++		if (*f < DEV_BSIZE || *f > MAX(UFS_BLOCK, 4096u) || (*f & (*f - 1))) {
+ 			return EINVAL;
+ 		}
+ 		su.secsize = *f;
+@@ -589,13 +774,19 @@ sweet_ufs_init(void)
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
++#if defined(SWEET_JACKPOTLTE)
++	char want[64] = "USERDATA";     /* Samsung GPT names are upper case */
++	const char *node_path = "/sweet-mmc";
++#else
+ 	char want[64] = "userdata";
++	const char *node_path = "/sweet-ufs";
++#endif
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	if (SecureDTLookupEntry(NULL, node_path, &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		printf("SWEET UFS: no %s node in the device tree\n", node_path);
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+@@ -623,12 +814,14 @@ sweet_ufs_init(void)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++#if !defined(SWEET_JACKPOTLTE)
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
++#endif
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
+@@ -649,17 +842,26 @@ sweet_ufs_init(void)
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
++#if defined(SWEET_JACKPOTLTE)
++	if (rw) {
++		printf("SWEET MMC: ufsrw ignored, eMMC writes are not implemented\n");
++	}
++	su.writable = false;
++#else
+ 	su.writable = (rw != 0);
++#endif
+ 	su.ready = true;
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++#if !defined(SWEET_JACKPOTLTE)    /* sweet's PMIC keys, GENI touch and DWC3: not on the A8 */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++#endif
+ 	return 0;
+ }
+ 
