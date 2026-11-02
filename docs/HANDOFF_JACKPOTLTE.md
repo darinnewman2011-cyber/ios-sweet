@@ -370,9 +370,12 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - **0097-jackpotlte-file-backed-root.patch** (commit 4238c0d): boot-arg `sweetrootino=N` makes the root device the
     ext4 file with inode N in USERDATA (superblock → group descriptor → inode → extent tree, up to 8192 extents;
     holes/unwritten read as zeros; read-only). Prints `SWEET ROOT: "USERDATA" inode N: … MiB, … extents`.
-    Without the boot-arg nothing changes. CI run 41477553892. **Result: pending.** First test plan: payload rebuilt
-    locally with `sweetrootino=1044512` → HFS should report `unknown Volume Signature : 5454` ("TT" from the
-    pattern at file offset 1024), proving the mapping.
+    Without the boot-arg nothing changes. CI run 41477553892: success, ISA 0, CI payload reproduced locally. Test payload rebuilt with
+    `sweetrootino=1044512`: **`a8-xnu12t-boot.img` SHA-256 `58f9420211787b3b48f5d9aae94c301040f90b7f8959ee2a10f517523b7e52db`**,
+    flashed, readback matched, hands-off run (TWRP after ~120 s).
+  - **Observed (xnu12t): `SWEET ROOT: "USERDATA" inode 1044512: 4 MiB, 1 extents, 4 MiB mapped`, then
+    `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 5454`** = "TT" at file offset 1024 of the test
+    pattern, as predicted. **0097 works: XNU reads a file inside ext4 USERDATA.** Remaining: the HFS+ image itself.
   - Local tree note: the Windows checkout has CRLF patch files; strip the CRs before `git apply` in `_tmp/` trees.
   - **iOS image build (WSL Ubuntu 26.04):** the WSL kernel 6.18.54.1 has no hfsplus (`# CONFIG_HFSPLUS_FS is not set`,
     modules allowed, no signing), apfs-fuse is not packaged, TWRP's kernel has no HFS+ either. Plan: build `hfsplus.ko`
