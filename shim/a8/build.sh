@@ -12,7 +12,10 @@ clang $CFLAGS -c diag.c -o out/diag.o
 clang $CFLAGS -c ../console.c -o out/console.o
 clang $CFLAGS -c ../fdt.c -o out/fdt.o
 # The image runs wherever S-Boot puts it: no absolute relocations allowed in C objects.
-abs=$(llvm-readelf -r out/diag.o out/console.o out/fdt.o | grep -c ABS64 || true)
+# (The Windows LLVM installer ships llvm-readobj but no llvm-readelf alias.)
+if command -v llvm-readelf >/dev/null; then readelf="llvm-readelf"; else readelf="llvm-readobj --elf-output-style=GNU"; fi
+relocs=$($readelf -r out/diag.o out/console.o out/fdt.o)
+abs=$(grep -c ABS64 <<<"$relocs" || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 ld.lld -nostdlib -static -N --no-rosegment -T a8.ld out/start.o out/diag.o out/console.o out/fdt.o -o out/shim.elf
 llvm-objcopy -O binary out/shim.elf out/Image
