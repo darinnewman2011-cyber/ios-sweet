@@ -290,7 +290,12 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     lines were expected.
 - **Diagnostic: 0092-jackpotlte-bsd-init-heartbeat.patch** (commit bae8324): on jackpotlte, bsd_init's
   `bsd_init_kprintf` steps print via printf, plus `bsd_init: start` and a 5 s `SWEET A8: alive Ns, rootdevice '...'`
-  heartbeat. Each print calls `sweet_early_kick()` (re-arms the DECON trigger). Run 41460201332. **Result: pending.**
+  heartbeat. Each print calls `sweet_early_kick()` (re-arms the DECON trigger).
+- **Observed (user, xnu6 after ~8 h):** the progress meter reached ~50% = `kProgressMeterEnd` (512/1024), the
+  kernel-side maximum. Kernel alive all night, never handed off to userland.
+- **Run 41460201332 (commit bae8324): success**, ISA 0. Kernel `2c9b7250…`, payload `84353b06…` (reproduced
+  locally). **`a8-xnu7-boot.img` SHA-256 `d8a030e73f67405c10a0669001099a2cff5c9b920e40296619c792324d1fadcd`**,
+  flashed to BOOT, readback matched, `adb reboot`. **Result: pending.**
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
     `out/Image`), and `adb push` from Git Bash needs `MSYS_NO_PATHCONV=1`.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
