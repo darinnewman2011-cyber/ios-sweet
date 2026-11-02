@@ -196,6 +196,9 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     **`270f5102b890c89365427fc563780a528b43d56bcbca93c8787bcb2409034772`**.
   - DTBH and cmdline are byte-identical to stock; Image header text_offset `0x80000`, flags `0xa`.
   - The image stays on the PC (`_tmp/`, not in git).
+- **Flashed 2026-11-01 (user approved):** pushed to `/sdcard/a8-xnu1-boot.img` (hash OK on the phone), `dd` to
+  `/dev/block/by-name/BOOT` (= `mmcblk0p12`), readback SHA-256 matches `270f5102…4772`, `adb reboot` from TWRP.
+  `/sdcard/a8bak/BOOT.img` re-checked as `c87a1336…` before writing. **Result on screen: not yet reported.**
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
