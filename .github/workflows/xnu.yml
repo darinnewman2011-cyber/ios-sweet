@@ -56,6 +56,11 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          if [ "$SWEET_BOARD" = jackpotlte ]; then
+            # Apple clang's default arm64 CPU has LSE; Cortex-A53/A73 are ARMv8.0
+            sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\"/& 'OTHER_CFLAGS[arch=arm64]=\$(inherited) -mcpu=generic -march=armv8-a'/" dxb/build.sh
+            grep -c 'OTHER_CFLAGS\[arch=arm64\]' dxb/build.sh
+          fi
           ls dxb/patches
 
       - name: Deps
