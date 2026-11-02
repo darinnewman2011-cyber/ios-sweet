@@ -1,0 +1,316 @@
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..4b82e52 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,12 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(SWEET_JACKPOTLTE)
++/*
++ * Galaxy A8 (4K pages): RAM above 4 GB, plus the early console's own V=P L2
++ * tables for the splash framebuffer (L1 index 3) and DECON (L1 index 0).
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 12)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..6ebf014 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1828,25 +1828,42 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #if defined(SWEET)
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+- * Use the otherwise empty 32MB block above low globals and below gVirtBase
+- * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
++ * Use the otherwise empty L2 blocks above low globals and below gVirtBase
++ * for a Normal-NC framebuffer alias (and on command-mode panels a Device
++ * alias of the DECON registers) that survives bootstrap TTBR0 teardown.
+  */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
++#define SWEET_EARLY_FB_BLOCKS ((SWEET_FB_BYTES + ARM_TT_L2_SIZE - 1) / ARM_TT_L2_SIZE)
++#if defined(SWEET_DECON_PA)
++#define SWEET_EARLY_DECON_VA (SWEET_EARLY_FB_VA + SWEET_EARLY_FB_BLOCKS * ARM_TT_L2_SIZE + 	(SWEET_DECON_PA & ARM_TT_L2_OFFMASK))
++#endif
+ 
+ static void
+-sweet_early_map_final(void)
++sweet_early_map_block(vm_map_address_t va, pmap_paddr_t pa, unsigned int attr)
+ {
+-	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (pa & ~ARM_TT_L2_OFFMASK) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_ATTRINDX(attr) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++}
++
++static void
++sweet_early_map_final(void)
++{
++	for (unsigned int i = 0; i < SWEET_EARLY_FB_BLOCKS; i++) {
++		sweet_early_map_block(SWEET_EARLY_FB_VA + i * ARM_TT_L2_SIZE,
++		    SWEET_FB_PA + i * ARM_TT_L2_SIZE, CACHE_ATTRINDX_WRITECOMB);
++	}
++#if defined(SWEET_DECON_PA)
++	sweet_early_map_block(SWEET_EARLY_DECON_VA & ~ARM_TT_L2_OFFMASK, SWEET_DECON_PA,
++	    CACHE_ATTRINDX_DISABLE);
++#endif
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+@@ -2190,7 +2207,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++#if defined(SWEET_DECON_PA)
++	sweet_early_relocate(SWEET_EARLY_FB_VA, SWEET_EARLY_DECON_VA);
++#else
++	sweet_early_relocate(SWEET_EARLY_FB_VA, 0);
++#endif
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 9414972..92adaa9 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -499,6 +499,40 @@ start_cpu:
+ 2:
+ .endmacro
+ 
++#if defined(SWEET)
++/*
++ * sweet_bootstrap_blocks: V=P L2 block entries in the bootstrap tables.
++ *   arg0 - physical (= virtual) address, L2 aligned; advanced
++ *   arg1 - number of L2 blocks; consumed
++ *   arg2 - block template (attributes, no address)
++ * Uses x25 (V=P L1 table) and x2 (free page pointer, last allocated page),
++ * scratch x6-x9. Reuses the L1 slot's L2 table if one exists.
++ */
++.macro sweet_bootstrap_blocks
++1:
++	and		x6, $0, #(ARM_TT_L1_INDEX_MASK)
++	lsr		x6, x6, #(ARM_TT_L1_SHIFT)
++	add		x6, x25, x6, lsl #(TTE_SHIFT)		// L1 entry pointer
++	ldr		x7, [x6]
++	tbnz	x7, #0, 2f							// valid: existing L2 table
++	add		x2, x2, PGBYTES						// allocate a (zeroed) L2 table
++	mov		x8, #(ARM_TTE_BOOT_TABLE)
++	and		x7, x2, #(ARM_TTE_TABLE_MASK)
++	orr		x7, x7, x8
++	str		x7, [x6]
++2:
++	and		x7, x7, #(ARM_TTE_TABLE_MASK)		// L2 table address
++	and		x8, $0, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x8, x8, #(ARM_TT_L2_SHIFT)
++	orr		x9, $0, $2
++	str		x9, [x7, x8, lsl #(TTE_SHIFT)]
++	MOV64	x9, ARM_TT_L2_SIZE
++	add		$0, $0, x9
++	subs	$1, $1, #1
++	b.ne	1b
++.endmacro
++#endif
++
+ /*
+  * _start_first_cpu
+  * Cold boot init routine.  Called from __start
+@@ -517,10 +551,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_FB_PA + (SWEET_FB_HEIGHT - 32) * SWEET_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #(SWEET_FB_STRIDE)
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -532,6 +566,15 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++#if defined(SWEET_DECON_PA)
++	/* Command-mode panel: re-arm DECON's TE trigger so the band is shown. */
++	MOV64	x0, (SWEET_DECON_PA + SWEET_DECON_TRIG_CONTROL)
++	ldr		w1, [x0]
++	bic		w1, w1, #(SWEET_DECON_TRIG_MASK)
++	orr		w1, w1, #(SWEET_DECON_TRIG_EN)
++	str		w1, [x0]
++	dsb		sy
++#endif
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -682,19 +725,22 @@ Lkernelcache_base_found:
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer as Normal-NC V=P L2 blocks (one 32MB block with
++	 * 16K pages, 2MB blocks with 4K pages), and on command-mode panels the
++	 * DECON registers as one Device block. sweet_bootstrap_blocks reuses the
++	 * L2 table of an L1 slot RAM already occupies: create_bootstrap_mapping
++	 * would replace it.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_FB_PA
++	mov		x12, #((SWEET_FB_BYTES + ARM_TT_L2_SIZE - 1) / ARM_TT_L2_SIZE)
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+-	orr		x11, x11, x10
+-	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+-	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+-	add		x13, x25, #(2 * PGBYTES)
+-	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	sweet_bootstrap_blocks x10, x12, x11
++#if defined(SWEET_DECON_PA)
++	MOV64	x10, (SWEET_DECON_PA & ~ARM_TT_L2_OFFMASK)
++	mov		x12, #1
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	sweet_bootstrap_blocks x10, x12, x11
++#endif
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..001bfec 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,11 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PA;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH ((unsigned int)SWEET_FB_WIDTH)
++#define EARLY_HEIGHT ((unsigned int)SWEET_FB_HEIGHT)
++#define EARLY_STRIDE ((unsigned int)SWEET_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -28,6 +28,26 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++#if defined(SWEET_DECON_PA)
++/* Command-mode panel: VA=PA DECON registers until sweet_early_relocate(). */
++static volatile uint32_t *early_decon = (volatile uint32_t *)(uintptr_t)SWEET_DECON_PA;
++
++/* Re-arm the TE trigger (shim/a8 a8_present): DECON masks it after a frame. */
++static void
++sweet_early_present(void)
++{
++	volatile uint32_t *trig = early_decon + SWEET_DECON_TRIG_CONTROL / 4;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*trig = (*trig & ~(uint32_t)SWEET_DECON_TRIG_MASK) | SWEET_DECON_TRIG_EN;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++#else
++static inline void
++sweet_early_present(void)
++{
++}
++#endif
++
+ static void
+ sweet_early_clear_row(void)
+ {
+@@ -58,6 +78,7 @@ sweet_early_putc(char c)
+ 		early_row = (early_row + 1) % EARLY_ROWS;
+ 		sweet_early_clear_row();
+ 		if (c == '\n') {
++			sweet_early_present();
+ 			return;
+ 		}
+ 	}
+@@ -123,13 +144,19 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	va_end(copy);
+ 	sweet_early_putc('\n');
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_early_present();
+ }
+ 
+ void
+-sweet_early_relocate(uint64_t base)
++sweet_early_relocate(uint64_t base, uint64_t decon_base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
++#if defined(SWEET_DECON_PA)
++	early_decon = (volatile uint32_t *)(uintptr_t)decon_base;
++#else
++	(void)decon_base;
++#endif
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..282a925 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -10,7 +10,7 @@
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+-void sweet_early_relocate(uint64_t base);
++void sweet_early_relocate(uint64_t base, uint64_t decon_base);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 7f07330..8ccd704 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -40,6 +40,31 @@
+ #define SWEET_CPU_NAME            "Kryo 470"
+ #endif
+ 
++/*
++ * Bootloader splash framebuffer used by the early console (sweet_early.c,
++ * start.s): a8r8g8b8, physical, L2-block aligned. Only the first buffer.
++ */
++#if defined(SWEET_JACKPOTLTE)
++#define SWEET_FB_PA               0xEC000000      // S-Boot, 0x1400000 reserved
++#define SWEET_FB_WIDTH            1080
++#define SWEET_FB_HEIGHT           2220
++/*
++ * DSI command-mode panel: DECON scans out one frame per armed TE trigger and
++ * masks the trigger again, so every update must be "presented" (shim/a8:
++ * a8_present). The shim leaves DECON enabled and DPP0 on SWEET_FB_PA.
++ */
++#define SWEET_DECON_PA            0x14860000
++#define SWEET_DECON_TRIG_CONTROL  0x70            // HW_SW_TRIG_CONTROL
++#define SWEET_DECON_TRIG_MASK     0x10            // HW_TRIG_MASK_DECON
++#define SWEET_DECON_TRIG_EN       0x1             // HW_TRIG_EN
++#else
++#define SWEET_FB_PA               0x9c000000      // ABL continuous splash
++#define SWEET_FB_WIDTH            1080
++#define SWEET_FB_HEIGHT           2400
++#endif
++#define SWEET_FB_STRIDE           (SWEET_FB_WIDTH * 4)
++#define SWEET_FB_BYTES            (SWEET_FB_STRIDE * SWEET_FB_HEIGHT)
++
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+ #define __ARM_VMSA__              8

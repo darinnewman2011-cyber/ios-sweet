@@ -121,6 +121,21 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: ISA check (instructions an ARMv8.0 core cannot execute)
+        if: always() && env.SWEET_BOARD == 'jackpotlte'
+        run: |
+          # Cortex-A53/A73 are ARMv8.0: LSE atomics (8.1), RDM (8.1), RCpc
+          # loads (8.3) and non-hint pointer-auth instructions are UNDEFINED.
+          # Closed libraries (libcc_kext) are not compiled with our -march.
+          k=$(find out -maxdepth 1 -type f -name 'kernel.*' ! -name '*.txt' | head -1)
+          xcrun llvm-objdump -d --no-show-raw-insn "$k" > out/kernel.dis
+          re='[[:space:]](cas|casa|casl|casal|casp|caspa|caspl|caspal|casb|cash|casab|casah|casalb|casalh|caslb|caslh|ld(add|clr|eor|set|smax|smin|umax|umin)(a|l|al)?(b|h)?|st(add|clr|eor|set|smax|smin|umax|umin)(l)?(b|h)?|swp(a|l|al)?(b|h)?|sqrdml[as]h|ldapr[bh]?|ldapur[bh]?|retaa|retab|braa|brab|blraa|blrab|braaz|brabz|blraaz|blrabz|eretaa|eretab|ldraa|ldrab|sdot|udot)([[:space:]]|$)'
+          grep -E "$re" out/kernel.dis > out/isa-v81.txt || true
+          echo "ARMv8.1+ instructions: $(wc -l < out/isa-v81.txt)"
+          # attribute each hit to its function
+          awk -v re="$re" '/^[0-9a-f]+ <.*>:$/ {fn=$2} $0 ~ re {n[fn]++} END {for (f in n) print n[f], f}' out/kernel.dis | sort -rn | head -40 | tee out/isa-v81-functions.txt
+          rm out/kernel.dis
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
