@@ -1,0 +1,465 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..b20a211 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_a8input.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8input.c b/bsd/dev/sweet_a8input.c
+new file mode 100644
+index 0000000..9b4b0c0
+--- /dev/null
++++ b/bsd/dev/sweet_a8input.c
+@@ -0,0 +1,379 @@
++/*
++ * Galaxy A8 (2018, jackpotlte) input: GPIO keys and the sec_ts touchscreen.
++ * Both feed the HID services in iokit/Kernel/arm/hid/SweetHID.cpp.
++ *
++ * Keys (live FDT gpio_keys): gpa1-5 volume up, gpa1-6 volume down, gpa1-7
++ * power, active low, on the ALIVE pin controller 0x11CB0000 (gpa1 bank at
++ * +0x60, DAT +0x64). Read only: the pins stay in the EINT function Android's
++ * gpio-keys set, DAT still reflects the level. Volume up + volume down
++ * together press Home.
++ *
++ * Touch (live FDT i2c@13870000/touchscreen@48, Samsung sec_ts y661): S3C2440
++ * I2C controller I2C4 at 0x13870000, pins gpp4-0/1 function 2 on the TOP pin
++ * controller 0x139B0000, attention line gpa0-0 (active low), power
++ * "tsp_ldo_en" = gpg3-0 active high, clock gate CMU_PERI 0x10010000 + 0x2048.
++ * Protocol from Samsung's drivers/input/touchscreen/sec_ts (8-byte events,
++ * READ_ONE_EVENT 0x60, READ_ALL_EVENT 0x61, SENSE_ON 0x10). Polled, no IRQ.
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_a8_input_init(void);
++
++#define A8_ALIVE_PA     0x11cb0000u     /* gpa0 +0x40, gpa1 +0x60 */
++#define A8_TOP_PA       0x139b0000u     /* gpp4 +0xa0, gpg3 +0x180 */
++#define A8_CMU_PERI_PA  0x10010000u
++#define A8_I2C4_PA      0x13870000u
++#define A8_GPA0         0x40u
++#define A8_GPA1         0x60u
++#define A8_GPP4         0xa0u
++#define A8_GPG3         0x180u
++#define GPIO_CON        0x0u
++#define GPIO_DAT        0x4u
++#define GPIO_PUD        0x8u
++#define CMU_I2C4_PCLK   0x2048u         /* bit 20 manual, bit 21 clock on */
++
++#define IICCON          0x00u
++#define IICSTAT         0x04u
++#define IICDS           0x0cu
++#define IICLC           0x10u
++#define CON_ACK         (1u << 7)
++#define CON_DIV512      (1u << 6)
++#define CON_IRQEN       (1u << 5)       /* needed for the pending flag; the GIC line stays off */
++#define CON_PEND        (1u << 4)
++#define CON_BASE        (CON_ACK | CON_DIV512 | CON_IRQEN | 3u)
++#define STAT_MRX        0x80u
++#define STAT_MTX        0xc0u
++#define STAT_START      (1u << 5)       /* write: start/stop, read: bus busy */
++#define STAT_TXRX       (1u << 4)
++#define STAT_NACK       (1u << 0)
++
++#define TS_ADDR         0x48u
++#define TS_SENSE_ON     0x10u
++#define TS_DEVICE_ID    0x22u
++#define TS_PANEL_INFO   0x23u
++#define TS_TOUCHFUNC    0x30u
++#define TS_ONE_EVENT    0x60u
++#define TS_ALL_EVENT    0x61u
++#define TS_CLEAR_STACK  0x62u
++#define TS_EVENT        8u
++#define TS_MAX_EVENTS   32u
++
++#define PANEL_W         1080
++#define PANEL_H         2220
++
++static vm_offset_t a8_alive, a8_top, a8_cmu, a8_i2c;
++static int a8_sleep_chan;
++
++static uint32_t
++a8_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++a8_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++a8_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a8_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- keys ---- */
++
++enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_VOLDOWN = 2, KEY_HOME = 3 };
++
++static void
++a8_keys_poll(int state[4])
++{
++	uint32_t dat = a8_rd(a8_alive, A8_GPA1 + GPIO_DAT);
++	int now[3] = { !(dat & (1u << 7)), !(dat & (1u << 5)), !(dat & (1u << 6)) };
++
++	for (int k = 0; k < 3; ++k) {
++		if (now[k] != state[k]) {
++			state[k] = now[k];
++			printf("SWEET A8 KEYS: key=%d down=%d gpa1=%#x\n", k, now[k], dat);
++			sweet_hid_key(k, now[k]);
++		}
++	}
++	/* Both volume keys held = Home; released when either goes up. */
++	int home = state[KEY_VOLUP] && state[KEY_VOLDOWN];
++	if (home != state[KEY_HOME]) {
++		state[KEY_HOME] = home;
++		printf("SWEET A8 KEYS: home down=%d\n", home);
++		sweet_hid_key(KEY_HOME, home);
++	}
++}
++
++/* ---- I2C4, polled ---- */
++
++static int
++i2c_wait(void)
++{
++	for (int i = 0; i < 20000; ++i) {
++		if (a8_rd(a8_i2c, IICCON) & CON_PEND) {
++			return 0;
++		}
++		delay(5);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++i2c_next(void)
++{
++	a8_wr(a8_i2c, IICCON, a8_rd(a8_i2c, IICCON) & ~CON_PEND);
++}
++
++static void
++i2c_stop(uint32_t mode)
++{
++	a8_wr(a8_i2c, IICSTAT, mode | STAT_TXRX);
++	i2c_next();
++	for (int i = 0; i < 2000 && (a8_rd(a8_i2c, IICSTAT) & STAT_START); ++i) {
++		delay(5);
++	}
++}
++
++static int
++i2c_xfer(bool rd, uint8_t *buf, uint32_t len)
++{
++	uint32_t mode = rd ? STAT_MRX : STAT_MTX;
++	int error;
++
++	a8_wr(a8_i2c, IICCON, CON_BASE);
++	a8_wr(a8_i2c, IICSTAT, mode | STAT_TXRX);
++	a8_wr(a8_i2c, IICDS, (TS_ADDR << 1) | (rd ? 1u : 0u));
++	a8_wr(a8_i2c, IICSTAT, mode | STAT_TXRX | STAT_START);
++	if ((error = i2c_wait())) {
++		goto out;
++	}
++	if (a8_rd(a8_i2c, IICSTAT) & STAT_NACK) {
++		error = ENXIO;
++		goto out;
++	}
++	for (uint32_t i = 0; i < len; ++i) {
++		if (rd) {
++			if (i == len - 1) {
++				a8_wr(a8_i2c, IICCON, a8_rd(a8_i2c, IICCON) & ~CON_ACK);
++			}
++			i2c_next();
++			if ((error = i2c_wait())) {
++				goto out;
++			}
++			buf[i] = (uint8_t)a8_rd(a8_i2c, IICDS);
++		} else {
++			a8_wr(a8_i2c, IICDS, buf[i]);
++			i2c_next();
++			if ((error = i2c_wait())) {
++				goto out;
++			}
++			if (a8_rd(a8_i2c, IICSTAT) & STAT_NACK) {
++				error = EIO;
++				goto out;
++			}
++		}
++	}
++out:
++	i2c_stop(mode);
++	return error;
++}
++
++/* The DTB sets samsung,stop-after-trans: register write, STOP, then the read. */
++static int
++ts_read(uint8_t reg, uint8_t *buf, uint32_t len)
++{
++	int error = i2c_xfer(false, &reg, 1);
++	return error ? error : i2c_xfer(true, buf, len);
++}
++
++static int
++ts_write(uint8_t reg, const uint8_t *data, uint32_t len)
++{
++	uint8_t b[4] = { reg };
++	if (len > 3) {
++		return EINVAL;
++	}
++	if (len) {
++		memcpy(b + 1, data, len);
++	}
++	return i2c_xfer(false, b, len + 1);
++}
++
++/* ---- touch ---- */
++
++static int ts_res_x = PANEL_W, ts_res_y = PANEL_H;
++static unsigned ts_errors;
++
++static bool
++ts_init(void)
++{
++	uint32_t gate = a8_rd(a8_cmu, CMU_I2C4_PCLK);
++	uint32_t pcon = a8_rd(a8_top, A8_GPP4 + GPIO_CON), gcon = a8_rd(a8_top, A8_GPG3 + GPIO_CON);
++	uint32_t gdat = a8_rd(a8_top, A8_GPG3 + GPIO_DAT);
++	uint8_t id[5] = { 0 }, info[11] = { 0 }, ev[TS_EVENT];
++	int error;
++
++	printf("SWEET A8 TOUCH: before: i2c4 pclk %#x gpp4 con %#x gpg3 con %#x dat %#x gpa0 dat %#x\n",
++	    gate, pcon, gcon, gdat, a8_rd(a8_alive, A8_GPA0 + GPIO_DAT));
++	a8_wr(a8_cmu, CMU_I2C4_PCLK, gate | (1u << 20) | (1u << 21));
++	/* gpp4-0/1: function 2 (I2C), pull-up. */
++	a8_wr(a8_top, A8_GPP4 + GPIO_CON, (pcon & ~0xffu) | 0x22u);
++	a8_wr(a8_top, A8_GPP4 + GPIO_PUD, (a8_rd(a8_top, A8_GPP4 + GPIO_PUD) & ~0xffu) | 0x33u);
++	/* Power-cycle the touch LDO (gpg3-0 output) so the IC reports boot complete. */
++	a8_wr(a8_top, A8_GPG3 + GPIO_CON, (gcon & ~0xfu) | 0x1u);
++	a8_wr(a8_top, A8_GPG3 + GPIO_DAT, gdat & ~1u);
++	a8_sleep_ms(50);
++	a8_wr(a8_top, A8_GPG3 + GPIO_DAT, gdat | 1u);
++	a8_sleep_ms(100);
++
++	a8_wr(a8_i2c, IICCON, CON_BASE);
++	a8_wr(a8_i2c, IICLC, 0x5u);     /* filter on, SDA delay 5 clocks */
++	a8_wr(a8_i2c, IICSTAT, STAT_TXRX);
++
++	/* Wait for the boot-complete status event (eid 1, status id 0). */
++	bool ready = false;
++	for (int i = 0; i < 50 && !ready; ++i) {
++		error = ts_read(TS_ONE_EVENT, ev, TS_EVENT);
++		if (!error && (ev[0] & 3) == 1 && ev[1] == 0) {
++			ready = true;
++		} else {
++			a8_sleep_ms(20);
++		}
++	}
++	error = ts_read(TS_DEVICE_ID, id, sizeof(id));
++	printf("SWEET A8 TOUCH: ready=%d device id %02x %02x %02x %02x %02x (err %d), i2c4 pclk now %#x\n",
++	    ready, id[0], id[1], id[2], id[3], id[4], error, a8_rd(a8_cmu, CMU_I2C4_PCLK));
++	if (error) {
++		return false;
++	}
++	if (!ts_read(TS_PANEL_INFO, info, sizeof(info))) {
++		int rx = (info[0] << 8) | info[1], ry = (info[2] << 8) | info[3];
++		printf("SWEET A8 TOUCH: IC resolution %dx%d, tx %u rx %u\n", rx, ry, info[8], info[9]);
++		if (rx > 0 && ry > 0) {
++			ts_res_x = rx;
++			ts_res_y = ry;
++		}
++	}
++	uint8_t func[2] = { 0x61, 0x00 };  /* touch | palm | wet, little endian */
++	int e1 = ts_write(TS_TOUCHFUNC, func, 2);
++	int e2 = ts_write(TS_CLEAR_STACK, NULL, 0);
++	int e3 = ts_write(TS_SENSE_ON, NULL, 0);
++	printf("SWEET A8 TOUCH: touch function %d, clear %d, sense on %d\n", e1, e2, e3);
++	return e3 == 0;
++}
++
++static void
++ts_event(const uint8_t *e)
++{
++	if ((e[0] & 3) != 0) {         /* not a coordinate event */
++		return;
++	}
++	int id = ((e[0] >> 2) & 0xf) - 1;
++	int action = e[0] >> 6;
++	int x = (e[1] << 4) | (e[3] >> 4);
++	int y = (e[2] << 4) | (e[3] & 0xf);
++	if (id < 0 || action == 0) {
++		return;
++	}
++	x = x * PANEL_W / ts_res_x;
++	y = y * PANEL_H / ts_res_y;
++	sweet_hid_touch(id, action != 3, x, y);
++}
++
++static void
++ts_poll(void)
++{
++	static uint8_t ev[TS_EVENT * TS_MAX_EVENTS];
++
++	/* gpa0-0 low = events waiting. */
++	if (a8_rd(a8_alive, A8_GPA0 + GPIO_DAT) & 1u) {
++		return;
++	}
++	int error = ts_read(TS_ONE_EVENT, ev, TS_EVENT);
++	if (!error) {
++		uint32_t left = ev[7] & 0x3f;
++		if (left >= TS_MAX_EVENTS) {
++			(void)ts_write(TS_CLEAR_STACK, NULL, 0);
++			left = 0;
++		} else if (left) {
++			error = ts_read(TS_ALL_EVENT, ev + TS_EVENT, left * TS_EVENT);
++		}
++		for (uint32_t i = 0; !error && i <= left; ++i) {
++			ts_event(ev + i * TS_EVENT);
++		}
++	}
++	if (error && (ts_errors++ % 200u) == 0) {
++		printf("SWEET A8 TOUCH: read error %d (stat %#x)\n", error, a8_rd(a8_i2c, IICSTAT));
++	}
++}
++
++static void
++a8_input_thread(void *arg, wait_result_t result)
++{
++	int keys[4] = { 0, 0, 0, 0 };
++	int touch = 1;
++	(void)arg;
++	(void)result;
++
++	printf("SWEET A8 KEYS: gpa1 con %#x dat %#x\n",
++	    a8_rd(a8_alive, A8_GPA1 + GPIO_CON), a8_rd(a8_alive, A8_GPA1 + GPIO_DAT));
++	(void)PE_parse_boot_argn("sweettouch", &touch, sizeof(touch));
++	bool ts_ok = touch && ts_init();
++	if (!ts_ok) {
++		printf("SWEET A8 TOUCH: off (sweettouch=%d)\n", touch);
++	}
++	for (;;) {
++		a8_keys_poll(keys);
++		if (ts_ok) {
++			ts_poll();
++		}
++		a8_sleep_ms(10);
++	}
++}
++
++void
++sweet_a8_input_init(void)
++{
++	int keys = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetkeys", &keys, sizeof(keys));
++	if (!keys) {
++		printf("SWEET A8 KEYS: input disabled (sweetkeys=0)\n");
++		return;
++	}
++	a8_alive = ml_io_map(A8_ALIVE_PA, 0x1000);
++	a8_top = ml_io_map(A8_TOP_PA, 0x1000);
++	a8_cmu = ml_io_map(A8_CMU_PERI_PA, 0x4000);
++	a8_i2c = ml_io_map(A8_I2C4_PA, 0x1000);
++	if (!a8_alive || !a8_top || !a8_cmu || !a8_i2c) {
++		printf("SWEET A8 KEYS: MMIO mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(a8_input_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5feea09..210383e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_a8_input_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -1237,6 +1238,8 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++#else
++	sweet_a8_input_init();          /* GPIO keys and sec_ts touch (sweet_a8input.c) */
+ #endif
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..a8c0b52 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,12 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/* Panel height in pixels (the touch input space; width is 1080 on both). */
++#if defined(SWEET_JACKPOTLTE)
++#define SWEET_TOUCH_PANEL_H 2220
++#else
++#define SWEET_TOUCH_PANEL_H 2400
++#endif
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -435,9 +441,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
++	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -459,7 +465,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > SWEET_TOUCH_PANEL_H - 1 ? SWEET_TOUCH_PANEL_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -473,7 +479,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_TOUCH_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
