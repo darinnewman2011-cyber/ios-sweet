@@ -1,0 +1,17 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..855e9b2 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,12 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(SWEET_JACKPOTLTE)
++/* Galaxy A8: /cpus nodes are Cortex-A53/A73 (mkadt.py JP_CORES), not Kryo 470 */
++    "     'IONameMatch'     = ('arm,cortex-a53', 'arm,cortex-a73');"
++#else
+     "     'IONameMatch'     = 'qcom,kryo470';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
