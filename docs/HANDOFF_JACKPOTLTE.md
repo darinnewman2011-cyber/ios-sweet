@@ -46,6 +46,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   0x200, 0x201, 0x0, 0x1), and all seven ran `secondary_entry` (alive mask `0x3E3`, MPIDR-derived stacks) and
   called CPU_OFF (`0x84000002`). Both A73s and the second A53 cluster come up without extra cluster power-up.
   Step 2 is done; next is step 3 (DW-MSHC eMMC, read-only first).
+- **Observed — MILESTONE 3 (eMMC read) PASSES (commit `059403b`, boot image `1237728a…40e7`):** S-Boot leaves the
+  DW-MSHC usable as is; no re-init needed. State at hand-over: CTRL `0x10` (PIO, INT_ENABLE; no IDMAC), VERID
+  `0x5342270A` (v2.70a), HCON `0x08E42541` (64-bit FIFO entries, 64-bit addressing), CLKSEL `0` (no phase shift, so
+  no USE_HOLD_REG), CTYPE `0x10000` (8-bit), UHS_REG `0x10000` (**DDR**: S-Boot runs DDR52, not HS400), BMOD `0x282`,
+  STATUS `0x8906`. The card answers CMD13 at **RCA 1** in TRAN state (R1 `0x900`). PIO CMD17 reads work: LBA0 has
+  `0xAA55`, LBA1 "EFI PART" (entries at LBA 2, 128 entries), GPT "BOOT" starts at **LBA `0x23800`** (= Linux sysfs
+  145408), and BOOT's first sector is our own boot.img ("ANDROID!", kernel_size `0x18400`). Samsung protector/SMU:
+  MPSCTRL0 `0xF1` (= BYPASS: secure + non-secure read/write, valid), MPSEND0 `0xFFFFFFFF`, readable from NS EL1, so
+  it does not block us (nor would it block writes: be careful). The shim only ever sends CMD13/CMD7/CMD17 (checked in
+  the disassembly). Step 3's shim half is done; DDR52 PIO is slow but enough to load a payload. The XNU root-device
+  driver is still to do.
 - **Verified:** `mkadt.py` sweet output is byte-identical to `45263be` (seed `\0`*64, highmem off and on);
   `--device jackpotlte` builds (10200 bytes). Open question: every jackpotlte CPU node has `cluster-id` 0, although
   the A53s sit in two clusters (`0x1xx`, `0x2xx`) and the A73s in a third.
@@ -104,7 +115,7 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 2. **DONE 2026-11-01** (see Update above). Original note: GICv2 in the shim: port `shim/shim.c`'s GICv3 timer IRQ self-test to GICD `0x12301000` / GICC `0x12302000`,
    virtual-timer INTID 27 (PPI 11), 26 MHz. Then PSCI `cpu_on` (`0xc4000003`, `smc`, v0.1 IDs from DT) for the 7
    other cores with the MPIDR table in `mkadt.py` (`JP_CORES`).
-3. DW-MSHC eMMC driver (`0x13500000`, v270a, 64-bit IDMAC, HS400/enhanced strobe/CMDQ were enabled by Android;
+3. **Shim read path DONE 2026-11-01** (see Update above; XNU driver still to do). DW-MSHC eMMC driver (`0x13500000`, v270a, 64-bit IDMAC, HS400/enhanced strobe/CMDQ were enabled by Android;
    check whether S-Boot leaves the controller usable, otherwise full init with the `samsung,dw-mshc-*` timings).
    First read-only in the shim, then the XNU root-device driver replacing `bsd/dev/sweet_ufs.c` (patches 0028–0034, 0069).
 4. XNU patches: GICv2 interrupt controller, SMP MPIDR map (0065), ARMv8.0 (A53/A73) machine config, GPIO keys
