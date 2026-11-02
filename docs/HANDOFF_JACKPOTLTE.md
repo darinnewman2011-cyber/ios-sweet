@@ -122,7 +122,7 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - Not covered yet: the regular framebuffer console and the IOMFB driver (after early-console stage 20) still
     need a present path, which is step "panel present path".
   - **Still blocking the first A8 XNU boot:** the A8 boot shim and payload placement (boot args with phys
-    base and size, ADT, DPP0 on `SWEET_FB_PA`). Also any ARMv8.1+ hits the ISA check finds.
+    base and size, ADT, DPP0 on `SWEET_FB_PA`). (ARMv8.1+ hits: resolved in step 4c, count is 0.)
   - **Was blocking before 0084/0085 (now addressed):**
     - `SweetCPU::start`/`startAll` require boot MPIDR 0 and MPIDRs `0xN00` (A8 boots on `0x100`; MPIDRs use Aff0).
     - `start.s` hard-codes sweet's framebuffer `0x9c000000` (stage-0 white band, MMU off) and a 32 MB L2 block that
@@ -130,6 +130,29 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     - The bootstrap code assumes all RAM is below 4 GB.
     - Apple's closed KDK libraries linked into the kernel may contain ARMv8.1+ instructions (LSE atomics), which
       are UNDEFINED on A53/A73. Disassemble them before the first boot.
+
+### Step 4c: ARMv8.0-clean kernel (2026-11-01)
+- **Result (observed): run 41377484152 (commit f1bcf44, board=jackpotlte) built the A8 kernel and the ISA check
+  reports 0 ARMv8.1+ instructions** in the whole linked kernel (including the closed libraries). Artifact
+  `xnu-kernel-jackpotlte`. Not run on hardware.
+- How it got there:
+  - Run 41373667993: 1082 LSE instructions. Apple clang with only `-march=armv8-a` keeps the macOS default CPU's
+    features, so 0082 now passes `-mcpu=generic -march=armv8-a` (commit f4d90a0).
+  - Run 41375031655 then failed in the assembler (good: it now rejects v8.1+ asm):
+    `commpage_asm.s` `casa` (×2) and `sha256_compress_arm64.s` SHA2 instructions (80 errors).
+  - **0086-jackpotlte-armv80-asm.patch** (commit 3e29312):
+    - The commpage `pfz_trylock_and_enqueue`/`dequeue` use an LDAXR/STXR acquire trylock (CLREX on failure; only
+      x9–x15 are used) instead of `casa`.
+    - `cc_config.h` sets `CCSHA2_VNG_ARM 0` on jackpotlte, so `ccsha256_di()` returns the C `ccsha256_ltc_di`.
+      The SHA2 asm is compiled out. The Exynos 7885 crypto extension is unverified, so it isn't relied on.
+  - Run 41376104920 built successfully, with 12 LSE hits, all in `firehose_*`. That code is libdispatch's
+    `libfirehose_kernel.a`, which blacktop's `build.sh` builds with xcodebuild at the default Apple arm64 CPU.
+  - `xnu.yml` (jackpotlte only) now adds
+    `'OTHER_CFLAGS=$(inherited) $(SWEET_ARCH_CFLAGS_$(CURRENT_ARCH))' 'SWEET_ARCH_CFLAGS_arm64=-mcpu=generic -march=armv8-a'`
+    to that xcodebuild line. `OTHER_CFLAGS[arch=arm64]=` on the command line is misparsed: run 41376911349
+    failed with `clang: no such file 'arm64]=-mkernel'`.
+- Caveat: the ISA regex covers LSE, RDM, RCpc (`ldapr`), non-hint PAC and dot product. It does not cover every
+  v8.2+ extension (e.g. FP16 arithmetic, `dc cvap`), and kexts in the kernelcache/userland are a separate question.
 
 ## State at handoff
 - Done (not yet run on hardware): `tools/mkadt.py --device jackpotlte` (GICv2, 8 real MPIDRs, 26 MHz timer, 2 GiB
@@ -189,7 +212,8 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
    check whether S-Boot leaves the controller usable, otherwise full init with the `samsung,dw-mshc-*` timings).
    First read-only in the shim, then the XNU root-device driver replacing `bsd/dev/sweet_ufs.c` (patches 0028–0034, 0069).
 4. XNU patches: **GICv2 interrupt controller and ARMv8.0/4K board variant written (0082, see Update above)**;
-   **SMP MPIDR map (0084) and 4K early framebuffer/DECON present (0085) written**; next: GPIO keys
+   **SMP MPIDR map (0084) and 4K early framebuffer/DECON present (0085) written; ARMv8.0-clean build with ISA
+   count 0 (0086 + firehose CFLAGS, run 41377484152)**; next: A8 boot shim/payload for the first kernel entry, GPIO keys
    (`gpa1` 5/6/7 at `0x11CB0000`), `sec_ts` touch on `i2c@13870000` addr `0x48` (Samsung protocol, fw v0.0.2.20),
    panel present path. Rename the `xiaomi,sweet` compatible fallback in `mkadt.py` together with the platform expert.
 5. Payload placement: S-Boot puts the boot.img ramdisk at `0x89000000` and reports it in `/chosen`, but `BOOT` is only
