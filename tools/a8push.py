@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Copy a disk image to the A8 (TWRP, adb) as a sparse file.
 
-    a8push.py IMAGE /data/sweet/root.img
+    a8push.py [--dense] IMAGE /data/sweet/root.img
 
 USERDATA has less free space than the iOS root image's size, and simg2img
 writes the empty parts as zeros. This truncates the target to the image size
 and writes only the 1 MiB blocks that hold data (dd seek, conv=notrunc), so
 all-zero stretches stay holes. The kernel's file-backed root (patch 0097)
 reads holes as zeros. Finally the phone's SHA-256 is compared with the PC's.
+
+--dense writes every block, zeros included, so the file has no holes and no
+unwritten extents. Patch 0103 (sweetrootrw=1) writes the root in place only
+for such a file.
 """
 import hashlib
 import subprocess
@@ -17,7 +21,11 @@ MB = 1 << 20
 GAP = 4 * MB            # zero stretches shorter than this are written anyway
 CHUNK = 64 * MB         # bytes per adb call
 
-src, dst = sys.argv[1], sys.argv[2]
+args = sys.argv[1:]
+dense = '--dense' in args
+if dense:
+    args.remove('--dense')
+src, dst = args
 
 
 def adb(cmd, data=None):
@@ -41,6 +49,8 @@ with open(src, 'rb') as f:
                 runs.append([i, i + 1])
         i += 1
     size = f.tell()
+if dense:
+    runs = [[0, (size + MB - 1) // MB]]
 digest = h.hexdigest()
 data_mb = sum(e - s for s, e in runs)
 print(f'{src}: {size} bytes, sha256 {digest}, {len(runs)} data runs, {data_mb} MiB to send', flush=True)

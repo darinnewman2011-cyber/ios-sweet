@@ -1,0 +1,228 @@
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+index 9e09bba..965e0f8 100644
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -3,7 +3,10 @@
+  * Boot-arg sweetgpu: 0 (default) off; 1 logs the power domain and G3D clock
+  * state and, only if the domain is already on, the GPU's ID registers;
+  * 2 also powers the domain on (Samsung pmucal g3d_on: PMU 0x11C840A0 = 0xF,
+- * wait for 0xF in 0x11C840A4) and then the L2, tiler and shader cores.
++ * wait for 0xF in 0x11C840A4) and then the L2, tiler and shader cores;
++ * 3 then runs step 3: address space 0 with Mali LPAE page tables (G71 has no
++ * AArch64-format GPU MMU) and a polled chain of two WRITE_VALUE jobs (Zero,
++ * then Immediate 32) on job slot 1, and checks RAM for the values.
+  * GPU registers are never touched while the domain is off (that can hang the
+  * bus). Runs in its own thread so a stuck access stalls only the probe.
+  * Facts: live FDT mali@11500000, pd-g3d@11c840a0; Samsung cmucal (CMU_G3D 0x11400000).
+@@ -15,9 +18,12 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void sweet_a8_gpu_init(void);
+ 
+ #define PMU_PA          0x11c80000u
+@@ -46,6 +52,46 @@ void sweet_a8_gpu_init(void);
+ #define SHADER_PWRON    0x180u
+ #define TILER_PWRON     0x190u
+ #define L2_PWRON        0x1a0u
++#define COHERENCY_ENABLE 0x304u         /* 31 = no coherency (as Panfrost on non-coherent SoCs) */
++
++/* Job manager, MMU and address space 0 (offsets as in Linux panfrost_regs.h). */
++#define JOB_IRQ_RAWSTAT 0x1000u
++#define JOB_IRQ_CLEAR   0x1004u
++#define JOB_IRQ_MASK    0x1008u
++#define JS_BASE(n)      (0x1800u + (n) * 0x80u)
++#define JS_HEAD_LO      0x00u
++#define JS_COMMAND      0x20u
++#define JS_STATUS       0x24u
++#define JS_HEAD_NEXT_LO 0x40u
++#define JS_HEAD_NEXT_HI 0x44u
++#define JS_AFF_NEXT_LO  0x50u
++#define JS_AFF_NEXT_HI  0x54u
++#define JS_CONFIG_NEXT  0x58u
++#define JS_COMMAND_NEXT 0x60u
++#define MMU_IRQ_RAWSTAT 0x2000u
++#define MMU_IRQ_CLEAR   0x2004u
++#define MMU_IRQ_MASK    0x2008u
++#define AS0             0x2400u
++#define AS_TRANSTAB_LO  0x00u
++#define AS_TRANSTAB_HI  0x04u
++#define AS_MEMATTR_LO   0x08u
++#define AS_MEMATTR_HI   0x0cu
++#define AS_COMMAND      0x18u
++#define AS_FAULTSTATUS  0x1cu
++#define AS_FAULTADDR_LO 0x20u
++#define AS_FAULTADDR_HI 0x24u
++#define AS_STATUS       0x28u
++
++/*
++ * Step 3 buffer: 8 x 4 KiB, physically contiguous. Pages 0-3 hold the level 0-3
++ * tables, page 4 the job chain, page 5 the target. The GPU sees all 8 pages at
++ * GPU VA G_VA (L0[0] -> L1[0] -> L2[8] -> L3[0..7]).
++ */
++#define G_BUF           0x8000u
++#define G_VA            0x1000000ull
++#define G_PG_JOB        4
++#define G_PG_TARGET     5
++#define G_IMM           0x5157ee70u
+ 
+ static vm_offset_t g_pmu, g_cmu, g_gpu;
+ static int g_sleep_chan;
+@@ -75,6 +121,141 @@ g_sleep_ms(uint32_t ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* Clean and invalidate [p, p+len) to the point of coherency (the GPU is not coherent). */
++static void
++g_flush(void *p, size_t len)
++{
++	for (uintptr_t a = (uintptr_t)p & ~(uintptr_t)63; a < (uintptr_t)p + len; a += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++g_as_idle(void)
++{
++	for (int i = 0; i < 1000; ++i) {
++		if (!(g_rd(g_gpu, AS0 + AS_STATUS) & 1)) {
++			return true;
++		}
++		delay(10);
++	}
++	printf("SWEET GPU: AS0 stays active, status %#x\n", g_rd(g_gpu, AS0 + AS_STATUS));
++	return false;
++}
++
++/* Step 3: GPU MMU address space 0 plus one polled chain of two WRITE_VALUE jobs. */
++static void
++g_step3(uint32_t shader)
++{
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, G_BUF, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPU: no contiguous memory for step 3\n");
++		return;
++	}
++	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++	for (vm_offset_t o = PAGE_SIZE; o < G_BUF; o += PAGE_SIZE) {
++		if (ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(va + o))) != pa + o) {
++			printf("SWEET GPU: step 3 buffer not contiguous at +%#lx\n", (unsigned long)o);
++			return;
++		}
++	}
++	if (!pa || (pa & 0xfff)) {
++		printf("SWEET GPU: bad step 3 buffer PA %#llx\n", pa);
++		return;
++	}
++	uint64_t *pg[8];
++	for (int i = 0; i < 8; ++i) {
++		pg[i] = (uint64_t *)(va + i * 0x1000);
++	}
++
++	/* Mali LPAE: table = PA | 3; leaf = PA | 1 at every level, attr index 0, HAP read+write, outer shareable. */
++	pg[0][0] = (pa + 0x1000) | 3;
++	pg[1][0] = (pa + 0x2000) | 3;
++	pg[2][(G_VA >> 21) & 0x1ff] = (pa + 0x3000) | 3;
++	for (int i = 0; i < 8; ++i) {
++		pg[3][((G_VA >> 12) & 0x1ff) + i] = (pa + i * 0x1000) | 1 | (3ull << 6) | (2ull << 8);
++	}
++
++	/* Two WRITE_VALUE jobs (Mesa genxml v6: Job Header, then Write Value Job Payload at +32). */
++	uint64_t job0 = G_VA + G_PG_JOB * 0x1000, job1 = job0 + 128, target = G_VA + G_PG_TARGET * 0x1000;
++	uint32_t *t = (uint32_t *)pg[G_PG_TARGET];
++	for (int i = 0; i < 8; ++i) {
++		t[i] = 0xdeadbeef;
++	}
++	uint32_t *j = (uint32_t *)pg[G_PG_JOB];
++	j[4] = 1 | (2u << 1) | (1u << 16);              /* 64-bit descriptor, type Write value, index 1 */
++	*(uint64_t *)&j[6] = job1;                      /* next */
++	*(uint64_t *)&j[8] = target;                    /* payload: address */
++	j[10] = 3;                                      /* Zero */
++	j += 32;
++	j[4] = 1 | (2u << 1) | (2u << 16);              /* index 2, last job */
++	*(uint64_t *)&j[8] = target + 8;
++	j[10] = 6;                                      /* Immediate 32 */
++	*(uint64_t *)&j[12] = G_IMM;
++	g_flush((void *)va, G_BUF);
++
++	g_wr(g_gpu, JOB_IRQ_MASK, 0);                   /* polled: no interrupts */
++	g_wr(g_gpu, MMU_IRQ_MASK, 0);
++	g_wr(g_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	g_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++	g_wr(g_gpu, COHERENCY_ENABLE, 31);
++
++	uint64_t transtab = pa | (1u << 2) | 3;         /* READ_INNER | ADRMODE_TABLE */
++	uint64_t memattr = 0x88ull | (0x8dull << 8) | (0x88ull << 16);
++	if (!g_as_idle()) {
++		return;
++	}
++	g_wr(g_gpu, AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	g_wr(g_gpu, AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	g_wr(g_gpu, AS0 + AS_MEMATTR_LO, (uint32_t)memattr);
++	g_wr(g_gpu, AS0 + AS_MEMATTR_HI, (uint32_t)(memattr >> 32));
++	g_wr(g_gpu, AS0 + AS_COMMAND, 1);               /* UPDATE */
++	if (!g_as_idle()) {
++		return;
++	}
++	printf("SWEET GPU: AS0 transtab %#llx memattr %#llx, buffer PA %#llx, jobs at GPU VA %#llx\n",
++	    transtab, memattr, pa, job0);
++
++	uint32_t js = JS_BASE(1);
++	g_wr(g_gpu, js + JS_HEAD_NEXT_LO, (uint32_t)job0);
++	g_wr(g_gpu, js + JS_HEAD_NEXT_HI, (uint32_t)(job0 >> 32));
++	g_wr(g_gpu, js + JS_AFF_NEXT_LO, shader);
++	g_wr(g_gpu, js + JS_AFF_NEXT_HI, 0);
++	/* AS 0, flush clean+invalidate at start and end, thread priority 8 (as Panfrost). */
++	g_wr(g_gpu, js + JS_CONFIG_NEXT, (3u << 8) | (3u << 12) | (8u << 16));
++	g_wr(g_gpu, js + JS_COMMAND_NEXT, 1);           /* START */
++
++	const uint32_t done = (1u << 1) | (1u << 17);   /* slot 1 done or failed */
++	uint32_t raw = 0;
++	int ms;
++	for (ms = 0; ms < 1000; ++ms) {
++		raw = g_rd(g_gpu, JOB_IRQ_RAWSTAT);
++		if (raw & done) {
++			break;
++		}
++		delay(1000);
++	}
++	if (!(raw & done)) {
++		g_wr(g_gpu, js + JS_COMMAND, 3);        /* HARD_STOP */
++	}
++	g_flush((void *)va, G_BUF);
++	j = (uint32_t *)pg[G_PG_JOB];
++	printf("SWEET GPU: job rawstat %#x after ~%d ms; JS1 status %#x head %#x; mmu rawstat %#x AS0 fault %#x at %#x%08x\n",
++	    raw, ms, g_rd(g_gpu, js + JS_STATUS), g_rd(g_gpu, js + JS_HEAD_LO), g_rd(g_gpu, MMU_IRQ_RAWSTAT),
++	    g_rd(g_gpu, AS0 + AS_FAULTSTATUS), g_rd(g_gpu, AS0 + AS_FAULTADDR_HI), g_rd(g_gpu, AS0 + AS_FAULTADDR_LO));
++	printf("SWEET GPU: job0 exception %#x incomplete %#x, job1 exception %#x incomplete %#x; target %#x %#x %#x %#x\n",
++	    j[0], j[1], j[32], j[33], t[0], t[1], t[2], t[3]);
++	if (t[0] == 0 && t[1] == 0 && t[2] == G_IMM && t[3] == 0xdeadbeef) {
++		printf("SWEET GPU: the GPU wrote RAM through its MMU (step 3 done)\n");
++	} else {
++		printf("SWEET GPU: step 3 FAILED\n");
++	}
++	g_wr(g_gpu, JOB_IRQ_CLEAR, 0xffffffffu);
++	g_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
++}
++
+ /* Write mask to a PWRON register, wait up to ~1 s for it in the READY register. */
+ static bool
+ g_power(const char *what, uint32_t pwron, uint32_t ready, uint32_t mask)
+@@ -137,6 +318,9 @@ g_thread(void *arg, wait_result_t result)
+ 	    g_power("tiler", TILER_PWRON, TILER_READY, tiler) &&
+ 	    g_power("shader", SHADER_PWRON, SHADER_READY, shader)) {
+ 		printf("SWEET GPU: all cores powered (step 2 done)\n");
++		if (level >= 3) {
++			g_step3(shader);
++		}
+ 	}
+ }
+ 
