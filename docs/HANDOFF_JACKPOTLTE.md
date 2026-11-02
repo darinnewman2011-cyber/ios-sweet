@@ -439,6 +439,28 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - Symbolication setup (WSL): image mounted read-only at `/mnt/iosroot` (`_tmp/wsl/mountro.sh`); ipsw needs the cache in
     a writable dir, so `/opt/sweet/dsc` holds **relative** symlinks to the cache files (absolute ones fail, overlayfs on
     hfsplus fails).
+  - **GPU step 2 (0101, commit aeff637, CI 41517565494; `a8-ios9b`, `sweetgpu=2`):** Mali-G71 MP2 identified and powered,
+    details in `docs/GPU_JACKPOTLTE.md`.
+  - **Observed (ios8, `sweetreboot=1800`, log `_tmp/ios8-log.txt`): panic at ~1150 s** `hfs_swap_BTNode: offset #0 invalid
+    (0x0000) … node=19731 fileID=4`, then `hfs_UNswap_BTNode: invalid forward link`. Guess (not verified): the 256 MiB RAM
+    overlay filled up and refused writes, leaving the catalog B-tree inconsistent in memory. 0102 (commit f02cca2) logs
+    overlay use every 50 MiB and repeats the "full" line every 500 refused writes.
+  - **Persistent root: 0103-jackpotlte-emmc-write-root-in-place.patch** (commit c38eb29, CI 41521759537 success, kernel
+    hash matches `SHA256SUMS`, artifact in `_tmp/a8art17`). Boot-arg `sweetrootrw=1`: if the root file is fully written
+    (extents contiguous from 0, none unwritten, covering the size), writes go to the eMMC through the file's extent map
+    (polled CMD24 through the FIFO, DAT0 busy wait, CMD13 until TRAN; CMD6 FLUSH_CACHE on sync). Every write is checked
+    against the USERDATA bounds (`mmc_wr_lo/hi`). Otherwise the RAM overlay is used as before.
+  - **13 GiB image (`_tmp/wsl/mkroot3.sh`):** the root is rebuilt at 13 GiB so it fits /data fully allocated (12.46 GB used,
+    1.49 GB free inside, fsck OK, journal header written). SHA-256
+    `6afd5ba18a61678e5e25219c166e39fe6a2d625cb93aad2163742bba06e18d16`. BTAudioHALPlugin.bundle was **not found** under
+    `/System/Library` (depth 6), so nothing was moved. The old sparse image and `t.bin` were deleted from the phone
+    (/data then had 14.5 GB free). Pushed with `tools/a8push.py --dense` (every block written, so the file has no holes).
+  - **GPU step 3: 0104-jackpotlte-mali-g71-mmu-write-value-job.patch** (commit 7b8456a, CI 41524145769). `sweetgpu=3`:
+    after powering the cores, AS0 gets Mali LPAE page tables (G71 has no AArch64-format GPU MMU, Panfrost
+    `hw_features_g71`): table = PA|3, leaf = PA|1 at every level, HAP read+write (bits 6-7), outer shareable,
+    TRANSTAB = L0 PA | READ_INNER | ADRMODE_TABLE, MEMATTR 0x88/0x8D/0x88. A chain of two WRITE_VALUE jobs (Zero, then
+    Immediate 32 `0x5157ee70`; layout from Mesa genxml `v6.xml`) runs on job slot 1, polled (no IRQ). Expected:
+    `SWEET GPU: the GPU wrote RAM through its MMU (step 3 done)`.
   - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
     volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
     read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in

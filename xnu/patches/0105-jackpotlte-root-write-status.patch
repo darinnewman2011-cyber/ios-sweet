@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 2d193c4..1c83874 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -356,6 +356,31 @@ static uint32_t mmc_hold;                       /* CMD_USE_HOLD_REG or 0 */
+ static bool mmc_fifo64;
+ static uint64_t mmc_wr_lo, mmc_wr_hi;           /* writable sectors [lo, hi): USERDATA, 0 = none */
+ 
++/*
++ * Write statistics, printed every 10 s by wst_thread() so the first failure
++ * stays inside the last 16 KB that ramoops keeps. where: 1 outside USERDATA,
++ * 2 CMD24, 3 data error, 4 data timeout, 5 busy, 6 card status, 7 not back in
++ * TRAN, 8 no extent, 9 beyond the file, 10 strategy bounds. a/b: rintsts, r1.
++ */
++static struct {
++	uint64_t ok, fail, lba;
++	uint32_t where, a, b;
++	int err;
++} wst;
++
++static int
++wst_fail(int err, uint32_t where, uint64_t lba, uint32_t a, uint32_t b)
++{
++	if (!wst.fail++) {
++		wst.err = err;
++		wst.where = where;
++		wst.lba = lba;
++		wst.a = a;
++		wst.b = b;
++	}
++	return err;
++}
++
+ /* Wait until (reg & mask) == want; false on timeout. */
+ static bool
+ mmc_wait(uint32_t r, uint32_t mask, uint32_t want, uint64_t ns)
+@@ -449,14 +474,14 @@ mmc_wait_tran(uint64_t lba)
+ 
+ 	if (!mmc_wait(MMC_STATUS, STATUS_BUSY, 0, MMC_DATA_NS)) {
+ 		printf("SWEET MMC: 0x%llx: card still busy\n", lba);
+-		return ETIMEDOUT;
++		return wst_fail(ETIMEDOUT, 5, lba, 0, 0);
+ 	}
+ 	for (int i = 0; i < 1000; i++) {
+ 		st = mmc_cmd(13, MMC_RCA << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
+ 		if (st != UINT32_MAX && !(st & INT_ERROR)) {
+ 			if (resp & R1_ERRORS) {
+ 				printf("SWEET MMC: 0x%llx: card status 0x%x\n", lba, resp);
+-				return EIO;
++				return wst_fail(EIO, 6, lba, st, resp);
+ 			}
+ 			if (R1_STATE(resp) == 4 && (resp & R1_READY)) {
+ 				return 0;
+@@ -465,7 +490,7 @@ mmc_wait_tran(uint64_t lba)
+ 		delay(10);
+ 	}
+ 	printf("SWEET MMC: 0x%llx: card not back in TRAN, r1 0x%x\n", lba, resp);
+-	return ETIMEDOUT;
++	return wst_fail(ETIMEDOUT, 7, lba, 0, resp);
+ }
+ 
+ /* CMD24: one 512-byte sector from src (4-byte aligned), only inside [mmc_wr_lo, mmc_wr_hi). */
+@@ -477,7 +502,7 @@ mmc_write_sector(uint64_t lba, const uint32_t *src)
+ 
+ 	if (lba < mmc_wr_lo || lba >= mmc_wr_hi || lba > UINT32_MAX) {
+ 		printf("SWEET MMC: refusing write at 0x%llx (writable 0x%llx-0x%llx)\n", lba, mmc_wr_lo, mmc_wr_hi);
+-		return EPERM;
++		return wst_fail(EPERM, 1, lba, 0, 0);
+ 	}
+ 	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
+ 	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
+@@ -487,7 +512,7 @@ mmc_write_sector(uint64_t lba, const uint32_t *src)
+ 	    CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_READ_WRITE | CMD_PRV_DAT_WAIT, &resp);
+ 	if (st == UINT32_MAX || (st & INT_ERROR) || (resp & R1_ERRORS)) {
+ 		printf("SWEET MMC: CMD24 0x%llx: rintsts 0x%x r1 0x%x\n", lba, st, resp);
+-		return EIO;
++		return wst_fail(EIO, 2, lba, st, resp);
+ 	}
+ 	nanoseconds_to_absolutetime(MMC_DATA_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -506,14 +531,14 @@ mmc_write_sector(uint64_t lba, const uint32_t *src)
+ 		ufs_wr(MMC_RINTSTS, INT_TXDR);
+ 		if (r & INT_ERROR) {
+ 			printf("SWEET MMC: write 0x%llx: rintsts 0x%x after %u words\n", lba, r, n);
+-			return EIO;
++			return wst_fail(EIO, 3, lba, r, n);
+ 		}
+ 		if ((r & INT_DATA_OVER) && n >= 128) {
+ 			break;
+ 		}
+ 		if (mach_absolute_time() > deadline) {
+ 			printf("SWEET MMC: write 0x%llx timed out: rintsts 0x%x, %u words\n", lba, r, n);
+-			return ETIMEDOUT;
++			return wst_fail(ETIMEDOUT, 4, lba, r, n);
+ 		}
+ 	}
+ 	return mmc_wait_tran(lba);
+@@ -784,14 +809,14 @@ file_write_blocks(uint64_t lba, uint32_t count)
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 
+ 	if (count > BOUNCE_SIZE / UFS_BLOCK || lba + count > su.nblocks) {
+-		return EINVAL;
++		return wst_fail(EINVAL, 9, lba, count, (uint32_t)su.nblocks);
+ 	}
+ 	while (count) {
+ 		uint32_t n;
+ 		uint64_t pba = file_extent(lba, count, &n);
+ 		if (pba == UINT64_MAX) {
+ 			printf("SWEET ROOT: no block behind file sector 0x%llx, refusing write\n", lba);
+-			return EIO;
++			return wst_fail(EIO, 8, lba, count, n);
+ 		}
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			int error = mmc_write_sector(su.first_block + pba + i,
+@@ -799,6 +824,7 @@ file_write_blocks(uint64_t lba, uint32_t count)
+ 			if (error) {
+ 				return error;
+ 			}
++			wst.ok++;
+ 		}
+ 		b += n * UFS_BLOCK;
+ 		lba += n;
+@@ -807,6 +833,21 @@ file_write_blocks(uint64_t lba, uint32_t count)
+ 	return 0;
+ }
+ 
++static int wst_chan;
++
++static void
++wst_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(10, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&wst_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("SWEET ROOT: %llu sectors written, %llu failed; first failure err %d where %u at 0x%llx (%#x %#x)\n",
++		    wst.ok, wst.fail, wst.err, wst.where, wst.lba, wst.a, wst.b);
++	}
++}
++
+ /* count 512-byte sectors of the file at sector lba into the bounce buffer. */
+ static int
+ file_read_blocks(uint64_t lba, uint32_t count)
+@@ -1129,7 +1170,7 @@ sweet_ufs_strategy(buf_t bp)
+ 		goto done;
+ 	}
+ 	if (off > part_bytes || count > part_bytes - off) {
+-		error = EINVAL;
++		error = rd ? EINVAL : wst_fail(EINVAL, 10, off / UFS_BLOCK, count, (uint32_t)su.nblocks);
+ 		goto done;
+ 	}
+ 	if (count == 0) {
+@@ -1413,6 +1454,10 @@ sweet_ufs_init(void)
+ 		mmc_wr_hi = su.first_block + part_blocks;
+ 		su.writable = true;
+ 		printf("SWEET ROOT: read-write in place: writes go only into the file's own %u extents\n", xf.nrun);
++		thread_t wt;
++		if (kernel_thread_start(wst_thread, NULL, &wt) == KERN_SUCCESS) {
++			thread_deallocate(wt);
++		}
+ 	} else {
+ 		if (rootrw) {
+ 			printf("SWEET ROOT: sweetrootrw refused (no file root or not fully written)\n");
