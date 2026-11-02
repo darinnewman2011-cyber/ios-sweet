@@ -265,7 +265,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     reserves 32 MB.
 - **Run 41389836692 (commit ef5b97e): success**, ISA 0. Kernel `632dd999…15b0`, payload `e398b202…0d3f`
   (reproduced locally). **`a8-xnu5-boot.img` SHA-256 `c0f586c329b8735aac933c66d05a2f22f5356cee453cf9f5e8cd4a5334aa604e`**,
-  flashed to BOOT with all checks passing, `adb reboot`. **Result: not yet reported.**
+  flashed to BOOT with all checks passing, `adb reboot`.
+- **Observed (user photos, xnu5):** `kmem_range_init` passed; Zone info, compressor info and 13 threads are
+  printed. New panic `write_pte_fast: PTE write is unaligned, ptep=0xfffffff03842b618,
+  pte=0x4200008830024ec3 @pmap.c:623`. Backtrace (symbolized with llvm-symbolizer, kernel unslid at
+  `0xfffffff007004000`): `kernel_bootstrap_thread` → `vm_commpage_init` → `commpage_populate` →
+  `pmap_create_commpages` → `pmap_enter_options_addr` → `pmap_enter_options_internal`.
+- **Cause:** `pmap_create_commpages()` puts the text commpage at a random leaf (4K) index. With 16K VM pages on
+  a 4K granule, `write_pte_fast()` writes PAGE_RATIO=4 PTEs and requires a 32-byte-aligned ptep (index 0xc3
+  is not).
+- **Fix: 0091-jackpotlte-commpage-text-va.patch** (commit 00d7f75): on SWEET, pick a leaf index that is a
+  multiple of PAGE_RATIO (no-op on sweet, PAGE_RATIO 1). Run 41391199403. **Result: pending.**
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
