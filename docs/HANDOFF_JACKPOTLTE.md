@@ -235,7 +235,23 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 - **Run 41387128412 (commit afb201a): success**, ISA 0.
   - Kernel `bc6846c6…b340` (matches `SHA256SUMS`). Payload `3c5cc419…c6ea` (reproduced locally).
   - **`a8-xnu3-boot.img` SHA-256 `b3a413382bab04cdc0d88182706ed31334935cfbb16bf2ad40edb45db6e22df3`.** Flashed to BOOT
-    with all checks passing (readback matches), `adb reboot`. **Result: not yet reported.**
+    with all checks passing (readback matches), `adb reboot`.
+- **Observed — DARWIN BANNER ON THE A8 (user photos, xnu3):**
+  - All SWEET EARLY stages passed. The progress bar runs across the whole bottom edge and the regular console
+    took over.
+  - Console: `Darwin Kernel Version 22.6.0: Mon Aug 14 05:06:07 UTC 2023; runner:xnu-8796.141.3`,
+    `pmap_startup() init/release time: 18345 microsec`, `vm_page_bootstrap: 128151 free pages, 2857 wired pages`,
+    `VM bootstrap: 97 maps, 204 entries and 512 holes available`, `Maximum number of VM swap files: 100`.
+  - Then `panic(cpu 0 caller 0xfffffff007a4a878): kmem_range_init: vm_map_locate_space failing for claim zones
+    @vm_kern.c:3645`, followed by nested panics (caller `0xfffffff007a2f754`) and "Nested panic stall".
+  - 0088 worked.
+- **Cause:** `zalloc.c` gives `ZONE_MAP_VA_SIZE` 128 GB on `XNU_PLATFORM_MacOSX` (24 GB on iOS). The iOS 4K layout
+  has only ~112 GB of kernel VA (`0xffffffe000000000`–`0xfffffffbffffffff`).
+- **Fix: 0089-jackpotlte-ios-zone-map.patch** (commit 4b95d92): iOS sizes (8 GB max / 24 GB VA) when
+  `SWEET_JACKPOTLTE`. Checked the other kmem claims: only `compressor` (dynamic) is large, 16 × 2 GB = 32 GB
+  under the macOS rule, which fits. CI run 41388657761 is building it.
+- **Still open:** the nested panics after the first one (caller `0xfffffff007a2f754`) — check the symbol if
+  they recur.
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
