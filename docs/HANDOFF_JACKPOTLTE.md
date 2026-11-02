@@ -218,7 +218,21 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   **`f7f4eb8f2ef985efa1da034cbde50ea4162d91f6e3a5143249dd974f83a299f6`** (Image 16,228,864 bytes, payload at
   `0x40e0`; DTBH and cmdline identical to stock).
 - **Flashed xnu2 (user approved):** hash OK on `/sdcard`, `dd` to BOOT (`mmcblk0p12`), readback matches
-  `f7f4eb8f…99f6`, backup re-checked `c87a1336…`, `adb reboot`. **Result on screen: not yet reported.**
+  `f7f4eb8f…99f6`, backup re-checked `c87a1336…`, `adb reboot`.
+- **Observed — XNU RUNS WITH THE MMU ON (user photo, xnu2):**
+  - `SWEET EARLY 1` (arm_init entered, MMU on) through `7` (entering arm_vm_init) all printed. Progress blocks
+    0–7 sit along the bottom edge.
+  - Then `SWEET EARLY PANIC: arm_vm_init.c:1846 Assertion failed: (l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) ==
+    (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)` in `sweet_early_map_block`.
+  - So 0087 fixed the start.s fault: PE_init_platform, CPU topology, cpu_bootstrap,
+    kernel_startup_bootstrap and cpu_init all work on the A8.
+- **Cause:** 0012's `SWEET_EARLY_FB_VA = VM_MIN_KERNEL_ADDRESS + 2 MB`. That equals `LOW_GLOBAL_BASE_ADDRESS` only
+  with ARM_LARGE_MEMORY. In the iOS layout it is `0xffffffe000000000`, an L1 slot with no table.
+- **Fix: 0088-jackpotlte-early-fb-va.patch** (commit afb201a): `LOW_GLOBAL_BASE_ADDRESS + 2 MB` (same value on
+  sweet). On the A8 the alias uses L2 slots 1–6 of the kernel's L1 slot, below `gVirtBase` `0xfffffff006000000`.
+  In this layout the physmap and dynamic memory start above the kernel (`phystokv(topOfKernelData)`), so the
+  alias is never handed to the VM. No other patch assumes `VM_MIN_KERNEL_ADDRESS` = low globals.
+  CI run 41387128412 is building it.
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
