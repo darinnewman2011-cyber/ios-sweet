@@ -188,6 +188,14 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   `PAYLOAD=<artifact>/xnu-jackpotlte.payload shim/a8/build.sh`, then
   `python tools/mka8boot.py <BOOT backup> shim/a8/out/Image <out>.img`. Flash from TWRP as before. Get the
   user's confirmation; recovery is unchanged.
+- **First XNU boot image built (2026-11-01, not flashed yet).** The artifact from run 41378975010 was
+  downloaded to the PC (kernel SHA-256 `e7b04f6a…fb7a3` matches CI's `SHA256SUMS`). A local `mkpayload.py`
+  rebuild is byte-identical to CI's payload (`360008e1…aed1`).
+  - Image: 16,343,552 bytes, payload at `0x40e0`.
+  - `a8-xnu1-boot.img` (template = BOOT backup `c87a1336…`): SHA-256
+    **`270f5102b890c89365427fc563780a528b43d56bcbca93c8787bcb2409034772`**.
+  - DTBH and cmdline are byte-identical to stock; Image header text_offset `0x80000`, flags `0xa`.
+  - The image stays on the PC (`_tmp/`, not in git).
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
