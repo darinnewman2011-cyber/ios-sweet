@@ -381,6 +381,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     modules allowed, no signing), apfs-fuse is not packaged, TWRP's kernel has no HFS+ either. Plan: build `hfsplus.ko`
     from Microsoft's `linux-msft-wsl-6.18.54.1` tag, build apfs-fuse from source, apt hfsprogs. Blocked on the user's OK
     to download/build/run that code as root in WSL. PC: C: freed to 35 GB (WSL swap 32→4 GB in `.wslconfig`).
+  - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
+    volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
+    read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in
+    blocks that file already owns. Home on the A8 (no Bixby key, no Home button): planned as Volume Up + Volume Down
+    together = HID Home; the swipe-up gesture is the long-term fix.
+  - **WSL image toolchain (2026-11-02):** hfsplus.ko built from `linux-msft-wsl-6.18.54.1` (gcc 15 vs Microsoft's gcc 13:
+    `module_layout` CRC differs, loads with `modprobe --force-modversion`, taints WSL's kernel only), apfs-fuse @66b86bd
+    (needs `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and `-include cstdint`). Scripts: `_tmp/wsl/{setup,fetch,mkroot}.sh`.
+    IPSW parts in `/opt/sweet/ipsw` (OS 087-86698-044, SystemOS 087-86593-047, AppOS 087-86715-047). Repo shell scripts
+    have CRLF in the Windows checkout: strip before running in WSL. DeviceTree.d22ap.im4p payload is LZFSE (`bvx2`);
+    decoded with lzfse from apfs-fuse's 3rdparty to `research/ipsw-x/d22ap.adt` (186084 bytes, git-ignored).
+    `tools/a8push.py` copies an image sparsely (verified: hash match, holes kept).
   - The public GitHub API allows 60 requests/hour without a token: poll every 90 s, or read the Actions page in the browser.
   - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
@@ -425,9 +437,9 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   the user's OK.
 - Keep dumps, serial numbers and IMEI-bearing partitions out of git. The live FDT and `bootargs` contain the
   serial; use the redacted copy under `research/a8/`. The user's partition backups stay on their PC.
-- Recovery path for a bad BOOT: force off (Power + Volume Down ~8 s), TWRP (Power + Bixby + Volume Up),
+- Recovery path for a bad BOOT: force off (Power + Volume Down ~8 s), TWRP (Power + Volume Up; the A8 has no Bixby key, user 2026-11-02),
   `dd` the saved `BOOT.img` (SHA-256 `c87a1336e8e6ca031b402cce84add38c9ec24172e3293de868cd7b05d6c9a59d`) back.
-  Download mode is Power + Bixby + Volume Down. Stock firmware for Odin can come from SamFw (user has the tool);
+  Download mode: combo unverified (no Bixby key on the A8; ask the user). Stock firmware for Odin can come from SamFw (user has the tool);
   never flash an older bootloader than `A530FXXULCUK6`.
 - Update this file / `NOTES.md` after each milestone (AGENTS.md convention) and distinguish observations from guesses.
 

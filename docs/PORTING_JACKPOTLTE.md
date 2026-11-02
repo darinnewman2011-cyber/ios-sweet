@@ -103,7 +103,7 @@ already on screen). Any unexpected exception paints a red screen with ESR/ELR/FA
 to the 32 MiB `BOOT` partition. Its id formula reproduces the template's own SHA-1 id.
 
 Flash from TWRP (backup first!): `dd` the image to `/dev/block/by-name/BOOT`, read it back and compare SHA-256, reboot.
-Recover: force power off (Power + Volume Down ~8 s), boot TWRP (Power + Bixby + Volume Up), `dd` the saved `BOOT.img` back.
+Recover: force power off (Power + Volume Down ~8 s), boot TWRP (Power + Volume Up; the A8 has no Bixby key, user 2026-11-02), `dd` the saved `BOOT.img` back.
 If the screen stays black the display path needs the DECON trigger (see "Display" above) and that is the next thing to build.
 
 ## Milestone 4: XNU loader (`PAYLOAD=... shim/a8/build.sh`)
