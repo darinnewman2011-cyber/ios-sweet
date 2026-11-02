@@ -216,7 +216,9 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     (L1 index `0xc0`), the vectors (`0xfffffff00740c000`) and `arm_init`.
 - **`a8-xnu2-boot.img` built, NOT flashed:** SHA-256
   **`f7f4eb8f2ef985efa1da034cbde50ea4162d91f6e3a5143249dd974f83a299f6`** (Image 16,228,864 bytes, payload at
-  `0x40e0`; DTBH and cmdline identical to stock). Flash only with the user's OK, same procedure as xnu1.
+  `0x40e0`; DTBH and cmdline identical to stock).
+- **Flashed xnu2 (user approved):** hash OK on `/sdcard`, `dd` to BOOT (`mmcblk0p12`), readback matches
+  `f7f4eb8f…99f6`, backup re-checked `c87a1336…`, `adb reboot`. **Result on screen: not yet reported.**
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
