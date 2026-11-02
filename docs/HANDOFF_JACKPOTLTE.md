@@ -206,10 +206,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   `0xffffffc000000000`), but the macOS platform links the kernel at `0xfffffe0007004000` (ARM_LARGE_MEMORY,
   −2 TB). The branch to the kernel VA after the MMU is enabled faults, and so does the exception vector.
 - **Fix: 0087-jackpotlte-ios-kernel-va.patch** (commit 7525da0): for jackpotlte, `-UARM_LARGE_MEMORY` and link
-  at `0xfffffff007004000` (iOS 4K layout). A CI build with board=jackpotlte has been dispatched. **Next:** check
-  it builds, that "Applying patch ...0087" is in the log and the ISA count is still 0, and that the payload's
-  virt_base is now `0xfffffff006000000`. Then rebuild the boot image (download artifact,
-  `PAYLOAD=... shim/a8/build.sh`, `mka8boot.py`) and flash only with the user's OK.
+  at `0xfffffff007004000` (iOS 4K layout).
+- **Run 41381049607 (commit 7525da0): success.** 0087 applied, `-image_base,0xfffffff007004000`, ISA 0.
+  - Payload: 16,127,264 bytes. virt_base `0xfffffff006000000`, entry `0xfffffff007410488`, kernel_end
+    `0xfffffff008450000`.
+  - Kernel SHA-256 `eaac4048…6a87` (matches `SHA256SUMS`). Payload `ae790553…9b0c`, reproduced byte-identical
+    locally.
+  - Static check: boot TCR `0x22a51a251a` (T1SZ 26, TTBR1 from `0xffffffc000000000`) now covers the kernel text
+    (L1 index `0xc0`), the vectors (`0xfffffff00740c000`) and `arm_init`.
+- **`a8-xnu2-boot.img` built, NOT flashed:** SHA-256
+  **`f7f4eb8f2ef985efa1da034cbde50ea4162d91f6e3a5143249dd974f83a299f6`** (Image 16,228,864 bytes, payload at
+  `0x40e0`; DTBH and cmdline identical to stock). Flash only with the user's OK, same procedure as xnu1.
 - **Expected on the phone:**
   - First the blue "milestone 4: xnu loader" screen with PAYLOAD/PHYS/SEGS/BOOTARG/JUMP lines.
   - Then XNU's early console (0085: stage-0 white band, then text).
