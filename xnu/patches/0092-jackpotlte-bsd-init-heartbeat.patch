@@ -1,0 +1,104 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..6003701 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -473,6 +473,37 @@ bsd_rooted_ramdisk(void)
+  * of the tro_ucred field so that the uthread structure can be
+  * used like any other.
+  */
++#if defined(SWEET_JACKPOTLTE)
++#include <kern/thread_call.h>
++void sweet_early_kick(void);     /* osfmk/arm64/sweet_early.c */
++
++/*
++ * A8 bring-up: a periodic line proves the kernel is alive and re-arms the
++ * command-mode panel so everything printed since the last frame shows up.
++ */
++static thread_call_t sweet_a8_heartbeat_call;
++static uint32_t sweet_a8_heartbeat_secs;
++static void sweet_a8_heartbeat_arm(void);
++
++static void
++sweet_a8_heartbeat(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	sweet_a8_heartbeat_secs += 5;
++	printf("SWEET A8: alive %us, rootdevice '%s'\n", sweet_a8_heartbeat_secs, rootdevice);
++	sweet_early_kick();
++	sweet_a8_heartbeat_arm();
++}
++
++static void
++sweet_a8_heartbeat_arm(void)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(sweet_a8_heartbeat_call, deadline);
++}
++#endif
++
+ void
+ bsd_init(void)
+ {
+@@ -494,10 +525,19 @@ bsd_init(void)
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
++#elif defined(SWEET_JACKPOTLTE)
++/* A8 bring-up: show where bsd_init stops (no other log channel yet). */
++#define bsd_init_kprintf(x, ...) do { printf("bsd_init: " x, ## __VA_ARGS__); sweet_early_kick(); } while (0)
+ #else
+ #define bsd_init_kprintf(x, ...)
+ #endif
+ 
++#if defined(SWEET_JACKPOTLTE)
++	printf("bsd_init: start\n");
++	sweet_a8_heartbeat_call = thread_call_allocate(sweet_a8_heartbeat, NULL);
++	sweet_a8_heartbeat_arm();
++	sweet_early_kick();
++#endif
+ 	throttle_init();
+ 
+ 	printf(copyright);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 001bfec..e7e92c8 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -161,6 +161,17 @@ sweet_early_relocate(uint64_t base, uint64_t decon_base)
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/*
++ * Command-mode panel (jackpotlte): DECON shows nothing new until the TE
++ * trigger is re-armed, so text the kernel prints after the early console
++ * stays invisible until a panic. Lets other code request a frame.
++ */
++void
++sweet_early_kick(void)
++{
++	sweet_early_present();
++}
++
+ void
+ sweet_early_disable(void)
+ {
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 282a925..572f463 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,7 @@ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base, uint64_t decon_base);
+ void sweet_early_disable(void);
++void sweet_early_kick(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -19,6 +20,7 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_kick(void) {}
+ #endif
+ 
+ #endif
