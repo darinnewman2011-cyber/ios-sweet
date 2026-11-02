@@ -1,0 +1,119 @@
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..54bee43 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -589,7 +589,55 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
+  * Now running in a thread.  Kick off other services,
+  * invoke user bootstrap, enter pageout loop.
+  */
++static #if defined(SWEET_JACKPOTLTE)
++#include <kern/thread_call.h>
++void sweet_early_kick(void);     /* osfmk/arm64/sweet_early.c */
++
++/*
++ * A8 bring-up: xnu6-8 stop printing after IOKit's drivers register and never
++ * reach bsd_init. A 5 s heartbeat (thread call, independent of this thread)
++ * shows the last step this thread passed and what it is blocked on; the wait
++ * event is usually the address of a kernel global (llvm-symbolizer).
++ */
++static const char *volatile sweet_boot_stage = "start";
++static thread_t sweet_boot_thread;
++static thread_call_t sweet_boot_hb_call;
++static uint32_t sweet_boot_hb_secs;
++
++#define SWEET_STAGE(label) do { sweet_boot_stage = (label); } while (0)
++
++static void
++sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	thread_t t = sweet_boot_thread;
++	uint64_t deadline;
++
++	sweet_boot_hb_secs += 5;
++	printf("SWEET A8: %us stage '%s' state 0x%x event 0x%llx hint %d\n",
++	    sweet_boot_hb_secs, sweet_boot_stage, t->state, (unsigned long long)t->wait_event,
++	    (int)t->block_hint);
++	sweet_early_kick();
++	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(sweet_boot_hb_call, deadline);
++}
++
+ static void
++sweet_boot_hb_start(void)
++{
++	uint64_t deadline;
++
++	sweet_boot_thread = current_thread();
++	sweet_boot_hb_call = thread_call_allocate(sweet_boot_hb, NULL);
++	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(sweet_boot_hb_call, deadline);
++	printf("SWEET A8: boot heartbeat armed\n");
++	sweet_early_kick();
++}
++#else
++#define SWEET_STAGE(label) do { } while (0)
++#endif
++
++void
+ kernel_bootstrap_thread(void)
+ {
+ 	processor_t processor = current_processor();
+@@ -702,6 +750,9 @@ kernel_bootstrap_thread(void)
+ 	ml_spin_debug_clear_self();
+ #endif
+ 	(void) spllo();         /* Allow interruptions */
++#if defined(SWEET_JACKPOTLTE)
++	sweet_boot_hb_start();
++#endif
+ 
+ 	/*
+ 	 * This will start displaying progress to the user, start as early as possible
+@@ -711,9 +762,11 @@ kernel_bootstrap_thread(void)
+ 	/*
+ 	 *	Initialize the shared region module.
+ 	 */
++	SWEET_STAGE("initialize_screen done");
+ 	vm_commpage_init();
+ 	vm_commpage_text_init();
+ 
++	SWEET_STAGE("commpage done");
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_initmach");
+ 	mac_policy_initmach();
+@@ -752,10 +805,12 @@ kernel_bootstrap_thread(void)
+ 	 * Must be done prior to lockdown so that we can free (and possibly relocate)
+ 	 * the static KVA mappings used for the jettisoned bootstrap segments.
+ 	 */
++	SWEET_STAGE("trust caches done");
+ 	kernel_bootstrap_log("OSKextRemoveKextBootstrap");
+ 	OSKextRemoveKextBootstrap();
+ 
+ 	/* No changes to kernel text and rodata beyond this point. */
++	SWEET_STAGE("kext bootstrap removed");
+ 	kernel_bootstrap_log("machine_lockdown");
+ 	machine_lockdown();
+ 
+@@ -769,6 +824,7 @@ kernel_bootstrap_thread(void)
+ #endif /* CONFIG_XNUPOST */
+ 
+ #ifdef  IOKIT
++	SWEET_STAGE("machine_lockdown done");
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
+ #endif
+@@ -776,6 +832,7 @@ kernel_bootstrap_thread(void)
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
++	SWEET_STAGE("PE_lockdown_iokit returned");
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 
+ 
+@@ -786,6 +843,7 @@ kernel_bootstrap_thread(void)
+ 	/*
+ 	 *	Start the user bootstrap.
+ 	 */
++	SWEET_STAGE("calling bsd_init");
+ #ifdef  MACH_BSD
+ 	bsd_init();
+ #endif
