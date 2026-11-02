@@ -275,7 +275,12 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   a 4K granule, `write_pte_fast()` writes PAGE_RATIO=4 PTEs and requires a 32-byte-aligned ptep (index 0xc3
   is not).
 - **Fix: 0091-jackpotlte-commpage-text-va.patch** (commit 00d7f75): on SWEET, pick a leaf index that is a
-  multiple of PAGE_RATIO (no-op on sweet, PAGE_RATIO 1). Run 41391199403. **Result: pending.**
+  multiple of PAGE_RATIO (no-op on sweet, PAGE_RATIO 1).
+- **Run 41391199403 (commit 00d7f75): success**, ISA 0. Kernel `3c70084c…4884`, payload `6f667a80…4553`
+  (reproduced locally). **`a8-xnu6-boot.img` SHA-256 `152519a34dd1ebca3eaee5daa976d35af851f4a329639fa38322484299a3f3d4`**,
+  flashed to BOOT, readback matched, `adb reboot`. **Result: pending.**
+  - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
+    `out/Image`), and `adb push` from Git Bash needs `MSYS_NO_PATHCONV=1`.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
