@@ -311,7 +311,12 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     Android's f2fs/ext4 USERDATA (`cannot mount root, errno = …` repeating). That proves the read path without
     touching any data. The iOS root image itself needs space on the eMMC: wiping USERDATA or the dual-boot GPT
     change, which needs the user's explicit OK.
-  - CI run 41462686989. **Result: pending.**
+  - **Run 41462686989 (commit 1868ab1): success**, ISA 0. Kernel `27aaf291…9386`, payload `823d77c7…537a`
+    (reproduced locally with the same cmdline). **`a8-xnu8-boot.img` SHA-256
+    `bce40ffcf1123e3688a6ca509792743a4a3fc6dfc811e0c312ffcb966d0ce696`**, flashed to BOOT, readback matched, `adb reboot`.
+    **Result: pending.**
+  - PC disk: C: was full (0 MB free) on 2026-11-02. With the user's OK, the old CI downloads (`_tmp/a8art`–`a8art6`)
+    and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
     `out/Image`), and `adb push` from Git Bash needs `MSYS_NO_PATHCONV=1`.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
