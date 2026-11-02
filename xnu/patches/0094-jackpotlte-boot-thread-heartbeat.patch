@@ -1,12 +1,12 @@
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index bec97fb..54bee43 100644
+index bec97fb..95902bc 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -589,7 +589,55 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
+@@ -589,6 +589,54 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
   * Now running in a thread.  Kick off other services,
   * invoke user bootstrap, enter pageout loop.
   */
-+static #if defined(SWEET_JACKPOTLTE)
++#if defined(SWEET_JACKPOTLTE)
 +#include <kern/thread_call.h>
 +void sweet_early_kick(void);     /* osfmk/arm64/sweet_early.c */
 +
@@ -38,7 +38,7 @@ index bec97fb..54bee43 100644
 +	thread_call_enter_delayed(sweet_boot_hb_call, deadline);
 +}
 +
- static void
++static void
 +sweet_boot_hb_start(void)
 +{
 +	uint64_t deadline;
@@ -54,10 +54,9 @@ index bec97fb..54bee43 100644
 +#define SWEET_STAGE(label) do { } while (0)
 +#endif
 +
-+void
+ static void
  kernel_bootstrap_thread(void)
  {
- 	processor_t processor = current_processor();
 @@ -702,6 +750,9 @@ kernel_bootstrap_thread(void)
  	ml_spin_debug_clear_self();
  #endif
