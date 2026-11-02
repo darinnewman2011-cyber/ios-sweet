@@ -381,6 +381,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     modules allowed, no signing), apfs-fuse is not packaged, TWRP's kernel has no HFS+ either. Plan: build `hfsplus.ko`
     from Microsoft's `linux-msft-wsl-6.18.54.1` tag, build apfs-fuse from source, apt hfsprogs. Blocked on the user's OK
     to download/build/run that code as root in WSL. PC: C: freed to 35 GB (WSL swap 32→4 GB in `.wslconfig`).
+  - **iOS root image on the phone (2026-11-02):** built in WSL (`_tmp/wsl/mkroot.sh` + `mkroot2.sh`: mkiosroot.sh 16G,
+    sweet-root-tweaks.py applied, launchd/dyld/shared cache present; 12 GB used). `fsck.hfsplus -fn` still reports
+    "Volume header needs minor repair" after `-fy` (Linux hfsprogs quirk? unverified). Image SHA-256
+    `b094e826b5b84c748780e6e6f1f3c701cd2302c7b5432817cd0f6ee436c6f307`, copied with a8push.py to
+    `/data/sweet/root.img` (inode **1044513**, 113 extents, 11811 MiB allocated, hash matched on the phone; 2.6 GB
+    left free). Android booted fine afterwards with the file in place.
+  - Local ADT with the real D22AP `/product` (`research/ipsw-x/d22ap.adt` from the IPSW DeviceTree, LZFSE-decoded):
+    `_tmp/a8art12/jackpotlte-product.adt`, 12884 bytes (CI's has none, 10200 bytes).
+  - **Ready, not flashed:** `a8-ios1-boot.img` SHA-256 `1870593347a52ffabea9547f44b99252eb2306ffc149b826b7b4fffee5e62842`
+    = run 41477553892 kernel + product ADT, cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0
+    sweetrootino=1044513 sweetreboot=240`. Phone is back on stock Android BOOT for the user (restore it after each
+    test session).
   - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
     volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
     read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in
