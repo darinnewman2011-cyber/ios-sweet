@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2328611..3c3a192 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,11 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(SWEET_GICV2)
+ extern "C" void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
+ #endif
++#if defined(SWEET_JACKPOTLTE)
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* Start of the A8 boot shim's Image in the low DRAM bank (S-Boot loads it at 0x80080000). */
++#define SWEET_SMP_TRAMPOLINE_PA 0x80080000u
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -247,6 +252,31 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++#if defined(SWEET_JACKPOTLTE)
++	/*
++	 * The kernel lives in the upper DRAM bank (0x880000000); Samsung's PSCI
++	 * firmware returns 0 for such an entry but the core never arrives (it
++	 * keeps a 32-bit address; the A8 shim's own CPU_ON at low addresses works,
++	 * and the Galaxy S7 port saw the same). Enter through a trampoline at the
++	 * start of the boot shim's Image, dead once XNU runs:
++	 * ldr x16, =entry; br x16. x0 (the context id) stays for the entry.
++	 */
++	if ((uint64_t)entry >> 32) {
++		static vm_offset_t trampoline;
++		if (trampoline == 0) {
++			trampoline = ml_io_map(SWEET_SMP_TRAMPOLINE_PA, PAGE_SIZE);
++		}
++		volatile uint32_t *code = (volatile uint32_t *)trampoline;
++		code[0] = 0x58000050;   /* ldr x16, #8 */
++		code[1] = 0xd61f0200;   /* br x16 */
++		code[2] = (uint32_t)entry;
++		code[3] = (uint32_t)((uint64_t)entry >> 32);
++		__builtin_arm_dsb(DSB_SY);
++		IOLog("SWEET CPU: cpu=%u entry 0x%llx via trampoline 0x%x\n",
++		    getCPUNumber(), (uint64_t)entry, SWEET_SMP_TRAMPOLINE_PA);
++		entry = SWEET_SMP_TRAMPOLINE_PA;
++	}
++#endif
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
