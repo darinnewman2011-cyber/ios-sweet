@@ -249,7 +249,10 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   has only ~112 GB of kernel VA (`0xffffffe000000000`–`0xfffffffbffffffff`).
 - **Fix: 0089-jackpotlte-ios-zone-map.patch** (commit 4b95d92): iOS sizes (8 GB max / 24 GB VA) when
   `SWEET_JACKPOTLTE`. Checked the other kmem claims: only `compressor` (dynamic) is large, 16 × 2 GB = 32 GB
-  under the macOS rule, which fits. CI run 41388657761 is building it.
+  under the macOS rule, which fits.
+- **Run 41388657761 (commit 4b95d92): success**, ISA 0. Kernel `e8dbec53…83d1`, payload `8d33ad5a…24db`
+  (reproduced locally). **`a8-xnu4-boot.img` SHA-256 `1bff6defc656965acaf744032598d272fc15c8ce3734f96cca34eebc8ec2093a`**,
+  flashed to BOOT with all checks passing, `adb reboot`. **Result: not yet reported.**
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
