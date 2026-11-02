@@ -18,7 +18,13 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 - To tell the two apart, `diag.c` gained a proof-of-entry probe (`EXTRA_CFLAGS=-DA8_PROBE_RESET=4 shim/a8/build.sh`):
   after drawing it waits 4 s, then writes PMU SWRESET (`0x11C80400` = 1, the mainline exynos7 syscon-reboot value,
   unverified on this SoC). Reboot loop ⇒ the shim runs and the display trigger is the blocker. Splash that stays ⇒
-  S-Boot did not start us, or something before the reset hung. Not built yet: this PC has no aarch64 clang/lld.
+  S-Boot did not start us, or something before the reset hung.
+- **Observed (probe, boot image SHA-256 `5b02e66e…22bc8`, built with LLVM 23.1.4 on Windows):** the phone
+  **reboot-loops** every few seconds. So: S-Boot accepts and enters our arm64 Image; the shim runs through all
+  register reads, FDT parsing and framebuffer drawing without an exception (an exception paints red and halts, no
+  reset); the generic timer counts; **PMU SWRESET `0x11C80400` = 1 resets the SoC** (now verified). The display
+  is the only reason nothing was visible: the command-mode panel keeps the S-Boot splash until DECON sends a frame.
+  Next: DECON trigger (step 1 below). The reset is also a usable 1-bit signal for later blind experiments.
 - **Verified:** `mkadt.py` sweet output is byte-identical to `45263be` (seed `\0`*64, highmem off and on);
   `--device jackpotlte` builds (10200 bytes). Open question: every jackpotlte CPU node has `cluster-id` 0, although
   the A53s sit in two clusters (`0x1xx`, `0x2xx`) and the A73s in a third.

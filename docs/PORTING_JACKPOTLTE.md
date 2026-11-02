@@ -80,7 +80,8 @@ the compatible list. `xiaomi,sweet` stays last so the existing platform expert m
 
 - Whether DW-MSHC is left in a state the shim can reuse (HS400 timing, CMDQ) or must be re-initialised from scratch.
 - GICv2 register state at handover (the kernel enables it itself, so assume clean).
-- Whether S-Boot accepts a non-Linux `Image` (the shim must keep the arm64 Image header).
+- ~~Whether S-Boot accepts a non-Linux `Image`~~ **Verified 2026-11-01:** it enters the shim (arm64 Image header,
+  text_offset `0x80000`, flags `0xa`). PMU SWRESET (`0x11C80000 + 0x400` = 1) reboots the SoC.
 
 ## Boot and recovery (read before flashing anything)
 
