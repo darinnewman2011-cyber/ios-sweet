@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 383cf94..e3a7e88 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -363,7 +363,7 @@ static bool mmc_fifo64;
+ static uint64_t mmc_wr_lo, mmc_wr_hi;           /* writable sectors [lo, hi): USERDATA, 0 = none */
+ 
+ /*
+- * Write statistics, printed every second by wst_thread() so the first failure
++ * Write statistics, printed every 30 s by wst_thread() so the first failure
+  * stays inside the last 16 KB that ramoops keeps. where: 1 outside USERDATA,
+  * 2 CMD24, 3 data error, 4 data timeout, 5 busy, 6 card status, 7 not back in
+  * TRAN, 8 no extent, 9 beyond the file, 10 strategy bounds. a/b: rintsts, r1.
+@@ -866,7 +866,7 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	for (;;) {
+ 		uint64_t deadline;
+-		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
++		clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
+ 		(void)assert_wait_deadline(&wst_chan, THREAD_UNINT, deadline);
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		printf("SWEET ROOT: %llu sectors written, %llu failed; first failure err %d where %u at 0x%llx (%#x %#x)\n",
