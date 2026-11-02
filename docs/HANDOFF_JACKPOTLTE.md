@@ -25,6 +25,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   reset); the generic timer counts; **PMU SWRESET `0x11C80400` = 1 resets the SoC** (now verified). The display
   is the only reason nothing was visible: the command-mode panel keeps the S-Boot splash until DECON sends a frame.
   Next: DECON trigger (step 1 below). The reset is also a usable 1-bit signal for later blind experiments.
+- **Observed — DISPLAY WORKS (commit `608430b`, boot image `459ddbe7…eeed`, `-DA8_PROBE_RESET=10`):** blue text
+  screen, colour bars in the right order (red, green, blue, white, so a8r8g8b8 is right), then the PMU reset. Step 1 is
+  done. `a8_present()` = Samsung `decon_reg_start()`: GC |= EN|EN_F, SHADOW |= bit31, wait RUN, TRIG: clear
+  MASK_DECON, set HW_TRIG_EN. Values read on the phone (S-Boot hand-over state):
+  EL 1; MPIDR `0x80000100` (boot CPU = A53 `0x100`); MIDR `0x410FD034` (Cortex-A53 r0p4); SCTLR_EL1 `0x30C5183E`
+  (MMU off, **alignment checking on**: keep `-mstrict-align`); PFR0 `0x2222` (GIC sysreg field 0: GICv2 only);
+  MMFR0 `0x1122` (40-bit PA, 16-bit ASID); CNTFRQ `0x18CBA80`; DTB `0x8A000000` (magic OK, 0x2B082 bytes);
+  initrd `0x89000000`; GICD_CTLR 0, GICD_TYPER `0xFCEF` (512 IRQ lines, 8 CPUs, security extensions),
+  GICD_IIDR `0x0200143B` / GICC_IIDR `0x0202143B` (GIC-400), GICC_CTLR 1; DECON GLOBAL_CONTROL `0x133` (enabled,
+  running, idle, I80/command mode), HW_SW_TRIG_CONTROL `0x1290` (**MASK_DECON set**: why the splash stayed;
+  TRIG_AUTO_MASK_EN set; bit 9 set, undocumented), SHADOW 0, DPP0 IDMA_IN_BASE_ADDR_Y `0xEC000000` (buffer 0; the
+  copy into the second buffer in `fb_mirror()` is not needed for this S-Boot). PSCI_VERSION was not called (probe build).
 - **Verified:** `mkadt.py` sweet output is byte-identical to `45263be` (seed `\0`*64, highmem off and on);
   `--device jackpotlte` builds (10200 bytes). Open question: every jackpotlte CPU node has `cluster-id` 0, although
   the A53s sit in two clusters (`0x1xx`, `0x2xx`) and the A73s in a third.
@@ -77,7 +89,7 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   the repo; there is no way to build XNU in a Linux sandbox. iOS root image: README step 2 (iPhone10,3 IPSW 16.7.16 20H392).
 
 ## Next steps, in order
-1. Get the diagnostic result (photo). If black: build the DECON trigger / TE-paced present path. Reference: S9
+1. **DONE 2026-11-01** (see Update above; XNU's present path must do the same re-arm per frame). Original note: if black, build the DECON trigger / TE-paced present path. Reference: S9
    port patch 0095 and the 4.4 Samsung DECON driver (`decon_f`, `psr_mode=2`, `trig_mode=0`, TE pinctrl `0x139B0A38`).
    S-Boot leaves DSIM running ("PLL is stabled in bootloader") and the framebuffer holds two 1080×2220 32 bpp buffers.
 2. GICv2 in the shim: port `shim/shim.c`'s GICv3 timer IRQ self-test to GICD `0x12301000` / GICC `0x12302000`,
