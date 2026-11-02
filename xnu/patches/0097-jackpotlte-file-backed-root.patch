@@ -1,0 +1,274 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7fd8083..ce3fd91 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -29,6 +29,7 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/kalloc.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -459,8 +460,230 @@ ufs_sync_cache(void)
+ {
+ 	return 0;
+ }
++
++/*
++ * File-backed root (boot-arg sweetrootino=N): the iOS root is a plain file in
++ * Android's ext4 USERDATA (/data/sweet/root.img, created from TWRP outside the
++ * FBE-encrypted directories, so its blocks are plaintext on disk). Its extent
++ * tree is read once at init; the root device is then the file's bytes, holes
++ * and unwritten extents reading as zeros. Nothing outside the file is mapped.
++ * tools/ext4map.py does the same walk over adb.
++ */
++#define EXT4_MAX_EXTENTS        8192
++#define EXT4_MAX_DEPTH          5
++
++struct ext4_run {
++	uint32_t fblk;                          /* file block */
++	uint32_t len;                           /* blocks */
++	uint64_t pblk;                          /* partition block, ~0 for unwritten */
++};
++
++static struct {
++	struct ext4_run *run;
++	uint32_t nrun;
++	uint32_t bsz;                           /* ext4 block size */
++	uint64_t size;                          /* file bytes */
++} xf;
++
++static uint8_t xf_node[EXT4_MAX_DEPTH][4096];
++
++/* len bytes at byte offset off of the partition (len <= BOUNCE_SIZE - 512). */
++static int
++part_read(uint64_t off, void *dst, uint32_t len)
++{
++	uint64_t lba = off / UFS_BLOCK;
++	uint32_t skip = (uint32_t)(off % UFS_BLOCK);
++	int error = ufs_read_blocks(su.first_block + lba, (skip + len + UFS_BLOCK - 1) / UFS_BLOCK);
++	if (!error) {
++		memcpy(dst, (const char *)(su.dma + DMA_BOUNCE) + skip, len);
++	}
++	return error;
++}
++
++static int
++ext4_walk(const uint8_t *node, uint32_t level)
++{
++	uint16_t magic, n, depth;
++
++	memcpy(&magic, node, 2);
++	memcpy(&n, node + 2, 2);
++	memcpy(&depth, node + 6, 2);
++	if (magic != 0xF30A || level >= EXT4_MAX_DEPTH || n > (xf.bsz - 12) / 12) {
++		printf("SWEET ROOT: bad extent node (magic 0x%x, %u entries, depth %u)\n", magic, n, depth);
++		return EINVAL;
++	}
++	for (uint16_t i = 0; i < n; i++) {
++		const uint8_t *e = node + 12 + 12 * i;
++		uint32_t lblk, lo;
++		uint16_t len, hi;
++		int error;
++
++		memcpy(&lblk, e, 4);
++		if (depth) {
++			memcpy(&lo, e + 4, 4);
++			memcpy(&hi, e + 8, 2);
++			error = part_read((((uint64_t)hi << 32) | lo) * xf.bsz, xf_node[level + 1], xf.bsz);
++			if (!error) {
++				error = ext4_walk(xf_node[level + 1], level + 1);
++			}
++			if (error) {
++				return error;
++			}
++			continue;
++		}
++		memcpy(&len, e + 4, 2);
++		memcpy(&hi, e + 6, 2);
++		memcpy(&lo, e + 8, 4);
++		if (xf.nrun == EXT4_MAX_EXTENTS) {
++			printf("SWEET ROOT: more than %u extents\n", EXT4_MAX_EXTENTS);
++			return E2BIG;
++		}
++		struct ext4_run *r = &xf.run[xf.nrun];
++		r->fblk = lblk;
++		r->len = len > 32768 ? len - 32768u : len;
++		r->pblk = len > 32768 ? UINT64_MAX : (((uint64_t)hi << 32) | lo);
++		if (xf.nrun && r->fblk < xf.run[xf.nrun - 1].fblk + xf.run[xf.nrun - 1].len) {
++			printf("SWEET ROOT: extents out of order at file block %u\n", r->fblk);
++			return EINVAL;
++		}
++		if (r->pblk != UINT64_MAX && (r->pblk + r->len) * (xf.bsz / UFS_BLOCK) > su.nblocks) {
++			printf("SWEET ROOT: extent at block 0x%llx is outside the partition\n", r->pblk);
++			return EINVAL;
++		}
++		xf.nrun++;
++	}
++	return 0;
++}
++
++static int
++ext4_map_file(uint32_t ino)
++{
++	uint8_t sb[256], gd[64], inode[160];
++	uint32_t log_bsz, ipg, first, incompat, flags, size_lo, size_hi;
++	uint16_t magic, isz, dsz = 32, mode;
++	int error;
++
++	if ((error = part_read(1024, sb, sizeof(sb)))) {
++		return error;
++	}
++	memcpy(&magic, sb + 0x38, 2);
++	memcpy(&log_bsz, sb + 0x18, 4);
++	memcpy(&ipg, sb + 0x28, 4);
++	memcpy(&isz, sb + 0x58, 2);
++	memcpy(&incompat, sb + 0x60, 4);
++	memcpy(&first, sb + 0x14, 4);
++	if (incompat & 0x80) {
++		memcpy(&dsz, sb + 0xFE, 2);
++	}
++	if (magic != 0xEF53 || log_bsz > 2 || ipg == 0 || isz < 160 || dsz < 32 || dsz > sizeof(gd) ||
++	    ino == 0) {
++		printf("SWEET ROOT: not a usable ext4 (magic 0x%x)\n", magic);
++		return EINVAL;
++	}
++	xf.bsz = 1024u << log_bsz;
++
++	uint32_t g = (ino - 1) / ipg, idx = (ino - 1) % ipg;
++	if ((error = part_read((uint64_t)(first + 1) * xf.bsz + (uint64_t)g * dsz, gd, dsz))) {
++		return error;
++	}
++	uint32_t it_lo, it_hi = 0;
++	memcpy(&it_lo, gd + 8, 4);
++	if (dsz >= 64) {
++		memcpy(&it_hi, gd + 0x28, 4);
++	}
++	uint64_t itab = ((uint64_t)it_hi << 32) | it_lo;
++	if ((error = part_read(itab * xf.bsz + (uint64_t)idx * isz, inode, sizeof(inode)))) {
++		return error;
++	}
++	memcpy(&mode, inode, 2);
++	memcpy(&size_lo, inode + 4, 4);
++	memcpy(&flags, inode + 0x20, 4);
++	memcpy(&size_hi, inode + 0x6C, 4);
++	xf.size = ((uint64_t)size_hi << 32) | size_lo;
++	/* regular file, extent-mapped, not encrypted, no inline data */
++	if ((mode & 0xF000) != 0x8000 || !(flags & 0x80000) || (flags & (0x800 | 0x10000000))) {
++		printf("SWEET ROOT: inode %u unusable (mode 0%o flags 0x%x)\n", ino, mode, flags);
++		return EINVAL;
++	}
++	xf.run = kalloc_data(EXT4_MAX_EXTENTS * sizeof(*xf.run), Z_WAITOK | Z_ZERO);
++	if (!xf.run) {
++		return ENOMEM;
++	}
++	memcpy(xf_node[0], inode + 0x28, 60);
++	error = ext4_walk(xf_node[0], 0);
++	if (error) {
++		xf.nrun = 0;
++	}
++	return error;
++}
++
++/* count 512-byte sectors of the file at sector lba into the bounce buffer. */
++static int
++file_read_blocks(uint64_t lba, uint32_t count)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t spb = xf.bsz / UFS_BLOCK;
++
++	if (count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	while (count) {
++		uint64_t fblk = lba / spb;
++		uint32_t lo = 0, hi = xf.nrun, n;
++		uint64_t pba = UINT64_MAX;
++
++		/* last run with fblk >= run.fblk */
++		while (lo < hi) {
++			uint32_t mid = (lo + hi) / 2;
++			if (xf.run[mid].fblk <= fblk) {
++				lo = mid + 1;
++			} else {
++				hi = mid;
++			}
++		}
++		const struct ext4_run *r = lo ? &xf.run[lo - 1] : NULL;
++		if (r && fblk < (uint64_t)r->fblk + r->len) {
++			uint64_t end = ((uint64_t)r->fblk + r->len) * spb;
++			n = (uint32_t)MIN(count, end - lba);
++			if (r->pblk != UINT64_MAX) {
++				pba = (r->pblk + (fblk - r->fblk)) * spb + lba % spb;
++			}
++		} else {
++			/* hole up to the next run */
++			uint64_t end = lo < xf.nrun ? (uint64_t)xf.run[lo].fblk * spb : UINT64_MAX;
++			n = (uint32_t)MIN(count, end - lba);
++		}
++		if (pba == UINT64_MAX) {
++			bzero(b, n * UFS_BLOCK);
++		} else {
++			for (uint32_t i = 0; i < n; i++) {
++				int error = mmc_read_sector(su.first_block + pba + i,
++				    (uint32_t *)(void *)(b + i * UFS_BLOCK));
++				if (error) {
++					return error;
++				}
++			}
++		}
++		b += n * UFS_BLOCK;
++		lba += n;
++		count -= n;
++	}
++	return 0;
++}
+ #endif /* SWEET_JACKPOTLTE */
+ 
++/* count blocks at block lba of the root device into the bounce buffer. */
++static int
++root_read_blocks(uint64_t lba, uint32_t count)
++{
++#if defined(SWEET_JACKPOTLTE)
++	if (xf.nrun) {
++		return file_read_blocks(lba, count);
++	}
++#endif
++	return ufs_read_blocks(su.first_block + lba, count);
++}
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+@@ -624,7 +847,7 @@ sweet_ufs_strategy(buf_t bp)
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
++			error = root_read_blocks(lba, blocks);
+ 			if (!error) {
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
+ 			}
+@@ -825,6 +1048,21 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++#if defined(SWEET_JACKPOTLTE)
++	uint32_t rootino = 0;
++	if (!error && PE_parse_boot_argn("sweetrootino", &rootino, sizeof(rootino)) && rootino) {
++		error = ext4_map_file(rootino);
++		if (!error) {
++			uint64_t mapped = 0;
++			for (uint32_t i = 0; i < xf.nrun; i++) {
++				mapped += xf.run[i].len;
++			}
++			printf("SWEET ROOT: \"%s\" inode %u: %llu MiB, %u extents, %llu MiB mapped\n",
++			    want, rootino, xf.size >> 20, xf.nrun, (mapped * xf.bsz) >> 20);
++			su.nblocks = xf.size / UFS_BLOCK;
++		}
++	}
++#endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
