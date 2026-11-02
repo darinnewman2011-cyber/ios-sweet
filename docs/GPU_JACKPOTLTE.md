@@ -1,6 +1,6 @@
 # GPU on the Galaxy A8 (2018): plan
 
-Status 2026-11-02: **steps 2 and 3 done on the phone** (step 2: (patch 0101, `sweetgpu=2`, boot image `a8-ios9b`, SHA-256
+Status 2026-11-02: **steps 2 and 3 done on the phone** (step 2: patch 0101, `sweetgpu=2`, boot image `a8-ios9b`, SHA-256
 `94a30287…eea1`). iOS itself still draws everything on the CPU (CoreAnimation in software, frames copied into the
 S-Boot framebuffer), like sweet.
 
