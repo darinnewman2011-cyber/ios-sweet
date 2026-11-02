@@ -257,6 +257,9 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 ## Rules (from AGENTS.md, plus device-specific)
 - Never write `mmcblk0boot0/1` (S-Boot lives there) or `EFS`, `CPEFS`, `m9kefs*`, `PERSISTENT`, `PARAM`, `RADIO`, `CM`, `NA`.
   Only `BOOT` (and later `USERDATA`) are ever flashed. Confirm each destructive step with the user.
+  **Exception (user, 2026-11-01):** new test images may be flashed to `BOOT` without asking each time. Keep the
+  checks (hash on /sdcard, BOOT = `mmcblk0p12`, backup hash, readback). Anything else (USERDATA etc.) still needs
+  the user's OK.
 - Keep dumps, serial numbers and IMEI-bearing partitions out of git. The live FDT and `bootargs` contain the
   serial; use the redacted copy under `research/a8/`. The user's partition backups stay on their PC.
 - Recovery path for a bad BOOT: force off (Power + Volume Down ~8 s), TWRP (Power + Bixby + Volume Up),
