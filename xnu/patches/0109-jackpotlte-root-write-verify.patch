@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e3a7e88..966a6cb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -366,10 +366,12 @@ static uint64_t mmc_wr_lo, mmc_wr_hi;           /* writable sectors [lo, hi): US
+  * Write statistics, printed every 30 s by wst_thread() so the first failure
+  * stays inside the last 16 KB that ramoops keeps. where: 1 outside USERDATA,
+  * 2 CMD24, 3 data error, 4 data timeout, 5 busy, 6 card status, 7 not back in
+- * TRAN, 8 no extent, 9 beyond the file, 10 strategy bounds. a/b: rintsts, r1.
++ * TRAN, 8 no extent, 9 beyond the file, 10 strategy bounds, 11 verify kept
++ * failing. a/b: rintsts, r1.
+  */
+ static struct {
+ 	uint64_t ok, fail, lba;
++	uint64_t wbad, rbad, zero, bad_lba;     /* write verification, see file_write_verified() */
+ 	uint32_t where, a, b;
+ 	int err;
+ } wst;
+@@ -828,6 +830,69 @@ file_fully_written(void)
+ 	return true;
+ }
+ 
++/*
++ * Write one sector and read it back. ios14 (0107) left a few sectors zeroed
++ * (the volume header among them) without any error, so every write is
++ * checked: a mismatch is read once more (equal now: a read glitch, counted
++ * in wst.rbad) or written again (wst.wbad), up to WRITE_TRIES writes.
++ * wst.zero counts mismatching readbacks that were all zeros.
++ */
++#define WRITE_TRIES     3
++
++static uint32_t wverify[UFS_BLOCK / 4] __attribute__((aligned(64)));
++
++static bool
++sector_equal(const uint32_t *a, const uint32_t *b)
++{
++	return memcmp(a, b, UFS_BLOCK) == 0;
++}
++
++static bool
++sector_zero(const uint32_t *a)
++{
++	for (uint32_t i = 0; i < UFS_BLOCK / 4; i++) {
++		if (a[i]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static int
++file_write_verified(uint64_t dev, const uint32_t *src)
++{
++	for (int t = 0; t < WRITE_TRIES; t++) {
++		int error = mmc_write_sector(dev, src);
++		if (error) {
++			return error;
++		}
++		error = mmc_read_sector(dev, wverify);
++		if (error) {
++			return error;
++		}
++		if (sector_equal(wverify, src)) {
++			return 0;
++		}
++		if (sector_zero(wverify)) {
++			wst.zero++;
++		}
++		if (!wst.bad_lba) {
++			wst.bad_lba = dev;
++		}
++		error = mmc_read_sector(dev, wverify);
++		if (error) {
++			return error;
++		}
++		if (sector_equal(wverify, src)) {
++			wst.rbad++;
++			return 0;
++		}
++		wst.wbad++;
++	}
++	printf("SWEET MMC: 0x%llx still wrong after %d writes\n", dev, WRITE_TRIES);
++	return wst_fail(EIO, 11, dev, 0, 0);
++}
++
+ /* count 512-byte sectors from the bounce buffer to file sector lba. */
+ static int
+ file_write_blocks(uint64_t lba, uint32_t count)
+@@ -845,7 +910,7 @@ file_write_blocks(uint64_t lba, uint32_t count)
+ 			return wst_fail(EIO, 8, lba, count, n);
+ 		}
+ 		for (uint32_t i = 0; i < n; i++) {
+-			int error = mmc_write_sector(su.first_block + pba + i,
++			int error = file_write_verified(su.first_block + pba + i,
+ 			    (const uint32_t *)(const void *)(b + i * UFS_BLOCK));
+ 			if (error) {
+ 				return error;
+@@ -869,8 +934,10 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 		clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
+ 		(void)assert_wait_deadline(&wst_chan, THREAD_UNINT, deadline);
+ 		thread_block(THREAD_CONTINUE_NULL);
+-		printf("SWEET ROOT: %llu sectors written, %llu failed; first failure err %d where %u at 0x%llx (%#x %#x)\n",
+-		    wst.ok, wst.fail, wst.err, wst.where, wst.lba, wst.a, wst.b);
++		printf("SWEET ROOT: %llu sectors written, %llu failed; first failure err %d where %u at 0x%llx (%#x %#x); "
++		    "verify: %llu rewrites, %llu read glitches, %llu zero readbacks, first at 0x%llx\n",
++		    wst.ok, wst.fail, wst.err, wst.where, wst.lba, wst.a, wst.b,
++		    wst.wbad, wst.rbad, wst.zero, wst.bad_lba);
+ 	}
+ }
+ 
