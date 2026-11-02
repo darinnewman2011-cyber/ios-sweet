@@ -17,19 +17,29 @@ _head:
 	.ascii	"ARM\x64"		/* magic */
 	.long	0			/* res5 */
 
+/*
+ * adrp + :lo12: (+-4 GB): with an XNU payload linked into .rodata, .bss and
+ * the stacks are ~17 MB away, out of adr's +-1 MB range. Needs a 4 KiB
+ * aligned load address, which the Image header (text_offset) guarantees.
+ */
+.macro adrl reg, sym
+	adrp	\reg, \sym
+	add	\reg, \reg, :lo12:\sym
+.endm
+
 	.text
 	.globl _start
 _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* FDT pointer from S-Boot */
 	msr	spsel, #1
-	adr	x1, _stack_top
+	adrl	x1, _stack_top
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
-	adr	x1, _bss_start		/* zero .bss */
-	adr	x2, _bss_end
+	adrl	x1, _bss_start		/* zero .bss */
+	adrl	x2, _bss_end
 1:	cmp	x1, x2
 	b.hs	2f
 	str	xzr, [x1], #8
@@ -52,7 +62,7 @@ secondary_entry:
 	ubfx	x1, x0, #8, #8
 	and	x0, x0, #0xff
 	add	x0, x0, x1, lsl #2
-	adr	x1, _sec_stacks
+	adrl	x1, _sec_stacks
 	add	x1, x1, x0, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1

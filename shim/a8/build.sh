@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the A8 diagnostic shim (clang + lld, no GNU cross toolchain needed).
 set -euo pipefail
+[ -z "${PAYLOAD:-}" ] || PAYLOAD="$(cd "$(dirname "$PAYLOAD")" && pwd)/$(basename "$PAYLOAD")"
 cd "$(dirname "$0")"
 CFLAGS="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fno-pic -fno-stack-protector \
  -mgeneral-regs-only -mstrict-align -Wall -Wextra \
@@ -9,6 +10,7 @@ CFLAGS="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fno
 # XNU loader: PAYLOAD=out/xnu.payload shim/a8/build.sh (tools/mkpayload.py output, linked into the Image;
 # S-Boot loads the stock 22 MB kernel the same way). Without PAYLOAD the diagnostics run.
 mkdir -p out
+rm -f out/payload.bin
 {
 	echo '	.section .rodata.payload, "a"'
 	echo '	.balign 16'
@@ -16,7 +18,8 @@ mkdir -p out
 	echo 'a8_payload:'
 	if [ -n "${PAYLOAD:-}" ]; then
 		head -c 8 "$PAYLOAD" | grep -q SWEETXNU || { echo "error: $PAYLOAD is not a SWEETXNU payload" >&2; exit 1; }
-		echo "	.incbin \"$(cd "$(dirname "$PAYLOAD")" && pwd)/$(basename "$PAYLOAD")\""
+		cp "$PAYLOAD" out/payload.bin	# relative path: Windows clang can't open /c/... paths
+		echo '	.incbin "out/payload.bin"'
 	fi
 	echo 'a8_payload_end:'
 	echo '	.balign 8'
