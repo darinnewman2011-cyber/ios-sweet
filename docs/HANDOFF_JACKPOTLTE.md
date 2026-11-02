@@ -461,6 +461,30 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     TRANSTAB = L0 PA | READ_INNER | ADRMODE_TABLE, MEMATTR 0x88/0x8D/0x88. A chain of two WRITE_VALUE jobs (Zero, then
     Immediate 32 `0x5157ee70`; layout from Mesa genxml `v6.xml`) runs on job slot 1, polled (no IRQ). Expected:
     `SWEET GPU: the GPU wrote RAM through its MMU (step 3 done)`.
+  - **New root file on the phone:** `/data/sweet/root.img` inode **1044497**, 13 GiB, 121 extents, contiguous from block
+    0, none unwritten (`tools/ext4map.py`), SHA-256 after push `6afd5ba1…8d16`.
+  - **Observed (ios10, 0103, `sweetrootrw=1`): panic at ~52 s,** `tzinit[18] exited … exit status 22`. Every file create
+    in userland returned EINVAL (HFS journal invalid after a failed write); root.img's hash was unchanged, so no write
+    landed. ios12 (0105, status every 10 s) panicked the same way; the 16 KB window held only ~2 s of launchd output.
+  - **0105** (commit 8ee468a) records the first write failure (step, errno, sector, rintsts/r1); **0106** (f729292) fills
+    the FIFO before CMD24 and ignores HTO on writes; status line every second.
+  - **Observed (ios13, 0106):** `0 sectors written, 5 failed; first failure err 5 where 3 at 0x2e50878 (0x94 0x80)` =
+    RINTSTS DCRC after all 128 words: the card rejected the data CRC.
+  - **Cause and fix, 0107** (commit c78fe90, CI 41533351451): the driver read CLKSEL at `0xa4`, which is BUFADDRU with
+    64-bit IDMAC registers. Samsung's `dw_mmc-exynos.h` (Exynos7885-Dev lineage-18.1, read only) puts CLKSEL at
+    BUFADDRU + 4 = **`0xa8`**, and its driver sets `CMD_USE_HOLD_REG` on every command when the drive phase is non-zero
+    (live FDT DDR timing `<3 0 4 2>`: divider 3, fine drive 0, drive 4, sample 2). Reads tolerate the missing hold
+    register; writes do not. Init now logs CLKSEL and UHS_REG. (The shim's milestone-3 "CLKSEL 0" came from the same
+    wrong offset.)
+  - **Observed (ios14, 0107, `a8-ios14` SHA-256 `f592189d…9f4d`, 900 s run): root writes work.** 1,163,980 sectors
+    (~570 MB) written, 0 failed, no panic; Apple logo at ~470 s; `com.apple.datamigrator` ran; backboardd looks for
+    `IOAcceleratorES` (found the stub) and `IOAcceleratorESLegacy` (none). SpringBoard's main thread still waits in
+    `_LSContextInitCommon` ← `LSApplicationRecord` ← `CCSModuleRepository`, a second thread in
+    `__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__` (symbolicated `_tmp/wsl/smp14.sym.txt`). bluetoothd and
+    fairplayd.H2 still crash-loop (~every 10 s). The reseed now persists between boots (guess: it needs one long run).
+  - **0108** (commit 51dae2a, CI 41536600658): status every 30 s. **`a8-ios15`** (`c294fa66…bc16`): verbose console,
+    `sweetreboot=0` (runs until stopped), in-place root writes. Flashed 2026-11-02 16:33 for a long watched run.
+  - Next for speed: multi-block writes/reads (CMD25/CMD18) or IDMAC; every sector is one PIO command today (~1 MB/s).
   - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
     volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
     read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in
