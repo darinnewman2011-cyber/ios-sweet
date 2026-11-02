@@ -1,0 +1,39 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..a2a4dab 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2536,6 +2536,16 @@ pmap_virtual_region(
+ 		low_global_vr_mask = 0xFFFFFFFFFF800000;
+ 		low_global_vr_size = 0x800000;
+ 	}
++#if defined(SWEET)
++	/*
++	 * arm_vm_init.c maps the early-console framebuffer (and DECON) alias in
++	 * L2 blocks from LOW_GLOBAL_BASE_ADDRESS + 2 MB (up to + 14 MB on the A8):
++	 * keep the VM from allocating over it.
++	 */
++	if (low_global_vr_size < 0x1000000) {
++		low_global_vr_size = 0x1000000;
++	}
++#endif
+ 
+ 	if (((gVirtBase & low_global_vr_mask) != LOW_GLOBAL_BASE_ADDRESS) && (region_select == 2)) {
+ 		*startp = LOW_GLOBAL_BASE_ADDRESS;
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..bb5b05b 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -811,7 +811,12 @@ vm_compressor_set_size(void)
+ 	compressor_pool_max_size = C_SEG_MAX_LIMIT;
+ 	compressor_pool_max_size *= c_seg_bufsize;
+ 
+-#if XNU_TARGET_OS_OSX
++/*
++ * SWEET_JACKPOTLTE: the iOS 4K kernel VA layout (0087) leaves ~45 GB above the
++ * physmap for all kmem claims; the macOS 16 x RAM compressor reservation
++ * (32 GB for 2 GB) plus the 24 GB zone map does not fit. Use iOS sizing.
++ */
++#if XNU_TARGET_OS_OSX && !defined(SWEET_JACKPOTLTE)
+ 
+ 	if (vm_compression_limit == 0) {
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
