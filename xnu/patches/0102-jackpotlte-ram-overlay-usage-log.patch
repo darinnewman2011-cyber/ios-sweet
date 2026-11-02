@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 8b8f03e..08e52c4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -700,7 +700,7 @@ static struct {
+ 	uint8_t **page;
+ 	uint32_t mask;          /* table size - 1 */
+ 	uint32_t n, max;        /* pages in use, cap */
+-	bool full_logged;
++	uint32_t full_count;     /* writes refused while full */
+ } ovl;
+ 
+ static bool
+@@ -754,9 +754,8 @@ ovl_write(uint64_t off, const char *src, uint32_t len)
+ 		uint32_t i = ovl_slot(pg);
+ 		if (!ovl.key[i]) {
+ 			if (ovl.n >= ovl.max) {
+-				if (!ovl.full_logged) {
+-					printf("SWEET RAMRW: overlay full (%u pages), failing writes\n", ovl.n);
+-					ovl.full_logged = true;
++				if ((ovl.full_count++ % 500u) == 0) {
++					printf("SWEET RAMRW: overlay full (%u MiB), %u writes failed\n", ovl.n >> 8, ovl.full_count);
+ 				}
+ 				return ENOSPC;
+ 			}
+@@ -778,6 +777,9 @@ ovl_write(uint64_t off, const char *src, uint32_t len)
+ 			ovl.key[i] = pg + 1;
+ 			ovl.page[i] = p;
+ 			ovl.n++;
++			if (ovl.n % (50u << 8) == 0) {        /* every 50 MiB */
++				printf("SWEET RAMRW: %u MiB of %u MiB in the overlay\n", ovl.n >> 8, ovl.max >> 8);
++			}
+ 		}
+ 		memcpy(ovl.page[i] + skip, src, n);
+ 		off += n;
