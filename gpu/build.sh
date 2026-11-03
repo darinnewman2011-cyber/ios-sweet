@@ -29,7 +29,8 @@ fi
 
 # The test of the kernel's interface needs nothing else: first, so it is there even if Mesa fails.
 "$CLANG" $TARGET -O1 -framework IOKit -o out/mali_test src/mali_test.c
-codesign -s - -f out/mali_test
+"$CLANG" $TARGET -O1 -o out/sweet-run src/sweet_run.c          # the test runner (launchd job com.sweet.run)
+codesign -s - -f out/mali_test out/sweet-run
 echo "build.sh: out/mali_test ($(wc -c < out/mali_test) bytes)"
 
 cd "$B"
