@@ -1,0 +1,185 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 71b17a6..f00eb15 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,18 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * The A8's panel is a DSI command-mode panel: DECON sends it a frame only when its TE trigger
++ * is re-armed (osfmk/arm64/sweet_early.c), and masks the trigger again after that frame. Until
++ * 0120 only the kernel's heartbeat lines re-armed it, every few seconds, so what CoreAnimation
++ * drew reached the glass that seldom; now every frame shown here re-arms it.
++ */
++extern "C" void sweet_early_kick(void);
++#define sweet_fb_kick()         sweet_early_kick()
++#else
++#define sweet_fb_kick()         do { } while (0)
++#endif
+ /*
+  * boot-arg sweetfb_noconsole=N: stop drawing console text over the GUI from
+  * swap N on (1 = the first swap). On the A8 the boot logo comes long before
+@@ -243,6 +255,16 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/* for libredwood-gl (G8): it scales CoreAnimation's picture into the panel's surface with the GPU */
++	setProperty("SweetPanelSurface", fSurface->id, 32);
++	if (fFit) {
++		setProperty("SweetFitX", fFitX, 32);
++		setProperty("SweetFitY", fFitY, 32);
++		setProperty("SweetFitWidth", fFitW, 32);
++		setProperty("SweetFitHeight", fFitH, 32);
++		setProperty("SweetLogicalWidth", fLogicalW, 32);
++		setProperty("SweetLogicalHeight", fLogicalH, 32);
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -285,6 +307,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			sweet_fb_kick();
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -302,6 +325,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		sweet_fb_kick();
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -335,6 +359,7 @@ get32(const uint8_t *p, uint32_t off)
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
++static uint64_t sweet_fb_gpu_shown __attribute__((unused));    /* frames the GPU put on the panel itself */
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -390,6 +415,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++#if defined(SWEET_JACKPOTLTE)
++		if (fFit && mask == (1u << layer) && sweet_mali_surface_shown(s)) {
++			/* (libredwood-gl had the GPU scale this picture into the panel: G8) */
++			if (sweet_fb_gpu_shown++ == 0) {
++				IOLog("SWEET FB: surface %u is on the panel by the GPU: no CPU copy\n", id);
++			}
++			s->release();
++			continue;
++		}
++#endif
+ 		uintptr_t src = s->kernelAddress();
+ #if defined(SWEET_JACKPOTLTE)
+ 		sweet_mali_surface_for_cpu(s, src);    /* drawn by the GPU: done, and out of the CPU's cache */
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index 217f6f5..22aa28d 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -11,7 +11,8 @@
+  *
+  *   panfrost   SUBMIT, WAIT_BO, CREATE_BO, MMAP_BO, GET_PARAM, GET_BO_OFFSET, MADVISE, SET_LABEL_BO
+  *   drm        GEM_CLOSE, SYNCOBJ_CREATE / DESTROY / WAIT / RESET / SIGNAL
+- *   ours       0x7b / 0x7c a syncobj's fence set / read, 0x7d counters, 0x7e an IOSurface as a buffer
++ *   ours       0x7b / 0x7c a syncobj's fence set / read, 0x7d counters, 0x7e an IOSurface as a buffer,
++ *              0x7a "this surface's picture is on the panel already" (the framebuffer then copies nothing)
+  *              (0x7f show is not here: the framebuffer shows surfaces)
+  *
+  * A buffer's memory is the client memory of the type that is its handle (what Linux does with mmap()
+@@ -82,6 +83,7 @@ enum {
+ 	kRedwoodSyncobjGet      = 0x7c,
+ 	kRedwoodMaliCounts      = 0x7d,
+ 	kRedwoodSurface         = 0x7e,
++	kSweetShown             = 0x7a,
+ };
+ 
+ struct drm_panfrost_submit {
+@@ -154,6 +156,10 @@ struct redwood_surface {
+ 	uint32_t planeOffset[2], planeRowBytes[2];
+ };
+ #define kRedwoodDescribe        0xffffffffu
++/* 0x7a: the GPU has put what it last drew into this IOSurface on the panel as well (libredwood-gl, G8) */
++struct sweet_shown {
++	uint32_t surface, pad;
++};
+ 
+ #define PANFROST_BO_NOEXEC              1
+ #define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL 1
+@@ -582,6 +588,20 @@ RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	return b != NULL ? kIOReturnSuccess : kIOReturnNoMemory;
+ }
+ 
++bool
++sweet_mali_surface_shown(SweetSurface * s)
++{
++	uint64_t fence = s->gpuFence;
++
++	if (fence == 0 || s->gpuShown != fence) {
++		return false;
++	}
++	if (!sweet_mali_wait(fence, MALI_SURFACE_WAIT_MS)) {
++		IOLog("SWEET MALI: IOSurface %u: the panel copy (job %llu) not done after %u ms\n", s->id, fence, MALI_SURFACE_WAIT_MS);
++	}
++	return true;
++}
++
+ void
+ sweet_mali_surface_for_cpu(SweetSurface * s, uintptr_t kaddr)
+ {
+@@ -815,6 +835,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		struct redwood_syncobj_fence syncFence;
+ 		struct redwood_mali_counts counts;
+ 		struct redwood_surface surface;
++		struct sweet_shown shown;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct mali_buffer * b;
+@@ -932,6 +953,17 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 	case kRedwoodSurface:
+ 		ret = surfaceBuffer(&r.surface);
+ 		break;
++	case kSweetShown: {
++		SweetSurface * shown = sweet_surface_copy(r.shown.surface);
++
++		if (shown == NULL) {
++			ret = kIOReturnNotFound;
++		} else {
++			shown->gpuShown = shown->gpuFence;
++			shown->release();
++		}
++		break;
++	}
+ 	default:
+ 		IOLog("SWEET MALI: request %#x (%zu bytes) is not known here\n", selector, size);
+ 		ret = kIOReturnUnsupported;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 2145800..55335b0 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -43,6 +43,7 @@ public:
+ 	/* The A8's GPU (SweetMali.cpp): its last job that names this surface, and the last one whose drawing the CPU was let see */
+ 	volatile uint64_t         gpuFence;
+ 	uint64_t                  gpuSeen;
++	volatile uint64_t         gpuShown;     /* the job of gpuFence's whose picture the GPU also put on the panel (0x7a) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -79,6 +80,11 @@ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+  * (SweetMali.cpp). Nothing to do for a surface the GPU never touched.
+  */
+ void sweet_mali_surface_for_cpu(SweetSurface *surface, uintptr_t kaddr);
++/*
++ * true: the GPU has put the surface's latest picture on the panel itself (and is done
++ * with it): the framebuffer has nothing to copy (SweetMali.cpp, request 0x7a).
++ */
++bool sweet_mali_surface_shown(SweetSurface *surface);
+ #endif
+ 
+ #endif /* SWEET */
