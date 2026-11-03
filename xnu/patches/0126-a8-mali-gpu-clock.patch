@@ -1,0 +1,110 @@
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -99,6 +99,7 @@
+ #define G_IMM           0x5157ee70u
+ 
+ static vm_offset_t g_pmu, g_cmu, g_gpu;
++static uint32_t g_mhz = 343;      /* the G3D PLL as S-Boot leaves it; g_clock() below may change it */
+ static int g_sleep_chan;
+ 
+ static uint32_t
+@@ -994,8 +995,8 @@
+ 	if (pt_root == NULL) {
+ 		return;                 /* sweetgpu < 4 */
+ 	}
+-	printf("SWEET MALI: %s; %llu jobs, %llu faults, %llu resets; self test %s\n", mali_up ? "up" : "DOWN", stat_jobs,
+-	    stat_faults, stat_resets, selftest_result);
++	printf("SWEET MALI: %s at %u MHz; %llu jobs, %llu faults, %llu resets; self test %s\n", mali_up ? "up" : "DOWN",
++	    g_mhz, stat_jobs, stat_faults, stat_resets, selftest_result);
+ }
+ 
+ static void
+@@ -1109,6 +1110,78 @@
+ 	return false;
+ }
+ 
++/*
++ * GPU clock. S-Boot leaves PLL_G3D at 343 MHz (PLL_CON0 0xa1570d11: M 343, P 13, S 1 from the 26 MHz
++ * oscillator), the lowest step of the DVFS table, with vdd_g3d at its 0.8 V boot default. Boot-arg
++ * sweetgpumhz picks one of two settings out of Samsung's own pll_g3d_rate_table, without touching the
++ * voltage: 550 (M 127, P 3, S 1 = 550.3 MHz, the table's 545 MHz step) or 747 (M 115, P 4, S 0 =
++ * 747.5 MHz, between its 676 and 845 MHz steps). Anything else leaves the clock alone.
++ *
++ * The order is the one Samsung's clock layer uses: the PLL's output mux to the oscillator (bit 4, busy in
++ * bit 7), the PLL off (bit 31), the lock time (P x 150 cycles of the reference) into PLL_LOCKTIME, then
++ * the new dividers written with the PLL on and the mux back on it, and the lock bit (29) waited for. The
++ * GPU is idle here: this runs before its cores are powered. A PLL that does not lock gets its old
++ * dividers back.
++ */
++#define G3D_PLL_LOCKTIME        0x000u
++#define G3D_PLL_CON0            0x120u
++#define G3D_PLL_ENABLE          (1u << 31)
++#define G3D_PLL_STABLE          (1u << 29)
++#define G3D_PLL_MUX_BUSY        (1u << 7)
++#define G3D_PLL_MUX_SEL         (1u << 4)
++#define G3D_PLL_PMS_MASK        ((0x3ffu << 16) | (0x3fu << 8) | 0x7u)
++
++static bool
++g_wait_bit(uint32_t off, uint32_t bit, bool set)
++{
++	for (int i = 0; i < 1000; ++i) {
++		if (((g_rd(g_cmu, off) & bit) != 0) == set) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++g_clock(void)
++{
++	uint32_t want = 0, m, p, s;
++
++	(void)PE_parse_boot_argn("sweetgpumhz", &want, sizeof(want));
++	if (want == 550) {
++		m = 127; p = 3; s = 1;
++	} else if (want == 747) {
++		m = 115; p = 4; s = 0;
++	} else {
++		return;
++	}
++	uint32_t old = g_rd(g_cmu, G3D_PLL_CON0), oldlock = g_rd(g_cmu, G3D_PLL_LOCKTIME);
++	uint32_t con = old;
++
++	con &= ~G3D_PLL_MUX_SEL;
++	g_wr(g_cmu, G3D_PLL_CON0, con);
++	bool muxed = g_wait_bit(G3D_PLL_CON0, G3D_PLL_MUX_BUSY, false);
++	con &= ~G3D_PLL_ENABLE;
++	g_wr(g_cmu, G3D_PLL_CON0, con);
++	g_wr(g_cmu, G3D_PLL_LOCKTIME, p * 150);
++	con = (con & ~G3D_PLL_PMS_MASK) | (m << 16) | (p << 8) | s | G3D_PLL_MUX_SEL | G3D_PLL_ENABLE;
++	g_wr(g_cmu, G3D_PLL_CON0, con);
++	bool locked = g_wait_bit(G3D_PLL_CON0, G3D_PLL_STABLE, true);
++	if (!locked) {
++		/* the boot setting back, the same way */
++		g_wr(g_cmu, G3D_PLL_CON0, con & ~(G3D_PLL_MUX_SEL | G3D_PLL_ENABLE));
++		g_wr(g_cmu, G3D_PLL_LOCKTIME, oldlock);
++		g_wr(g_cmu, G3D_PLL_CON0, old);
++		(void)g_wait_bit(G3D_PLL_CON0, G3D_PLL_STABLE, true);
++	} else {
++		g_mhz = (26 * m) / (p << s);
++	}
++	printf("SWEET GPU: clock %u MHz asked: PLL_CON0 %#x -> %#x, %s%s; now %u MHz\n", want, old,
++	    g_rd(g_cmu, G3D_PLL_CON0), muxed ? "" : "mux busy, ", locked ? "locked" : "DID NOT LOCK, boot setting back",
++	    g_mhz);
++}
++
+ static void
+ g_thread(void *arg, wait_result_t result)
+ {
+@@ -1135,6 +1208,9 @@
+ 			return;
+ 		}
+ 	}
++	if (level >= 4) {
++		g_clock();
++	}
+ 	uint32_t id = g_rd(g_gpu, GPU_ID);
+ 	printf("SWEET GPU: GPU_ID %#x (product %#x r%up%u) L2 %#x core %#x tiler %#x mem %#x mmu %#x as %#x js %#x status %#x\n",
+ 	    id, id >> 16, (id >> 12) & 0xf, (id >> 4) & 0xff,
