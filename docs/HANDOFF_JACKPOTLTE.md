@@ -484,7 +484,25 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     fairplayd.H2 still crash-loop (~every 10 s). The reseed now persists between boots (guess: it needs one long run).
   - **0108** (commit 51dae2a, CI 41536600658): status every 30 s. **`a8-ios15`** (`c294fa66…bc16`): verbose console,
     `sweetreboot=0` (runs until stopped), in-place root writes. Flashed 2026-11-02 16:33 for a long watched run.
+  - **a8-ios15 result:** mount failed, "unknown Volume Signature : 0". Sector 2 (HFS volume header) and 6 more had
+    been zeroed by earlier writes with no error reported. Root image restored from `/opt/sweet/ios16-root.img`
+    (WSL) by per-64 MiB-chunk md5 compare (strip CRLF from adb output) and resending bad chunks. `tools/a8push.py`
+    once dropped a chunk silently: always check the final SHA-256.
+  - **0109** (commit 2391c31, CI 41539477993): read back every written sector, re-read on mismatch (read glitch vs
+    write fault), rewrite up to 3 times, then fail with where 11. **`a8-ios16`** (`d3a8434f…`): verify refused 4
+    sectors ("still wrong after 3 writes"); the read-back showed stale data (0xFF, old content, foreign bytes).
+  - **0110** (commit a38f5aa, CI 41545697431): fill the FIFO only after CMD24 is accepted (Linux order, not pre-fill),
+    and require STATUS FIFO empty after the FIFO reset (where 12 otherwise). **`a8-ios17`**
+    (`5181c357acc60a21a80a27584cb0f636c65eff2722ad8e5cb2d48e37316947af`), flashed 2026-11-02 ~17:40 CST.
+  - **MILESTONE 2026-11-02 (observed, user photos): a8-ios17 reached the iOS 16 lock screen** (red clock "4:35",
+    "Wednesday, December 31", camera button) after ~2030 s of uptime: 2.37M sectors written, 0 failed, 0 rewrites,
+    0 read glitches, 0 dirty FIFO, no panic. The LaunchServices reseed that blocked SpringBoard finished on its own
+    (guess: it was just slow PIO I/O, ~1 MB/s). bluetoothd and fairplayd.H2 still crash-loop; touch and keys deliver
+    HID events. The verbose console faded and the Apple logo came back right before the lock screen.
   - Next for speed: multi-block writes/reads (CMD25/CMD18) or IDMAC; every sector is one PIO command today (~1 MB/s).
+  - Live log plan (user chose 2026-11-02): DWC3 device mode at `0x13600000` + Exynos USB PHY init, presenting
+    CDC-ACM (Windows `usbser` COM port, no driver needed) instead of sweet's CDC-ECM. Not started beyond reading
+    sweet's `sweet_usb.c` (patches 0072–0077, 0081).
   - **Design note (from reading HakiOS docs, oosexgang/hakios-xnu-kernel, read only):** they keep the iOS system on one
     volume and `/private/var` on a separate small HFS+ data volume. For the A8: keep the system image sparse and
     read-only, and add a fully allocated data-volume file in `/data/sweet` (1-2 GB) so eMMC writes only ever land in
