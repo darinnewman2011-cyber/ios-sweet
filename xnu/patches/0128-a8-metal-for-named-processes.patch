@@ -1,0 +1,149 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -24,6 +24,7 @@
+ #include <libkern/c++/OSString.h>
+ #include <libkern/c++/OSSymbol.h>
+ #include <pexpert/pexpert.h>
++#include <string.h>
+ 
+ extern "C" void proc_selfname(char * buf, int size);
+ 
+@@ -32,16 +33,115 @@
+ 
+ static bool gSweetMetal;
+ 
++/*
++ * Boot-arg sweetmetalfor=NAME,NAME,...: the service is published WITH the two properties, and
++ * only the processes named see them (a name as the kernel keeps it, p_comm: at most 16
++ * characters, so "CollectionsPoster" is "CollectionsPoste"). Everyone else, backboardd above
++ * all, reads a service without them and keeps GL. Metal reads them once per process, through
++ * IORegistryEntryCreateCFProperty (copyProperty) or the whole table (serializeProperties),
++ * in the reading thread, so the caller's name is at hand. Independent of sweetmetal=1.
++ */
++static char gSweetMetalFor[256];
++static SInt32 gSweetMetalSaid;
++
++static bool
++sweet_metal_key(const char * key)
++{
++	return key != NULL && (strcmp(key, kSweetPluginNameKey) == 0 || strcmp(key, kSweetPluginClassKey) == 0);
++}
++
++/* is the calling process on the sweetmetalfor list (or is there no list)? */
++static bool
++sweet_metal_shown(const char * key)
++{
++	char who[32] = "?";
++	const char * p = gSweetMetalFor;
++	bool shown = false;
++
++	if (gSweetMetalFor[0] == '\0') {
++		return true;
++	}
++	proc_selfname(who, sizeof(who));
++	while (*p != '\0' && !shown) {
++		const char * end = strchr(p, ',');
++		size_t len = end != NULL ? (size_t)(end - p) : strlen(p);
++		size_t cmp = len > 16 ? 16 : len;
++
++		shown = cmp > 0 && strlen(who) == cmp && strncmp(who, p, cmp) == 0;
++		p += len;
++		if (*p == ',') {
++			p++;
++		}
++	}
++	/* the first reads of the plugin name say who got Metal; one read per process is the usual */
++	if (strcmp(key, kSweetPluginNameKey) == 0 && OSIncrementAtomic(&gSweetMetalSaid) < 64) {
++		IOLog("SWEET METAL: %s %s\n", shown ? "Metal device shown to" : "Metal device hidden from", who);
++	}
++	return shown;
++}
++
+ class IOAcceleratorES : public IOService
+ {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+ 
+ public:
++	using IOService::copyProperty;
+ 	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++	virtual OSObject * copyProperty(const char * aKey) const APPLE_KEXT_OVERRIDE;
++	virtual OSObject * copyProperty(const OSString * aKey) const APPLE_KEXT_OVERRIDE;
++	virtual OSObject * copyProperty(const OSSymbol * aKey) const APPLE_KEXT_OVERRIDE;
++	virtual bool serializeProperties(OSSerialize * s) const APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
++OSObject *
++IOAcceleratorES::copyProperty(const char * aKey) const
++{
++	if (sweet_metal_key(aKey) && !sweet_metal_shown(aKey)) {
++		return NULL;
++	}
++	return IOService::copyProperty(aKey);
++}
++
++OSObject *
++IOAcceleratorES::copyProperty(const OSString * aKey) const
++{
++	if (aKey != NULL && sweet_metal_key(aKey->getCStringNoCopy()) && !sweet_metal_shown(aKey->getCStringNoCopy())) {
++		return NULL;
++	}
++	return IOService::copyProperty(aKey);
++}
++
++OSObject *
++IOAcceleratorES::copyProperty(const OSSymbol * aKey) const
++{
++	if (aKey != NULL && sweet_metal_key(aKey->getCStringNoCopy()) && !sweet_metal_shown(aKey->getCStringNoCopy())) {
++		return NULL;
++	}
++	return IOService::copyProperty(aKey);
++}
++
++bool
++IOAcceleratorES::serializeProperties(OSSerialize * s) const
++{
++	OSDictionary * dict;
++	bool ok;
++
++	if (gSweetMetalFor[0] == '\0' || sweet_metal_shown(kSweetPluginNameKey)) {
++		return IOService::serializeProperties(s);
++	}
++	dict = dictionaryWithProperties();
++	if (dict == NULL) {
++		return false;
++	}
++	dict->removeObject(kSweetPluginNameKey);
++	dict->removeObject(kSweetPluginClassKey);
++	ok = dict->serialize(s);
++	dict->release();
++	return ok;
++}
++
+ IOReturn
+ IOAcceleratorES::setProperties(OSObject * properties)
+ {
+@@ -101,11 +201,21 @@
+ 	uint32_t metal = 0;
+ 
+ 	gSweetMetal = PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0;
++	if (!PE_parse_boot_argn("sweetmetalfor", gSweetMetalFor, sizeof(gSweetMetalFor))) {
++		gSweetMetalFor[0] = '\0';
++	}
+ 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
+ 		accelerator->setName("sgx");
++		if (gSweetMetalFor[0] != '\0') {
++			accelerator->setProperty(kSweetPluginNameKey, "RedwoodMetal");
++			accelerator->setProperty(kSweetPluginClassKey, "RedwoodMetalDevice");
++		}
+ 		accelerator->registerService();
+ 		IOLog("SWEET METAL: IOAcceleratorES \"sgx\" published%s\n",
+ 		    gSweetMetal ? "; sweetmetal=1: it takes MetalPluginName/MetalPluginClassName from user space" : "");
++		if (gSweetMetalFor[0] != '\0') {
++			IOLog("SWEET METAL: RedwoodMetal set at boot, shown only to: %s\n", gSweetMetalFor);
++		}
+ 	}
+ 	OSSafeReleaseNULL(accelerator);
+ }
