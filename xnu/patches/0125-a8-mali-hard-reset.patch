@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+index e96834b..0c1e99b 100644
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -677,18 +677,23 @@ sweet_mali_va_free(uint64_t va, uint64_t size)
+ 	lck_mtx_unlock(&mali_lock);
+ }
+ 
+-/* With the lock held: from a soft reset to a GPU ready for jobs in address space 0. */
++/* With the lock held: from a reset to a GPU ready for jobs in address space 0. */
+ static bool
+ hw_init(const char *why)
+ {
+ 	mw(GPU_IRQ_MASK, 0);
+ 	mw(GPU_IRQ_CLEAR, GPU_IRQ_RESET_DONE);
+-	mw(GPU_COMMAND, GPU_CMD_SOFT_RESET);
++	/*
++	 * The A8's Mali-G71 is an r0p0 part (GPU_ID revision 2), and Arm's kbase resets the first G71s hard.
++	 * After a soft reset that followed a fault, image stores stopped landing while buffer stores still
++	 * did (G9 M1 run 3, ios33). So hard first, and soft only if the hard one does not complete.
++	 */
++	mw(GPU_COMMAND, GPU_CMD_HARD_RESET);
+ 	if (!mpoll(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_DONE, GPU_IRQ_RESET_DONE, 100000)) {
+-		printf("SWEET MALI: %s: soft reset did not complete, hard reset\n", why);
+-		mw(GPU_COMMAND, GPU_CMD_HARD_RESET);
++		printf("SWEET MALI: %s: hard reset did not complete, soft reset\n", why);
++		mw(GPU_COMMAND, GPU_CMD_SOFT_RESET);
+ 		if (!mpoll(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_DONE, GPU_IRQ_RESET_DONE, 100000)) {
+-			printf("SWEET MALI: %s: hard reset did not complete either\n", why);
++			printf("SWEET MALI: %s: soft reset did not complete either\n", why);
+ 			return false;
+ 		}
+ 	}
