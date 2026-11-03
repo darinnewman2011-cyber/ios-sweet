@@ -5,6 +5,8 @@
 #   out/mali_test          the kernel's GPU service (RedwoodMali, sweetgpu=4) through its panfrost interface
 #   out/libOSMesa.8.dylib  Mesa 25.0.7 with panfrost (and softpipe), install name /sweet/lib/libOSMesa.8.dylib
 #   out/gl_test            one triangle through that library on the Mali, read back and checked
+#   out/libredwood-gl.dylib     OpenGL ES behind EAGLContext (step 7), for CoreAnimation in backboardd
+#   out/libsweet-gl-loader.dylib  inserted into backboardd (DYLD_INSERT_LIBRARIES): loads the one above
 #
 # Everything under gpu/mesa and gpu/src comes from stormtroopxyz/y2sios (MIT, gpu/LICENSE.y2sios), which
 # does the same for the Galaxy S20+'s Mali-G77: tools/mk-mesa.sh and userland/build-gpu-y2s.sh, adapted
@@ -84,5 +86,11 @@ xcrun strip -x out/libOSMesa.8.dylib
 install_name_tool -id /sweet/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
 "$CLANG" $TARGET -O1 -framework CoreFoundation -framework IOKit out/libOSMesa.8.dylib -o out/gl_test src/gl_test.c
 # ld only signs macOS arm64 output by itself; iOS kills unsigned code, and the kernel's AMFI takes ad-hoc.
-codesign -s - -f out/mali_test out/gl_test out/libOSMesa.8.dylib
+# GPU step 7: OpenGL ES behind EAGLContext for CoreAnimation (y2sios' eagl.c; its table of functions is the
+# same in iOS 16.7.16's OpenGLES as in 16.5's, all 457 entries checked) and its loader for backboardd.
+nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$B/exported-gl.txt"
+python3 mkeagl.py src/eagl_slots.txt "$B/mesa-$VERSION/src/mapi/glapi/registry/gl.xml" "$B/exported-gl.txt" src/eagl.c 	> "$B/eagl_gen.h"
+"$CLANG" $TARGET -O2 -dynamiclib -install_name /sweet/lib/libredwood-gl.dylib -I"$B" -framework CoreFoundation 	-framework IOKit -framework IOSurface -lobjc out/libOSMesa.8.dylib -o out/libredwood-gl.dylib src/eagl.c src/gl_osmesa.c
+"$CLANG" $TARGET -O2 -dynamiclib -install_name /sweet/lib/libsweet-gl-loader.dylib -framework IOKit 	-o out/libsweet-gl-loader.dylib src/sweet_gl_loader.c
+codesign -s - -f out/mali_test out/gl_test out/libOSMesa.8.dylib out/libredwood-gl.dylib out/libsweet-gl-loader.dylib
 echo "build.sh: out/libOSMesa.8.dylib ($(wc -c < out/libOSMesa.8.dylib) bytes), out/gl_test"
