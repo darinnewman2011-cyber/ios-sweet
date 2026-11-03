@@ -626,6 +626,16 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       `frame N (IOSurface 2/3) put on the panel by the GPU (0)`; frames 21–38 ms typical (≈20 ms of it waiting for the
       GPU, polled, no IRQ), first frames 176/539 ms with shader compiles. No crash in 1200 s; backboardd stayed up.
       Next for speed: GPU interrupts, GPU DVFS, CPU DVFS. **ios31** (`ec811190…8968`, same, `sweetreboot=0`) left booted.
+  - **G9 Metal, M0/M1 (2026-11-03):** gpu run 41638836728 (commit 370653a) builds `air_run`, `libredwoodair.dylib`
+    (install name /sweet/lib) and `air_metal_test` against panfrost; installed in `/sweet/bin`, `/sweet/lib`
+    (`_tmp/g9-m1.sh`, `%TEMP%/edit4.sh`). Runner commands are limited to one 4 KiB block (a8run.py `block()`), so
+    `_tmp/m1.cmd` holds the first 35 kernels of y2sios' rc.jobs.airmali. **M1 result (ios32, log `_tmp/m1-run.log`):
+    35/35 translated, compiled by Bifrost and dispatched, none crashed; 26 without a GPU fault, 9 with one (reset,
+    recovered): clearFragment01 (the draw), fbs_bistochastize_final, fbs_pcg_init, MetalFaceMask_{ConnectSpans,
+    DrawEye,DrawSpans,PropagateParents,PropogateAssociations,ResolveAssociations}.** Buffer writes seen from 7 kernels
+    (CalcCubeInputScaling, GenerateMask, InitMinMax, InitSpanTable, MinMax, fbs_bistochastize_init, ...); every
+    AV1SW kernel's written image reads back all zero (one -1): image stores / texture reads on Bifrost are the next
+    thing to check. Runner reset to `noop.cmd`; ios31 back on BOOT.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
