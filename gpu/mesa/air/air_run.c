@@ -1830,6 +1830,7 @@ main(int argc, char **argv)
       .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
    };
    struct pipe_resource *target = NULL;
+   struct pipe_resource *rt_res[PIPE_MAX_COLOR_BUFS] = { 0 };
    struct pipe_framebuffer_state fb = {
       .width = WIDTH, .height = HEIGHT, .nr_cbufs = num_rt,
    };
@@ -1837,6 +1838,7 @@ main(int argc, char **argv)
       struct pipe_resource *res = screen->resource_create(screen, &templ);
       fb.cbufs[i] = pipe->create_surface(pipe, res,
          &(struct pipe_surface){ .format = templ.format });
+      rt_res[i] = res;
       if (i == read_rt)
          target = res;
    }
@@ -2190,6 +2192,27 @@ main(int argc, char **argv)
          printf("  %u\n", ((uint32_t *)pix)[c]);
    }
    pipe->texture_unmap(pipe, xfer);
+
+   /* AIR_RUN_ALL_RT=1: pixel (0, 0) of every bound target as raw words, to tell an
+    * output that landed in the wrong target from one that was dropped (G9 M2 run 5:
+    * clearFragment04 and 08, which write only target 1, read back 0 on the Mali).
+    */
+   const char *all_rt = getenv("AIR_RUN_ALL_RT");
+   if (all_rt && *all_rt == '1') {
+      for (unsigned i = 0; i < num_rt; i++) {
+         struct pipe_transfer *x;
+         uint32_t *w = pipe->texture_map(pipe, rt_res[i], 0, PIPE_MAP_READ,
+                                         &(struct pipe_box){ .width = 1, .height = 1,
+                                                             .depth = 1 }, &x);
+         if (!w) {
+            printf("air_run: render target %u could not be read back\n", i);
+            continue;
+         }
+         printf("air_run: render target %u pixel (0, 0) words %08x %08x %08x %08x\n", i,
+                w[0], w[1], w[2], w[3]);
+         pipe->texture_unmap(pipe, x);
+      }
+   }
 
    printf("air_run: drew %ux%u into %s, %u render target%s\n",
           WIDTH, HEIGHT, util_format_short_name(rt_format), num_rt,
