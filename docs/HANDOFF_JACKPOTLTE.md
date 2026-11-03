@@ -711,7 +711,10 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       `nir_lower_viewport_transform`, which rewrites only a `store_deref` of gl_Position; air_run lowered I/O
       first, so positions reached the tiler in clip space (a 2x2-pixel quad at the origin). **air_metal.c's
       finalize_for_gallium has done the transform itself since 25 October; air_run's copy never got it. Fix
-      6cfc55a.** Whether target 1 is a separate bug is for run 9 (`_tmp/m2i.cmd`).
+      6cfc55a.**
+    - **Run 9 (`_tmp/m2i.cmd`, air_run 6cfc55a): render target 0 is bit-identical to softpipe on all 16 pixels for
+      all 8 clear shaders (01-08), 0 faults. M2's single-target draw path works.** Render target 1 is still all
+      zero on the Mali for every shader that has one (04-08), so that is a separate bug, still open (MRT).
     - CI caveat: gpu.yml reports success when air_run fails to compile (c5f4c8b: two printf strings split across
       lines); the artifact then simply has no `air_run`. Check the file list, not the run's colour.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
