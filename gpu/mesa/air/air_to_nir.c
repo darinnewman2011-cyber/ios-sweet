@@ -4065,6 +4065,25 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       NIR_PASS(_, c.nir, nir_opt_dce);
    }
 
+   /* Private memory -- the allocas and program-scope variables above -- back
+    * into a variable, so that what is only ever addressed by constants (most of
+    * it: AV1SW's Blit kernels store two words and read them straight back)
+    * becomes SSA values, a short indirectly indexed array a bcsel ladder, and
+    * only a longer one scratch again. On the Mali this was not just slow: the
+    * Blit kernels, all of which used scratch, wrote the wrong image -- or none
+    * -- after any earlier process's GPU fault, while every scratch-free kernel
+    * kept matching softpipe (G9 M1 runs 4-6, identical job descriptors before
+    * and after). And softpipe, the reference, cannot run scratch at all.
+    */
+   if (c.nir->scratch_size) {
+      NIR_PASS(_, c.nir, nir_lower_scratch_to_var);
+      NIR_PASS(_, c.nir, nir_lower_indirect_derefs, nir_var_function_temp, 16);
+      NIR_PASS(_, c.nir, nir_lower_vars_to_scratch, nir_var_function_temp, 0,
+               glsl_get_natural_size_align_bytes, glsl_get_natural_size_align_bytes);
+      NIR_PASS(_, c.nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, c.nir, nir_opt_dce);
+   }
+
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
 
    if (info) {
