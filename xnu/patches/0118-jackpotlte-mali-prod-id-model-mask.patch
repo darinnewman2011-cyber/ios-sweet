@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+index f2b3a29..e96834b 100644
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -917,7 +917,11 @@ bool
+ sweet_mali_param(uint32_t param, uint64_t *value)
+ {
+ 	switch (param) {
+-	case 0: *value = hw.gpu_id >> 16; break;                        /* GPU_PROD_ID */
++	/*
++	 * GPU_PROD_ID: arch major and product major only (kbase's GPU_ID2_PRODUCT_MODEL mask), as Mesa's model table
++	 * lists them. This G71 reads 0x60a0 (arch rev 0xa); Mesa knows the G71 as 0x6000 and would fall back to softpipe.
++	 */
++	case 0: *value = (hw.gpu_id >> 16) & 0xf00f; break;
+ 	case 1: *value = hw.gpu_id & 0xffff; break;                     /* GPU_REVISION */
+ 	case 2: *value = hw.shader_lo | ((uint64_t)hw.shader_hi << 32); break;
+ 	case 3: *value = hw.tiler; break;
