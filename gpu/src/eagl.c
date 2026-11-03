@@ -763,7 +763,8 @@ static void
 target_to_surface(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
-	size_t row = IOSurfaceGetBytesPerRow(surface);
+	bool planar = IOSurfaceGetPlaneCount(surface) > 0;     /* ('b3a8': its first plane) */
+	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, 0) : IOSurfaceGetBytesPerRow(surface);
 	uint8_t *base;
 
 	image->drawn = false;
@@ -805,7 +806,7 @@ target_to_surface(struct eagl *e, struct image *image)
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(surface);
+		base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, 0) : IOSurfaceGetBaseAddress(surface);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
 		if (!image->invert) {
@@ -4123,6 +4124,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	GLint texture = 0;
 	uint32_t pixels;
 	uint64_t began;
+	bool b3a8;
 
 	(void)selector;
 	if (e == NULL || surface == NULL) {
@@ -4132,8 +4134,17 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
-	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+	/*
+	 * (ios-sweet) 'b3a8' is what CoreAnimation draws the display in once it has OpenGL ES: a
+	 * 'BGRA' picture in the first plane and an opacity plane after it, which nobody shows. The
+	 * first plane is drawn into (the kernel gives the GPU that plane: RedwoodMali's 0x7e).
+	 */
+	b3a8 = pixels == 'b3a8' && IOSurfaceGetPlaneCount(surface) == 2 &&
+	    IOSurfaceGetBytesPerElementOfPlane(surface, 0) == 4 &&
+	    IOSurfaceGetWidthOfPlane(surface, 0) == IOSurfaceGetWidth(surface) &&
+	    IOSurfaceGetHeightOfPlane(surface, 0) == IOSurfaceGetHeight(surface);
+	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0 && !b3a8) ||
+	    IOSurfaceGetBytesPerElement(surface) != 4 || (IOSurfaceGetPlaneCount(surface) != 0 && !b3a8) ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });

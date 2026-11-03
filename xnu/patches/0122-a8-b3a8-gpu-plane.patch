@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index 22aa28d..6735e5a 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -557,6 +557,18 @@ RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		request->planeOffset[i] = real ? s->planes[i].offset : (i == 0 ? s->offset : 0);
+ 		request->planeRowBytes[i] = real ? s->planes[i].bytesPerRow : (i == 0 ? s->bytesPerRow : 0);
+ 	}
++	/*
++	 * 'b3a8' (four bytes a pixel, blue first, and an opacity plane after them): what CoreAnimation
++	 * draws the display in once it has OpenGL ES. Its first plane is a 'BGRA' picture, and that is
++	 * what the GPU is given; the opacity plane is not the GPU's (nobody shows it).
++	 */
++	if (s->pixelFormat == 'b3a8' && s->planeCount == 2 && s->planes[0].bytesPerElement == 4 &&
++	    s->planes[0].width == s->width && s->planes[0].height == s->height) {
++		request->pixelFormat = 'BGRA';
++		request->planes = 0;
++		request->offset = s->planes[0].offset;
++		request->rowBytes = s->planes[0].bytesPerRow;
++	}
+ 	if (request->handle == kRedwoodDescribe) {
+ 		request->handle = 0;
+ 		s->release();
