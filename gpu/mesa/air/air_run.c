@@ -2220,8 +2220,7 @@ main(int argc, char **argv)
                                         &(struct pipe_box){ .width = WIDTH, .height = HEIGHT,
                                                             .depth = 1 }, &x);
          if (!m) {
-            printf("air_run: render target %u could not be read back
-", i);
+            printf("air_run: render target %u could not be read back\n", i);
             continue;
          }
          for (unsigned y = 0; y < HEIGHT; y++) {
@@ -2229,8 +2228,7 @@ main(int argc, char **argv)
             printf("air_run: render target %u row %u:", i, y);
             for (unsigned k = 0; k < WIDTH * words; k++)
                printf(" %08x", w[k]);
-            printf("
-");
+            printf("\n");
          }
          pipe->texture_unmap(pipe, x);
       }
