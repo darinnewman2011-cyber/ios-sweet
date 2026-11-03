@@ -2038,6 +2038,18 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
    }
 
    nir_variable *var = make_io_var(c, nir_var_shader_out, t, location, name);
+   /* An LLVM integer has no sign, so make_io_var declares every integer output signed,
+    * and on Mali that is not harmless: Panfrost picks the blend unit's register format
+    * from the output's type, and an s32 value of 2^31 or more stored to a uint target
+    * is converted and clamps to 0. Apple's metadata names the declared type
+    * (air.arg_type_name "uint4", "ushort2", "uchar"), so an unsigned one is declared
+    * unsigned here (G9 M2 run 4: clearFragment02 and 08 read back 0, 03 did not).
+    */
+   const char *out_tn = md_key_str(node, "air.arg_type_name");
+   enum glsl_base_type out_base = glsl_get_base_type(var->type);
+   if (out_tn && out_tn[0] == 'u' && glsl_base_type_is_integer(out_base))
+      var->type = glsl_vector_type(glsl_unsigned_base_type_of(out_base),
+                                   glsl_get_vector_elements(var->type));
    var->data.index = index;
    var->data.driver_location = c->nir->num_outputs++;
    c->outputs[field].location = location;

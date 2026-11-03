@@ -1645,11 +1645,16 @@ main(int argc, char **argv)
       enum glsl_base_type base = glsl_get_base_type(glsl_without_array(var->type));
       if (base != GLSL_TYPE_FLOAT && base != GLSL_TYPE_FLOAT16 &&
           base != GLSL_TYPE_DOUBLE) {
-         /* unsigned, not signed: an LLVM integer carries no signedness, so
-          * both this and tools/air/cpuref.py print the bits unsigned and the
-          * two can be compared
+         /* The bits are printed unsigned either way, as tools/air/cpuref.py
+          * does, so the two can be compared. But the TARGET must match the
+          * output's sign: Mali's blend unit converts an s32 register to a uint
+          * target and clamps every value of 2^31 or more to 0 (G9 M2 run 4),
+          * where softpipe copied the bits. The frontend declares an output
+          * unsigned when Apple's metadata says uint, signed otherwise.
           */
-         rt_format = PIPE_FORMAT_R32G32B32A32_UINT;
+         rt_format = base == GLSL_TYPE_INT || base == GLSL_TYPE_INT16
+                        ? PIPE_FORMAT_R32G32B32A32_SINT
+                        : PIPE_FORMAT_R32G32B32A32_UINT;
          rt_is_float = false;
       } else if (base == GLSL_TYPE_FLOAT16) {
          /* A half return needs a half target. Through a 32-bit one the half is
@@ -1854,9 +1859,14 @@ main(int argc, char **argv)
       .translate = { WIDTH / 2.0f, HEIGHT / 2.0f, 0.0f },
    });
 
-   void *blend = pipe->create_blend_state(pipe, &(struct pipe_blend_state){
-      .rt[0].colormask = PIPE_MASK_RGBA,
-   });
+   /* Every target's mask set and independent blending on, rather than rt[0] alone
+    * standing for all of them: a target written only by the shader's second output
+    * (clearFragment04, 08) then cannot depend on how a driver reads the shared case.
+    */
+   struct pipe_blend_state blend_state = { .independent_blend_enable = true };
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
+      blend_state.rt[i].colormask = PIPE_MASK_RGBA;
+   void *blend = pipe->create_blend_state(pipe, &blend_state);
    pipe->bind_blend_state(pipe, blend);
    void *dsa = pipe->create_depth_stencil_alpha_state(pipe,
       &(struct pipe_depth_stencil_alpha_state){ 0 });
