@@ -1,0 +1,1685 @@
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+index 965e0f8..1e22015 100644
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -6,7 +6,9 @@
+  * wait for 0xF in 0x11C840A4) and then the L2, tiler and shader cores;
+  * 3 then runs step 3: address space 0 with Mali LPAE page tables (G71 has no
+  * AArch64-format GPU MMU) and a polled chain of two WRITE_VALUE jobs (Zero,
+- * then Immediate 32) on job slot 1, and checks RAM for the values.
++ * then Immediate 32) on job slot 1, and checks RAM for the values;
++ * 4 instead brings up the GPU service for programs (step 4, below) and runs its
++ * self test (sweetgputrace=N logs the first N jobs).
+  * GPU registers are never touched while the domain is off (that can hang the
+  * bus). Runs in its own thread so a stuck access stalls only the probe.
+  * Facts: live FDT mali@11500000, pd-g3d@11c840a0; Samsung cmucal (CMU_G3D 0x11400000).
+@@ -21,6 +23,9 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/proc.h>
++#include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -256,6 +261,806 @@ g_step3(uint32_t shader)
+ 	g_wr(g_gpu, MMU_IRQ_CLEAR, 0xffffffffu);
+ }
+ 
++/*
++ * Step 4 (sweetgpu=4): the GPU as a service for programs, ported from y2sios'
++ * redwood_mali.c (stormtroopxyz/y2sios, MIT, Mali-G77; itself after Linux
++ * panfrost). iokit/Kernel/arm/SweetMali.cpp gives it to programs with Linux's
++ * panfrost interface. What differs on the G71:
++ *   MMU     Mali LPAE tables as in step 3 (no AArch64 format on the G71): table
++ *           PA|3, leaf PA|1 at level 3, stage-2-like HAP read/write bits 6/7,
++ *           outer shareable, attribute index 0 (MEMATTR 0x88, as panfrost does
++ *           for memory that is not coherent), XN for no-exec.
++ *   quirks  Linux panfrost_gpu_init_quirks() for TMIx: only L2_MMU_CONFIG's
++ *           external read/write limits cleared; no SHADER_CONFIG / JM_CONFIG.
++ *   power   the rail and domain are on at hand-over (steps 2-3), so no cycle.
++ * One address space (AS 0) for every client, addresses 32 MB..4 GB, jobs run
++ * one at a time in submission order from a polling thread (fragment chains on
++ * slot 0, the rest on slot 1). A fault, an MMU fault or 2 s without an answer
++ * resets the GPU and the job counts as done.
++ */
++#define GPU_IRQ_CLEAR   0x024u
++#define GPU_IRQ_MASK    0x028u
++#define GPU_COMMAND     0x030u
++#define GPU_FAULTSTATUS 0x03cu
++#define GPU_FAULTADDR_LO 0x040u
++#define GPU_FAULTADDR_HI 0x044u
++#define GPU_CYCLES_LO   0x090u
++#define GPU_CYCLES_HI   0x094u
++#define GPU_TIMESTAMP_LO 0x098u
++#define GPU_TIMESTAMP_HI 0x09cu
++#define THREAD_MAX_THREADS 0x0a0u
++#define THREAD_MAX_WG   0x0a4u
++#define THREAD_MAX_BARRIER 0x0a8u
++#define THREAD_FEATURES 0x0acu
++#define TEXTURE_FEATURES(n) (0x0b0u + 4 * (n))
++#define JS_FEATURES(n)  (0x0c0u + 4 * (n))
++#define SHADER_PRESENT_HI 0x104u
++#define AFBC_FEATURES   0x04cu
++#define COHERENCY_FEATURES 0x300u
++#define THREAD_TLS_ALLOC 0x310u
++#define STACK_PRESENT   0xe00u
++#define L2_MMU_CONFIG   0xf0cu
++#define   L2_MMU_LIMIT_EXT (0xfu << 24)       /* LIMIT_EXTERNAL_READS 25:24, WRITES 27:26 */
++#define GPU_CMD_SOFT_RESET 1u
++#define GPU_CMD_HARD_RESET 2u
++#define GPU_CMD_CYCLES_START 5u
++#define GPU_IRQ_RESET_DONE (1u << 8)
++#define AS_LOCKADDR_LO  0x10u
++#define AS_LOCKADDR_HI  0x14u
++#define AS_CMD_UPDATE   1u
++#define AS_CMD_LOCK     2u
++#define AS_CMD_FLUSH_PT 4u
++#define AS_CMD_FLUSH_MEM 5u
++#define JS_CMD_HARD_STOP 3u
++
++#define PTE_TABLE       3ull
++#define PTE_LEAF        1ull
++#define PTE_HAP_READ    (1ull << 6)
++#define PTE_HAP_WRITE   (1ull << 7)
++#define PTE_SH_OS       (2ull << 8)
++#define PTE_XN          (1ull << 54)
++#define MALI_VA_START   0x02000000ull
++#define MALI_VA_END     0x100000000ull
++#define MALI_VA_EXTENTS 4096
++#define MALI_JOBS       256
++#define MALI_JOB_TIMEOUT_MS 2000
++#define MALI_POLL_US    20
++
++#define SWEET_MALI_MAP_NOEXEC    0x1
++#define SWEET_MALI_MAP_READ_ONLY 0x2
++#define SWEET_MALI_JOB_FS        0x1
++
++static LCK_GRP_DECLARE(mali_grp, "sweet-mali");
++static LCK_MTX_DECLARE(mali_lock, &mali_grp);  /* everything below */
++static bool mali_up;
++static uint32_t mali_trace;
++
++static struct {
++	uint32_t gpu_id, l2_features, core_features, tiler_features, mem_features, mmu_features;
++	uint32_t as_present, js_present, thread_max, thread_wg, thread_barrier, thread_features, tls_alloc;
++	uint32_t texture[4], js[16], afbc, coherency;
++	uint32_t shader_lo, shader_hi, tiler, l2, stack;
++} hw;
++
++static inline uint32_t
++mr(uint32_t off)
++{
++	return g_rd(g_gpu, off);
++}
++
++static inline void
++mw(uint32_t off, uint32_t v)
++{
++	g_wr(g_gpu, off, v);
++}
++
++static bool
++mpoll(uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t i = 0; i < us / 5; i++) {
++		if ((mr(off) & mask) == want) {
++			return true;
++		}
++		delay(5);
++	}
++	return (mr(off) & mask) == want;
++}
++
++static uint64_t
++kpa(const void *p)
++{
++	return ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)p)) | ((uintptr_t)p & PAGE_MASK);
++}
++
++static void
++read_features(void)
++{
++	hw.gpu_id = mr(GPU_ID);
++	hw.l2_features = mr(L2_FEATURES);
++	hw.core_features = mr(CORE_FEATURES);
++	hw.tiler_features = mr(TILER_FEATURES);
++	hw.mem_features = mr(MEM_FEATURES);
++	hw.mmu_features = mr(MMU_FEATURES);
++	hw.as_present = mr(AS_PRESENT);
++	hw.js_present = mr(JS_PRESENT);
++	hw.thread_max = mr(THREAD_MAX_THREADS);
++	hw.thread_wg = mr(THREAD_MAX_WG);
++	hw.thread_barrier = mr(THREAD_MAX_BARRIER);
++	hw.thread_features = mr(THREAD_FEATURES);
++	hw.tls_alloc = mr(THREAD_TLS_ALLOC);
++	for (unsigned i = 0; i < 4; i++) {
++		hw.texture[i] = mr(TEXTURE_FEATURES(i));
++	}
++	for (unsigned i = 0; i < 16; i++) {
++		hw.js[i] = mr(JS_FEATURES(i));
++	}
++	hw.afbc = mr(AFBC_FEATURES);
++	hw.coherency = mr(COHERENCY_FEATURES);
++	hw.shader_lo = mr(SHADER_PRESENT);
++	hw.shader_hi = mr(SHADER_PRESENT_HI);
++	hw.tiler = mr(TILER_PRESENT);
++	hw.l2 = mr(L2_PRESENT);
++	hw.stack = mr(STACK_PRESENT);
++}
++
++/*
++ * Page tables: four levels of 512 entries. Each table has a node: the table,
++ * and for levels 0-2 a page of pointers to the nodes below (the GPU's tables
++ * hold physical addresses only). 4 GB take at most 1 + 1 + 4 + 2048 tables.
++ */
++#define PT_NODES        2100
++
++struct pt_node {
++	uint64_t        *table;
++	struct pt_node  **child;
++};
++
++static struct pt_node pt_nodes[PT_NODES];
++static unsigned pt_nodes_used;
++static struct pt_node *pt_root;
++
++static void *
++table_new(void)
++{
++	vm_offset_t page = 0;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	return (void *)page;
++}
++
++static struct pt_node *
++node_new(bool leaf)
++{
++	struct pt_node *n;
++
++	if (pt_nodes_used == PT_NODES) {
++		return NULL;
++	}
++	n = &pt_nodes[pt_nodes_used];
++	n->table = table_new();
++	n->child = leaf ? NULL : table_new();
++	if (n->table == NULL || (!leaf && n->child == NULL)) {
++		return NULL;
++	}
++	pt_nodes_used++;
++	g_flush(n->table, 4096);        /* zeroes, for the GPU's table walk */
++	return n;
++}
++
++/* The level-3 table for va, made with those above it if make. NULL: none, or no memory. */
++static uint64_t *
++l3_table(uint64_t va, bool make)
++{
++	struct pt_node *n = pt_root;
++
++	for (int level = 0; level < 3; level++) {
++		unsigned i = (unsigned)(va >> (39 - 9 * level)) & 511;
++
++		if (n->child[i] == NULL) {
++			struct pt_node *c;
++
++			if (!make || (c = node_new(level == 2)) == NULL) {
++				return NULL;
++			}
++			n->table[i] = kpa(c->table) | PTE_TABLE;
++			g_flush(&n->table[i], 8);
++			n->child[i] = c;
++		}
++		n = n->child[i];
++	}
++	return n->table;
++}
++
++static bool
++as_wait(void)
++{
++	if (!mpoll(AS0 + AS_STATUS, 1, 0, 100000)) {
++		printf("SWEET MALI: AS0 stays busy (status %#x, fault %#x)\n", mr(AS0 + AS_STATUS), mr(AS0 + AS_FAULTSTATUS));
++		return false;
++	}
++	return true;
++}
++
++/* panfrost's lock_region() and the command: a naturally aligned power of two around [va, va + size) */
++static bool
++as_operation(uint64_t va, uint64_t size, uint32_t command)
++{
++	uint64_t end = va + size, region;
++	unsigned width = 64 - (unsigned)__builtin_clzll(va ^ (end - 1));
++
++	if (size == 0) {
++		return true;
++	}
++	if (width < 15) {
++		width = 15;                     /* AS_LOCK_REGION_MIN_SIZE: 32 KB */
++	}
++	width -= 1;
++	region = (va & ~((1ull << width) - 1)) | width;
++	if (!as_wait()) {
++		return false;
++	}
++	mw(AS0 + AS_LOCKADDR_LO, (uint32_t)region);
++	mw(AS0 + AS_LOCKADDR_HI, (uint32_t)(region >> 32));
++	mw(AS0 + AS_COMMAND, AS_CMD_LOCK);
++	if (!as_wait()) {
++		return false;
++	}
++	mw(AS0 + AS_COMMAND, command);
++	return as_wait();
++}
++
++static bool
++as_enable(void)
++{
++	uint64_t transtab = kpa(pt_root->table) | (1u << 2) | 3;       /* READ_INNER | ADRMODE_TABLE */
++	uint64_t memattr = 0x88ull | (0x8dull << 8) | (0x88ull << 16);  /* NC, write-alloc, device (panfrost) */
++
++	if (!as_operation(0, ~0ull, AS_CMD_FLUSH_MEM)) {
++		return false;
++	}
++	mw(AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	mw(AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	mw(AS0 + AS_MEMATTR_LO, (uint32_t)memattr);
++	mw(AS0 + AS_MEMATTR_HI, (uint32_t)(memattr >> 32));
++	mw(AS0 + AS_COMMAND, AS_CMD_UPDATE);
++	return as_wait();
++}
++
++bool sweet_mali_map(uint64_t va, uint64_t pa, uint32_t flags);
++bool
++sweet_mali_map(uint64_t va, uint64_t pa, uint32_t flags)
++{
++	uint64_t *l3, entry;
++	bool ok = false;
++
++	if ((va & 4095) || (pa & 4095) || va < MALI_VA_START || va >= MALI_VA_END) {
++		return false;
++	}
++	entry = pa | PTE_LEAF | PTE_HAP_READ | PTE_SH_OS | ((flags & SWEET_MALI_MAP_READ_ONLY) ? 0 : PTE_HAP_WRITE) |
++	    ((flags & SWEET_MALI_MAP_NOEXEC) ? PTE_XN : 0);
++	lck_mtx_lock(&mali_lock);
++	if (mali_up && (l3 = l3_table(va, true)) != NULL) {
++		unsigned i = (unsigned)(va >> 12) & 511;
++
++		l3[i] = entry;
++		__asm__ volatile ("dc cvac, %0" : : "r"(&l3[i]) : "memory");
++		ok = true;
++	}
++	lck_mtx_unlock(&mali_lock);
++	return ok;
++}
++
++void sweet_mali_mapped(uint64_t va, uint64_t size);
++void
++sweet_mali_mapped(uint64_t va, uint64_t size)
++{
++	lck_mtx_lock(&mali_lock);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (mali_up) {
++		as_operation(va, size, AS_CMD_FLUSH_PT);
++	}
++	lck_mtx_unlock(&mali_lock);
++}
++
++void sweet_mali_unmap(uint64_t va, uint64_t size);
++void
++sweet_mali_unmap(uint64_t va, uint64_t size)
++{
++	lck_mtx_lock(&mali_lock);
++	if (mali_up) {
++		for (uint64_t a = va; a < va + size; a += 4096) {
++			uint64_t *l3 = l3_table(a, false);
++
++			if (l3 != NULL) {
++				l3[(a >> 12) & 511] = 0;
++				__asm__ volatile ("dc cvac, %0" : : "r"(&l3[(a >> 12) & 511]) : "memory");
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		as_operation(va, size, AS_CMD_FLUSH_PT);
++	}
++	lck_mtx_unlock(&mali_lock);
++}
++
++/* GPU addresses: a sorted list of what is free. */
++static struct {
++	uint64_t start, size;
++} va_free_list[MALI_VA_EXTENTS];
++static unsigned va_free_count;
++
++uint64_t sweet_mali_va_alloc(uint64_t size, bool exec);
++uint64_t
++sweet_mali_va_alloc(uint64_t size, bool exec)
++{
++	uint64_t align = 4096, got = 0;
++
++	size = (size + 4095) & ~4095ull;
++	if (size == 0) {
++		return 0;
++	}
++	if (exec) {
++		/* a power of two at least the size: then it cannot cross a 16 MB line (the GPU's rule for code) */
++		while (align < size && align < (16ull << 20)) {
++			align <<= 1;
++		}
++	} else if (size >= (2ull << 20)) {
++		align = 2ull << 20;
++	}
++	lck_mtx_lock(&mali_lock);
++	for (unsigned i = 0; i < va_free_count; i++) {
++		uint64_t s = va_free_list[i].start, e = s + va_free_list[i].size;
++		uint64_t a = (s + align - 1) & ~(align - 1);
++
++		if (a + size > e) {
++			continue;
++		}
++		got = a;
++		if (a == s && a + size == e) {
++			memmove(&va_free_list[i], &va_free_list[i + 1], (va_free_count - i - 1) * sizeof(va_free_list[0]));
++			va_free_count--;
++		} else if (a == s) {
++			va_free_list[i].start += size;
++			va_free_list[i].size -= size;
++		} else if (a + size == e) {
++			va_free_list[i].size = a - s;
++		} else if (va_free_count < MALI_VA_EXTENTS) {
++			memmove(&va_free_list[i + 2], &va_free_list[i + 1], (va_free_count - i - 1) * sizeof(va_free_list[0]));
++			va_free_count++;
++			va_free_list[i].size = a - s;
++			va_free_list[i + 1].start = a + size;
++			va_free_list[i + 1].size = e - (a + size);
++		} else {
++			got = 0;
++			continue;
++		}
++		break;
++	}
++	lck_mtx_unlock(&mali_lock);
++	return got;
++}
++
++void sweet_mali_va_free(uint64_t va, uint64_t size);
++void
++sweet_mali_va_free(uint64_t va, uint64_t size)
++{
++	unsigned i;
++
++	size = (size + 4095) & ~4095ull;
++	if (va == 0 || size == 0) {
++		return;
++	}
++	lck_mtx_lock(&mali_lock);
++	for (i = 0; i < va_free_count && va_free_list[i].start < va; i++) {
++	}
++	bool before = i > 0 && va_free_list[i - 1].start + va_free_list[i - 1].size == va;
++	bool after = i < va_free_count && va + size == va_free_list[i].start;
++
++	if (before && after) {
++		va_free_list[i - 1].size += size + va_free_list[i].size;
++		memmove(&va_free_list[i], &va_free_list[i + 1], (va_free_count - i - 1) * sizeof(va_free_list[0]));
++		va_free_count--;
++	} else if (before) {
++		va_free_list[i - 1].size += size;
++	} else if (after) {
++		va_free_list[i].start = va;
++		va_free_list[i].size += size;
++	} else if (va_free_count < MALI_VA_EXTENTS) {
++		memmove(&va_free_list[i + 1], &va_free_list[i], (va_free_count - i) * sizeof(va_free_list[0]));
++		va_free_list[i].start = va;
++		va_free_list[i].size = size;
++		va_free_count++;
++	} else {
++		printf("SWEET MALI: free GPU address list full: %#llx..+%#llx lost\n", va, size);
++	}
++	lck_mtx_unlock(&mali_lock);
++}
++
++/* With the lock held: from a soft reset to a GPU ready for jobs in address space 0. */
++static bool
++hw_init(const char *why)
++{
++	mw(GPU_IRQ_MASK, 0);
++	mw(GPU_IRQ_CLEAR, GPU_IRQ_RESET_DONE);
++	mw(GPU_COMMAND, GPU_CMD_SOFT_RESET);
++	if (!mpoll(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_DONE, GPU_IRQ_RESET_DONE, 100000)) {
++		printf("SWEET MALI: %s: soft reset did not complete, hard reset\n", why);
++		mw(GPU_COMMAND, GPU_CMD_HARD_RESET);
++		if (!mpoll(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_DONE, GPU_IRQ_RESET_DONE, 100000)) {
++			printf("SWEET MALI: %s: hard reset did not complete either\n", why);
++			return false;
++		}
++	}
++	mw(GPU_IRQ_CLEAR, 0xffffffffu);
++	mw(JOB_IRQ_MASK, 0);
++	mw(JOB_IRQ_CLEAR, 0xffffffffu);
++	mw(MMU_IRQ_MASK, 0);
++	mw(MMU_IRQ_CLEAR, 0xffffffffu);
++	mw(L2_MMU_CONFIG, mr(L2_MMU_CONFIG) & ~L2_MMU_LIMIT_EXT);
++	mw(COHERENCY_ENABLE, 31);
++	mw(L2_PWRON, hw.l2);
++	if (!mpoll(L2_READY, 0xffffffffu, hw.l2, 20000)) {
++		printf("SWEET MALI: %s: L2 not ready (%#x)\n", why, mr(L2_READY));
++		return false;
++	}
++	mw(SHADER_PWRON, hw.shader_lo);
++	mw(TILER_PWRON, hw.tiler);
++	if (!mpoll(SHADER_READY, 0xffffffffu, hw.shader_lo, 20000) || !mpoll(TILER_READY, 0xffffffffu, hw.tiler, 20000)) {
++		printf("SWEET MALI: %s: cores not ready (shaders %#x of %#x, tiler %#x)\n", why, mr(SHADER_READY), hw.shader_lo,
++		    mr(TILER_READY));
++		return false;
++	}
++	mw(GPU_COMMAND, GPU_CMD_CYCLES_START);
++	return as_enable();
++}
++
++static struct mali_job {
++	uint64_t        jc, seqno;
++	uint32_t        requirements;
++	int             pid;
++	char            name[20];
++} mali_jobs[MALI_JOBS];
++static unsigned job_head, job_tail;     /* taken from head, added at tail */
++static uint64_t submitted, completed;
++static volatile uint64_t *completed_shared;
++static uint64_t stat_jobs, stat_faults, stat_resets, last_fault_jc;
++
++/* The completed count where clients read it without a call (SweetMali.cpp maps it as client memory type 0). */
++void sweet_mali_share_completed(volatile uint64_t *where);
++void
++sweet_mali_share_completed(volatile uint64_t *where)
++{
++	completed_shared = where;
++	if (where != NULL) {
++		__atomic_store_n(where, __atomic_load_n(&completed, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
++	}
++}
++
++uint64_t sweet_mali_submit(uint64_t jc, uint32_t requirements);
++uint64_t
++sweet_mali_submit(uint64_t jc, uint32_t requirements)
++{
++	uint64_t seqno = 0;
++
++	lck_mtx_lock(&mali_lock);
++	while (mali_up && job_tail - job_head == MALI_JOBS) {
++		lck_mtx_sleep(&mali_lock, LCK_SLEEP_DEFAULT, (event_t)&completed, THREAD_UNINT);
++	}
++	if (mali_up) {
++		struct mali_job *j = &mali_jobs[job_tail++ % MALI_JOBS];
++
++		j->jc = jc;
++		j->requirements = requirements;
++		j->pid = proc_selfpid();
++		proc_selfname(j->name, sizeof(j->name));
++		j->seqno = seqno = ++submitted;
++		thread_wakeup((event_t)&mali_jobs);
++	}
++	lck_mtx_unlock(&mali_lock);
++	return seqno;
++}
++
++bool sweet_mali_done(uint64_t seqno);
++bool
++sweet_mali_done(uint64_t seqno)
++{
++	return __atomic_load_n(&completed, __ATOMIC_ACQUIRE) >= seqno;
++}
++
++uint64_t sweet_mali_last(void);
++uint64_t
++sweet_mali_last(void)
++{
++	return __atomic_load_n(&submitted, __ATOMIC_RELAXED);
++}
++
++bool sweet_mali_wait(uint64_t seqno, uint64_t milliseconds);
++bool
++sweet_mali_wait(uint64_t seqno, uint64_t milliseconds)
++{
++	uint64_t deadline;
++	bool done;
++
++	if (sweet_mali_done(seqno)) {
++		return true;
++	}
++	if (milliseconds == 0) {
++		return false;
++	}
++	clock_interval_to_deadline((uint32_t)milliseconds, NSEC_PER_MSEC, &deadline);
++	lck_mtx_lock(&mali_lock);
++	while (!(done = completed >= seqno) && mach_absolute_time() < deadline) {
++		lck_mtx_sleep_deadline(&mali_lock, LCK_SLEEP_DEFAULT, (event_t)&completed, THREAD_UNINT, deadline);
++	}
++	lck_mtx_unlock(&mali_lock);
++	return done;
++}
++
++void sweet_mali_counts(uint64_t *j, uint64_t *f, uint64_t *r, uint64_t *last);
++void
++sweet_mali_counts(uint64_t *j, uint64_t *f, uint64_t *r, uint64_t *last)
++{
++	*j = stat_jobs;
++	*f = stat_faults;
++	*r = stat_resets;
++	*last = last_fault_jc;
++}
++
++/* Processor caches written back and dropped, for memory the GPU reads or has written; NULL: a barrier only. */
++void sweet_mali_to_memory(const void *start, uint64_t size);
++void
++sweet_mali_to_memory(const void *start, uint64_t size)
++{
++	if (start == NULL) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
++	g_flush((void *)(uintptr_t)start, size);
++}
++
++static void
++job_start(const struct mali_job *j)
++{
++	uint32_t js = JS_BASE((j->requirements & SWEET_MALI_JOB_FS) ? 0 : 1);
++
++	mw(js + JS_HEAD_NEXT_LO, (uint32_t)j->jc);
++	mw(js + JS_HEAD_NEXT_HI, (uint32_t)(j->jc >> 32));
++	mw(js + JS_AFF_NEXT_LO, hw.shader_lo);
++	mw(js + JS_AFF_NEXT_HI, hw.shader_hi);
++	/* AS 0, thread priority 8, caches cleaned and invalidated at start and end (panfrost_job_hw_submit) */
++	mw(js + JS_CONFIG_NEXT, (3u << 8) | (3u << 12) | (8u << 16));
++	mw(js + JS_COMMAND_NEXT, 1);
++}
++
++/* With the lock held: what went wrong, then a reset and the GPU set up again. */
++static void
++job_failed(const struct mali_job *j, const char *what)
++{
++	unsigned slot = (j->requirements & SWEET_MALI_JOB_FS) ? 0 : 1;
++	uint32_t js = JS_BASE(slot);
++
++	stat_faults++;
++	last_fault_jc = j->jc;
++	if (stat_faults <= 32) {
++		printf("SWEET MALI: job %llu of %s[%d] (chain %#llx, slot %u) %s: JS status %#x head %#x; job rawstat %#x; "
++		    "MMU rawstat %#x, AS0 fault %#x at %#x:%08x; GPU fault %#x at %#x:%08x\n", j->seqno, j->name, j->pid, j->jc, slot,
++		    what, mr(js + JS_STATUS), mr(js + JS_HEAD_LO), mr(JOB_IRQ_RAWSTAT), mr(MMU_IRQ_RAWSTAT), mr(AS0 + AS_FAULTSTATUS),
++		    mr(AS0 + AS_FAULTADDR_HI), mr(AS0 + AS_FAULTADDR_LO), mr(GPU_FAULTSTATUS), mr(GPU_FAULTADDR_HI),
++		    mr(GPU_FAULTADDR_LO));
++	}
++	mw(js + JS_COMMAND, JS_CMD_HARD_STOP);
++	delay(100);
++	stat_resets++;
++	if (!hw_init("after a fault")) {
++		printf("SWEET MALI: the GPU could not be set up again: no more GPU work this run\n");
++		mali_up = false;
++	}
++}
++
++static void
++mali_scheduler(__unused void *parameter, __unused wait_result_t result)
++{
++	struct mali_job *running = NULL;
++	uint64_t started = 0, timeout;
++
++	nanoseconds_to_absolutetime((uint64_t)MALI_JOB_TIMEOUT_MS * NSEC_PER_MSEC, &timeout);
++	lck_mtx_lock(&mali_lock);
++	for (;;) {
++		if (running == NULL) {
++			if (job_head == job_tail || !mali_up) {
++				lck_mtx_sleep(&mali_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_jobs, THREAD_UNINT);
++				continue;
++			}
++			running = &mali_jobs[job_head % MALI_JOBS];
++			__asm__ volatile ("dsb sy" ::: "memory");
++			job_start(running);
++			started = mach_absolute_time();
++			if (stat_jobs < mali_trace) {
++				printf("SWEET MALI: job %llu: chain %#llx, %s\n", running->seqno, running->jc,
++				    (running->requirements & SWEET_MALI_JOB_FS) ? "fragment" : "vertex/tiler/compute");
++			}
++		}
++		unsigned slot = (running->requirements & SWEET_MALI_JOB_FS) ? 0 : 1;
++
++		lck_mtx_unlock(&mali_lock);
++		delay(MALI_POLL_US);
++		lck_mtx_lock(&mali_lock);
++
++		uint32_t raw = mr(JOB_IRQ_RAWSTAT), mmu = mr(MMU_IRQ_RAWSTAT);
++
++		if (raw & (1u << (16 + slot))) {
++			job_failed(running, "faulted");
++		} else if (mmu != 0) {
++			job_failed(running, "made an MMU fault");
++		} else if (raw & (1u << slot)) {
++			mw(JOB_IRQ_CLEAR, 1u << slot);
++		} else if (mach_absolute_time() - started > timeout) {
++			job_failed(running, "did not finish in time");
++		} else {
++			continue;
++		}
++		stat_jobs++;
++		job_head++;
++		__atomic_store_n(&completed, running->seqno, __ATOMIC_RELEASE);
++		if (completed_shared != NULL) {
++			__atomic_store_n(completed_shared, running->seqno, __ATOMIC_RELEASE);
++		}
++		running = NULL;
++		thread_wakeup((event_t)&completed);
++	}
++}
++
++/* Linux's DRM_PANFROST_PARAM_*, in that order; false if there is no such parameter. */
++bool sweet_mali_param(uint32_t param, uint64_t *value);
++bool
++sweet_mali_param(uint32_t param, uint64_t *value)
++{
++	switch (param) {
++	case 0: *value = hw.gpu_id >> 16; break;                        /* GPU_PROD_ID */
++	case 1: *value = hw.gpu_id & 0xffff; break;                     /* GPU_REVISION */
++	case 2: *value = hw.shader_lo | ((uint64_t)hw.shader_hi << 32); break;
++	case 3: *value = hw.tiler; break;
++	case 4: *value = hw.l2; break;
++	case 5: *value = hw.stack; break;
++	case 6: *value = hw.as_present; break;
++	case 7: *value = hw.js_present; break;
++	case 8: *value = hw.l2_features; break;
++	case 9: *value = hw.core_features; break;
++	case 10: *value = hw.tiler_features; break;
++	case 11: *value = hw.mem_features; break;
++	case 12: *value = hw.mmu_features; break;
++	case 13: *value = hw.thread_features; break;
++	case 14: *value = hw.thread_max; break;
++	case 15: *value = hw.thread_wg; break;
++	case 16: *value = hw.thread_barrier; break;
++	case 17: *value = hw.coherency; break;
++	case 18: case 19: case 20: case 21: *value = hw.texture[param - 18]; break;
++	case 22 ... 37: *value = hw.js[param - 22]; break;
++	case 38: *value = 1; break;                                     /* NR_CORE_GROUPS */
++	case 39: *value = hw.tls_alloc; break;
++	case 40: *value = hw.afbc; break;
++	case 41:                                                        /* SYSTEM_TIMESTAMP */
++		if (!mali_up) {
++			return false;
++		}
++		*value = mr(GPU_TIMESTAMP_LO) | ((uint64_t)mr(GPU_TIMESTAMP_HI) << 32);
++		break;
++	case 42: *value = 26000000; break;                              /* the SoC's system counter */
++	case 43: *value = 1u << 1; break;                               /* ALLOWED_JM_CTX_PRIORITIES: medium */
++	case 44: *value = 31; break;                                    /* SELECTED_COHERENCY: none */
++	default:
++		return false;
++	}
++	return true;
++}
++
++bool sweet_mali_ready(void);
++bool
++sweet_mali_ready(void)
++{
++	return mali_up;
++}
++
++extern void SweetMaliStart(void);               /* iokit/Kernel/arm/SweetMali.cpp */
++
++/*
++ * The self test: chains of WRITE_VALUE jobs (genxml v6, as step 3) through the
++ * allocator, the page tables and the scheduler: one job, then 1000 queued at
++ * once, each writing its own index; how long they took and whether every value
++ * landed.
++ */
++#define ST_JOBS         1000
++
++static void
++mali_selftest(void)
++{
++	vm_offset_t page = 0;
++	uint64_t size = 64 * 4096, va, t0, t1, ns, seq = 0;
++	uint32_t bad = 0;
++
++	if (kmem_alloc(kernel_map, &page, size, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET MALI: self test: no memory\n");
++		return;
++	}
++	va = sweet_mali_va_alloc(size, false);
++	for (uint64_t o = 0; va && o < size; o += 4096) {
++		if (!sweet_mali_map(va + o, kpa((void *)(page + o)), SWEET_MALI_MAP_NOEXEC)) {
++			va = 0;
++		}
++	}
++	if (va == 0) {
++		printf("SWEET MALI: self test: no GPU address\n");
++		return;
++	}
++	sweet_mali_mapped(va, size);
++	/* jobs: 128 bytes each from +0; results: 8 bytes each from +0x20000 */
++	for (uint32_t i = 0; i < ST_JOBS; i++) {
++		uint32_t *job = (uint32_t *)(page + i * 128);
++
++		job[4] = 1 | (2u << 1) | (1u << 16);                    /* 64-bit descriptor, WRITE_VALUE, index 1 */
++		*(uint64_t *)&job[8] = va + 0x20000 + 8 * i;            /* payload: address */
++		job[10] = 7;                                            /* Immediate 64 */
++		*(uint64_t *)&job[12] = 0x5157ee0000000000ull | i;
++	}
++	g_flush((void *)page, size);
++	t0 = mach_absolute_time();
++	for (uint32_t i = 0; i < ST_JOBS; i++) {
++		seq = sweet_mali_submit(va + i * 128, 0);
++		if (i == 0) {
++			bool first = sweet_mali_wait(seq, 1000);
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			printf("SWEET MALI: self test: first job %s after %llu us\n", first ? "done" : "NOT DONE", ns / 1000);
++			t0 = mach_absolute_time();
++		}
++	}
++	bool done = sweet_mali_wait(seq, 5000);
++	t1 = mach_absolute_time();
++	g_flush((void *)page, size);
++	for (uint32_t i = 0; i < ST_JOBS; i++) {
++		if (((volatile uint64_t *)(page + 0x20000))[i] != (0x5157ee0000000000ull | i)) {
++			if (bad++ == 0) {
++				printf("SWEET MALI: self test: job %u wrote %#llx, exception status %#x\n", i,
++				    ((volatile uint64_t *)(page + 0x20000))[i], ((uint32_t *)(page + i * 128))[0]);
++			}
++		}
++	}
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	printf("SWEET MALI: self test: %u more jobs %s in %llu us (%llu us each), %u wrong values, %llu faults, %llu resets: %s\n",
++	    ST_JOBS - 1, done ? "done" : "NOT DONE", ns / 1000, ns / 1000 / (ST_JOBS - 1), bad, stat_faults, stat_resets,
++	    done && bad == 0 && stat_faults == 0 ? "PASSED (step 4 kernel core)" : "FAILED");
++	sweet_mali_unmap(va, size);
++	sweet_mali_va_free(va, size);
++}
++
++/* Step 4: with the domain on and the cores powered by step 2. */
++static void
++g_step4(void)
++{
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetgputrace", &mali_trace, sizeof(mali_trace));
++	read_features();
++	va_free_list[0].start = MALI_VA_START;
++	va_free_list[0].size = MALI_VA_END - MALI_VA_START;
++	va_free_count = 1;
++	lck_mtx_lock(&mali_lock);
++	pt_root = node_new(false);
++	mali_up = pt_root != NULL && hw_init("bring-up");
++	lck_mtx_unlock(&mali_lock);
++	printf("SWEET MALI: %s: GPU_ID %#x, shaders %#x, L2 %#x, tiler %#x, AS %#x, JS %#x, MMU %#x, coherency %#x, "
++	    "L2_MMU_CONFIG %#x, AS0 tables at %#llx\n", mali_up ? "up" : "bring-up FAILED", hw.gpu_id, hw.shader_lo, hw.l2, hw.tiler,
++	    hw.as_present, hw.js_present, hw.mmu_features, hw.coherency, mr(L2_MMU_CONFIG), pt_root ? kpa(pt_root->table) : 0);
++	if (!mali_up) {
++		return;
++	}
++	if (kernel_thread_start(mali_scheduler, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	mali_selftest();
++	SweetMaliStart();
++}
++
+ /* Write mask to a PWRON register, wait up to ~1 s for it in the READY register. */
+ static bool
+ g_power(const char *what, uint32_t pwron, uint32_t ready, uint32_t mask)
+@@ -318,8 +1123,10 @@ g_thread(void *arg, wait_result_t result)
+ 	    g_power("tiler", TILER_PWRON, TILER_READY, tiler) &&
+ 	    g_power("shader", SHADER_PWRON, SHADER_READY, shader)) {
+ 		printf("SWEET GPU: all cores powered (step 2 done)\n");
+-		if (level >= 3) {
++		if (level == 3) {
+ 			g_step3(shader);
++		} else if (level >= 4) {
++			g_step4();
+ 		}
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+new file mode 100644
+index 0000000..8e1b7bf
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -0,0 +1,824 @@
++/*
++ * The Galaxy A8's Mali-G71 (bsd/dev/sweet_a8gpu.c, sweetgpu=4) for programs to draw with: step 4
++ * of docs/GPU_JACKPOTLTE.md. Ported from y2sios' RedwoodMali.cpp (stormtroopxyz/y2sios, MIT; on
++ * HackiOS, MIT). The service and user client keep that port's names, RedwoodMali and
++ * RedwoodMaliUserClient, and its request numbers, so its userland (the redwood-drm libdrm stand-in
++ * inside Mesa's panfrost) works unchanged.
++ *
++ * A program speaks the interface of Linux's panfrost DRM driver (Mesa 25.0.7: version 1.3): every
++ * request is a call of the user client with the request's number as the selector and its structure
++ * passed in and back.
++ *
++ *   panfrost   SUBMIT, WAIT_BO, CREATE_BO, MMAP_BO, GET_PARAM, GET_BO_OFFSET, MADVISE, SET_LABEL_BO
++ *   drm        GEM_CLOSE, SYNCOBJ_CREATE / DESTROY / WAIT / RESET / SIGNAL
++ *   ours       0x7b / 0x7c a syncobj's fence set / read, 0x7d counters
++ *              (0x7e IOSurface import and 0x7f show are not here yet: step 7)
++ *
++ * A buffer's memory is the client memory of the type that is its handle (what Linux does with mmap()
++ * on the device). Buffers are wired, zeroed and write-combined; the GPU's mappings are not cached
++ * and its caches are cleaned and invalidated around every job. All clients share the GPU's one
++ * address space; a fence is a job's sequence number, and jobs run in submission order.
++ */
++
++#if defined(SWEET_JACKPOTLTE)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
++
++extern "C" {
++/* bsd/dev/sweet_a8gpu.c */
++#define SWEET_MALI_MAP_NOEXEC   0x1
++bool sweet_mali_ready(void);
++void sweet_mali_share_completed(volatile uint64_t *where);
++bool sweet_mali_param(uint32_t param, uint64_t *value);
++uint64_t sweet_mali_va_alloc(uint64_t size, bool exec);
++void sweet_mali_va_free(uint64_t va, uint64_t size);
++bool sweet_mali_map(uint64_t va, uint64_t pa, uint32_t flags);
++void sweet_mali_mapped(uint64_t va, uint64_t size);
++void sweet_mali_unmap(uint64_t va, uint64_t size);
++uint64_t sweet_mali_submit(uint64_t jc, uint32_t requirements);
++bool sweet_mali_done(uint64_t seqno);
++bool sweet_mali_wait(uint64_t seqno, uint64_t milliseconds);
++uint64_t sweet_mali_last(void);
++void sweet_mali_counts(uint64_t *jobs, uint64_t *faults, uint64_t *resets, uint64_t *last);
++void sweet_mali_to_memory(const void *start, uint64_t size);
++void SweetMaliStart(void);
++}
++
++/* Linux's include/uapi/drm/panfrost_drm.h and drm.h: request numbers (DRM_COMMAND_BASE 0x40) */
++enum {
++	kDrmGemClose            = 0x09,
++	kDrmSyncobjCreate       = 0xbf,
++	kDrmSyncobjDestroy      = 0xc0,
++	kDrmSyncobjWait         = 0xc3,
++	kDrmSyncobjReset        = 0xc4,
++	kDrmSyncobjSignal       = 0xc5,
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBo         = 0x41,
++	kPanfrostCreateBo       = 0x42,
++	kPanfrostMmapBo         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBoOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kPanfrostSetLabelBo     = 0x49,
++	kRedwoodSyncobjSet      = 0x7b,
++	kRedwoodSyncobjGet      = 0x7c,
++	kRedwoodMaliCounts      = 0x7d,
++};
++
++struct drm_panfrost_submit {
++	uint64_t jc, in_syncs;
++	uint32_t in_sync_count, out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count, requirements;
++	uint32_t jm_ctx_handle, pad;            /* (newer than Mesa 25.0.7, which passes 48 bytes) */
++};
++/* SUBMIT as redwood-drm sends it: Linux's request, then where the job's sequence number is written back */
++struct redwood_mali_submit_ex {
++	struct drm_panfrost_submit submit;
++	uint64_t seqno;
++};
++struct drm_panfrost_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++struct drm_panfrost_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++struct drm_panfrost_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++struct drm_panfrost_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++struct drm_panfrost_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++struct drm_panfrost_madvise {
++	uint32_t handle, madv, retained;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct drm_syncobj_create {
++	uint32_t handle, flags;
++};
++struct drm_syncobj_destroy {
++	uint32_t handle, pad;
++};
++struct drm_syncobj_wait {
++	uint64_t handles;
++	int64_t timeout_nsec;
++	uint32_t count_handles, flags, first_signaled, pad;
++	uint64_t deadline_nsec;
++};
++struct drm_syncobj_array {
++	uint64_t handles;
++	uint32_t count_handles, pad;
++};
++struct redwood_syncobj_fence {
++	uint32_t handle, pad;
++	uint64_t fence;
++};
++struct redwood_mali_counts {
++	uint64_t jobs, faults, resets, last;
++};
++
++#define PANFROST_BO_NOEXEC              1
++#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL 1
++
++#define MALI_BUFFERS            8192            /* a client's, at most */
++#define MALI_BUFFER_MAX         (512ull << 20)
++#define MALI_SYNCOBJS           1024
++#define MALI_SUBMIT_BOS         16384
++#define MALI_PATIENCE_MS        5000            /* for a wait without a limit */
++#define MALI_LEFT               256
++
++static IOLock * gMaliLock;
++
++/* How long from now an absolute time of the caller's (CLOCK_MONOTONIC: mach_continuous_time here) is, in ms. */
++static uint64_t
++millisecondsUntil(int64_t when)
++{
++	uint64_t now;
++	int64_t left;
++
++	if (when <= 0) {
++		return 0;
++	}
++	if (when == INT64_MAX) {
++		return MALI_PATIENCE_MS;
++	}
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when - (int64_t) now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t) left / NSEC_PER_MSEC > MALI_PATIENCE_MS ? MALI_PATIENCE_MS : ((uint64_t) left + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC;
++}
++
++class RedwoodMali : public IOService
++{
++	OSDeclareDefaultStructors(RedwoodMali);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodMali, IOService);
++
++bool
++RedwoodMali::start(IOService * provider)
++{
++	uint64_t id = 0;
++
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	sweet_mali_param(0, &id);
++	setProperty(kIOUserClientClassKey, "RedwoodMaliUserClient");
++	setProperty("GPUProductID", id, 32);
++	setName("RedwoodMali");
++	registerService();
++	IOLog("SWEET MALI: service RedwoodMali ready (product %#llx); programs speak panfrost 1.3 to it\n", id);
++	return true;
++}
++
++void
++SweetMaliStart(void)
++{
++	IOService * provider = NULL;
++	RedwoodMali * gpu;
++
++	for (int i = 0; i < 100 && (provider = IOService::getPlatform()) == NULL; i++) {
++		IOSleep(100);
++	}
++	gMaliLock = IOLockAlloc();
++	gpu = OSTypeAlloc(RedwoodMali);
++	if (gpu == NULL || provider == NULL || gMaliLock == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("SWEET MALI: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("SWEET MALI: the service did not start\n");
++	}
++	gpu->release();
++}
++
++struct mali_buffer {
++	IOMemoryDescriptor *    memory;         /* NULL: this handle is free */
++	uint64_t                address, size;
++	uint32_t                flags;
++	uint64_t                fence;          /* the last job that names it */
++};
++
++/* A buffer given back while the GPU may still use it: kept until its job is done. */
++struct mali_left {
++	IOMemoryDescriptor *    memory;
++	uint64_t                address, size, fence;
++};
++
++class RedwoodMaliUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(RedwoodMaliUserClient);
++
++	struct mali_buffer *    fBuffers;       /* handle n is fBuffers[n - 1] */
++	uint64_t *              fSyncobjs;      /* handle n: fSyncobjs[n - 1], the fence (0: signalled); ~0: free */
++	uint32_t                fNextBuffer;
++	uint32_t                fBufferCount;
++	uint64_t                fBufferBytes;
++	uint32_t                fSubmits;
++	struct mali_left        fLeft[MALI_LEFT];
++	uint32_t                fLeftCount;
++	int32_t                 fPid;
++	char                    fName[20];
++
++	struct mali_buffer * buffer(uint32_t handle);
++	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t size, uint32_t mapFlags, uint32_t * handle);
++	void dropMapping(uint64_t address, uint64_t size);
++	void freeBuffer(struct mali_buffer * b);
++	void reap(bool wait);
++	uint64_t * syncobj(uint32_t handle);
++	IOReturn createBo(struct drm_panfrost_create_bo * request);
++	IOReturn submit(struct drm_panfrost_submit * request, size_t size);
++	IOReturn syncobjWait(struct drm_syncobj_wait * request);
++	IOReturn syncobjArray(struct drm_syncobj_array * request);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodMaliUserClient, IOUserClient);
++
++bool
++RedwoodMaliUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		return false;
++	}
++	fPid = proc_selfpid();
++	proc_selfname(fName, sizeof(fName));
++	return true;
++}
++
++bool
++RedwoodMaliUserClient::start(IOService * provider)
++{
++	if (!sweet_mali_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++	fSyncobjs = IONew(uint64_t, MALI_SYNCOBJS);
++	if (fBuffers == NULL || fSyncobjs == NULL) {
++		return false;
++	}
++	for (uint32_t i = 0; i < MALI_SYNCOBJS; i++) {
++		fSyncobjs[i] = ~0ULL;
++	}
++	IOLog("SWEET MALI: %s[%d] opened the GPU\n", fName, fPid);
++	return true;
++}
++
++struct mali_buffer *
++RedwoodMaliUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++uint64_t *
++RedwoodMaliUserClient::syncobj(uint32_t handle)
++{
++	if (handle == 0 || handle > MALI_SYNCOBJS || fSyncobjs[handle - 1] == ~0ULL) {
++		return NULL;
++	}
++	return &fSyncobjs[handle - 1];
++}
++
++/* A handle and GPU addresses for size bytes of a memory descriptor (wired; whole pages). With the lock held. */
++struct mali_buffer *
++RedwoodMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t size, uint32_t mapFlags, uint32_t * handle)
++{
++	struct mali_buffer * b = NULL;
++	bool mapped = true;
++	uint64_t address;
++
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (address = sweet_mali_va_alloc(size, !(mapFlags & SWEET_MALI_MAP_NOEXEC))) == 0) {
++		IOLog("SWEET MALI: no %s left for a buffer of %llu bytes\n", b ? "GPU addresses" : "handles", size);
++		return NULL;
++	}
++	for (uint64_t offset = 0; offset < size && mapped;) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		if (phys == 0 || length == 0) {
++			mapped = false;
++			break;
++		}
++		/* a physical run, a 4 KB page of the GPU's at a time */
++		for (uint64_t done = 0; done < length && offset < size && mapped; done += 4096, offset += 4096) {
++			mapped = sweet_mali_map(address + offset, phys + done, mapFlags);
++		}
++	}
++	sweet_mali_mapped(address, size);
++	if (!mapped) {
++		sweet_mali_unmap(address, size);
++		sweet_mali_va_free(address, size);
++		IOLog("SWEET MALI: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	bzero(b, sizeof(*b));
++	b->address = address;
++	b->size = size;
++	b->flags = mapFlags;
++	fBufferCount++;
++	fBufferBytes += size;
++	return b;
++}
++
++void
++RedwoodMaliUserClient::dropMapping(uint64_t address, uint64_t size)
++{
++	sweet_mali_unmap(address, size);
++	sweet_mali_va_free(address, size);
++}
++
++/* With the lock held. A buffer the GPU may still be using is left until it is done. */
++void
++RedwoodMaliUserClient::freeBuffer(struct mali_buffer * b)
++{
++	bool busy = b->fence != 0 && !sweet_mali_done(b->fence);
++
++	if (busy && fLeftCount == MALI_LEFT) {
++		reap(true);
++		busy = b->fence != 0 && !sweet_mali_done(b->fence);
++	}
++	if (busy && fLeftCount < MALI_LEFT) {
++		struct mali_left * left = &fLeft[fLeftCount++];
++
++		left->memory = b->memory;
++		left->address = b->address;
++		left->size = b->size;
++		left->fence = b->fence;
++	} else {
++		if (busy) {
++			/* (the GPU has stopped answering: its memory stays the GPU's for good) */
++			b->memory->retain();
++			IOLog("SWEET MALI: the GPU is not done with a buffer of %llu bytes: it stays the GPU's\n", b->size);
++		} else {
++			dropMapping(b->address, b->size);
++		}
++		b->memory->release();
++	}
++	b->memory = NULL;
++	fBufferCount--;
++	fBufferBytes -= b->size;
++}
++
++/* With the lock held: the buffers given back early that the GPU is done with now (all of them, if wait). */
++void
++RedwoodMaliUserClient::reap(bool wait)
++{
++	for (uint32_t i = 0; i < fLeftCount;) {
++		struct mali_left * left = &fLeft[i];
++
++		if (wait && !sweet_mali_done(left->fence)) {
++			IOLockUnlock(gMaliLock);
++			sweet_mali_wait(left->fence, 2000);
++			IOLockLock(gMaliLock);
++		}
++		if (!sweet_mali_done(left->fence)) {
++			i++;
++			continue;
++		}
++		dropMapping(left->address, left->size);
++		left->memory->release();
++		*left = fLeft[--fLeftCount];
++	}
++}
++
++IOReturn
++RedwoodMaliUserClient::clientClose(void)
++{
++	IOLockLock(gMaliLock);
++	if (fBuffers != NULL) {
++		sweet_mali_wait(sweet_mali_last(), 2000);
++		for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		reap(true);
++	}
++	IOLockUnlock(gMaliLock);
++	IOLog("SWEET MALI: %s[%d] closed the GPU after %u submits\n", fName, fPid, fSubmits);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++RedwoodMaliUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++	}
++	if (fSyncobjs != NULL) {
++		IODelete(fSyncobjs, uint64_t, MALI_SYNCOBJS);
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++RedwoodMaliUserClient::createBo(struct drm_panfrost_create_bo * request)
++{
++	uint64_t size = round_page_64(request->size);
++	IOBufferMemoryDescriptor * memory;
++	struct mali_buffer * b;
++	uint32_t mapFlags = (request->flags & PANFROST_BO_NOEXEC) ? SWEET_MALI_MAP_NOEXEC : 0;
++
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* PANFROST_BO_HEAP (the tiler's heap) grows on GPU page faults under Linux; here it is all there from the start. */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("SWEET MALI: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
++		    fBufferBytes >> 20);
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gMaliLock);
++	b = newBuffer(memory, size, mapFlags, &request->handle);
++	if (b != NULL) {
++		b->memory = memory;
++		request->offset = b->address;
++	}
++	IOLockUnlock(gMaliLock);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++RedwoodMaliUserClient::submit(struct drm_panfrost_submit * request, size_t size)
++{
++	uint32_t * handles = NULL;
++	uint32_t count = request->bo_handle_count;
++	uint64_t fence;
++	uint64_t * out;
++
++	if (size < offsetof(struct drm_panfrost_submit, jm_ctx_handle) || request->jc == 0 || count > MALI_SUBMIT_BOS) {
++		return kIOReturnBadArgument;
++	}
++	if (count != 0) {
++		handles = IONew(uint32_t, count);
++		if (handles == NULL) {
++			return kIOReturnNoMemory;
++		}
++		if (copyin((user_addr_t) request->bo_handles, handles, count * sizeof(uint32_t)) != 0) {
++			IODelete(handles, uint32_t, count);
++			return kIOReturnVMError;
++		}
++	}
++	IOLockLock(gMaliLock);
++	sweet_mali_to_memory(NULL, 0);                  /* the program's writes to memory first: a barrier */
++	fence = sweet_mali_submit(request->jc, request->requirements);
++	if (fence != 0) {
++		for (uint32_t i = 0; i < count; i++) {
++			struct mali_buffer * b = buffer(handles[i]);
++
++			if (b != NULL) {
++				b->fence = fence;
++			}
++		}
++		if (request->out_sync != 0 && (out = syncobj(request->out_sync)) != NULL) {
++			*out = fence;
++		}
++		if (size >= sizeof(struct redwood_mali_submit_ex)) {
++			((struct redwood_mali_submit_ex *) request)->seqno = fence;
++		}
++	}
++	reap(false);
++	if (fSubmits++ < 4) {
++		IOLog("SWEET MALI: %s job %llu: chain %#llx, %u buffers, requirements %#x\n", fName, fence, request->jc, count,
++		    request->requirements);
++	}
++	IOLockUnlock(gMaliLock);
++	if (handles != NULL) {
++		IODelete(handles, uint32_t, count);
++	}
++	return fence != 0 ? kIOReturnSuccess : kIOReturnNotReady;
++}
++
++IOReturn
++RedwoodMaliUserClient::syncobjWait(struct drm_syncobj_wait * request)
++{
++	uint32_t count = request->count_handles, handles[64];
++	uint64_t fences[64], patience = millisecondsUntil(request->timeout_nsec), began = mach_absolute_time(), now;
++	bool all = request->flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
++
++	if (count == 0 || count > 64 || copyin((user_addr_t) request->handles, handles, count * sizeof(uint32_t)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; i < count; i++) {
++		uint64_t * s = syncobj(handles[i]);
++
++		if (s == NULL) {
++			IOLockUnlock(gMaliLock);
++			return kIOReturnBadArgument;
++		}
++		fences[i] = *s;
++	}
++	IOLockUnlock(gMaliLock);
++	for (;;) {
++		uint32_t done = 0;
++
++		for (uint32_t i = 0; i < count; i++) {
++			if (fences[i] == 0 || sweet_mali_done(fences[i])) {
++				if (done++ == 0) {
++					request->first_signaled = i;
++				}
++			}
++		}
++		if (all ? done == count : done != 0) {
++			return kIOReturnSuccess;
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
++		if (now / NSEC_PER_MSEC >= patience) {
++			static uint32_t told;
++
++			if (told++ < 16) {
++				IOLog("SWEET MALI: a wait gave up after %llu ms (patience %llu, timeout %lld): %u fence(s), the first %llu, "
++				    "the last submitted %llu\n", now / NSEC_PER_MSEC, patience, (long long) request->timeout_nsec, count,
++				    fences[0], sweet_mali_last());
++			}
++			return kIOReturnTimeout;
++		}
++		/* jobs complete in order, so waiting for the latest covers the others */
++		uint64_t latest = 0;
++
++		for (uint32_t i = 0; i < count; i++) {
++			latest = fences[i] > latest ? fences[i] : latest;
++		}
++		sweet_mali_wait(all ? latest : fences[0], patience - now / NSEC_PER_MSEC);
++	}
++}
++
++/* Reset (no fence: unsignalled) and signal are the same here: nothing to wait for. */
++IOReturn
++RedwoodMaliUserClient::syncobjArray(struct drm_syncobj_array * request)
++{
++	uint32_t handles[64], count = request->count_handles;
++
++	if (count == 0 || count > 64 || copyin((user_addr_t) request->handles, handles, count * sizeof(uint32_t)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; i < count; i++) {
++		uint64_t * s = syncobj(handles[i]);
++
++		if (s != NULL) {
++			*s = 0;
++		}
++	}
++	IOLockUnlock(gMaliLock);
++	return kIOReturnSuccess;
++}
++
++/*
++ * Client memory type 0 (never a buffer's handle): one page every client may read, with the GPU's
++ * completed job count in its first 8 bytes. Made at the first request and kept.
++ */
++static IOBufferMemoryDescriptor * gMaliStatus;
++
++static IOMemoryDescriptor *
++statusPage(void)
++{
++	if (gMaliStatus == NULL) {
++		IOBufferMemoryDescriptor * page = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, PAGE_SIZE, PAGE_SIZE);
++
++		if (page == NULL) {
++			return NULL;
++		}
++		bzero(page->getBytesNoCopy(), PAGE_SIZE);
++		gMaliStatus = page;
++		sweet_mali_share_completed((volatile uint64_t *) page->getBytesNoCopy());
++	}
++	return gMaliStatus;
++}
++
++IOReturn
++RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gMaliLock);
++	if (type == 0) {
++		IOMemoryDescriptor * page = statusPage();
++
++		if (page != NULL) {
++			page->retain();
++			*memory = page;
++			*options = kIOMapReadOnly;
++			ret = kIOReturnSuccess;
++		}
++		IOLockUnlock(gMaliLock);
++		return ret;
++	}
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gMaliLock);
++	return ret;
++}
++
++IOReturn
++RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct drm_panfrost_submit submit;
++		struct redwood_mali_submit_ex submitEx;
++		struct drm_panfrost_wait_bo waitBo;
++		struct drm_panfrost_create_bo createBo;
++		struct drm_panfrost_mmap_bo mmapBo;
++		struct drm_panfrost_get_param param;
++		struct drm_panfrost_get_bo_offset boOffset;
++		struct drm_panfrost_madvise madvise;
++		struct drm_gem_close close;
++		struct drm_syncobj_create syncCreate;
++		struct drm_syncobj_destroy syncDestroy;
++		struct drm_syncobj_wait syncWait;
++		struct drm_syncobj_array syncArray;
++		struct redwood_syncobj_fence syncFence;
++		struct redwood_mali_counts counts;
++	} r;
++	size_t size = args->structureInputSize;
++	struct mali_buffer * b;
++	uint64_t * s;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!sweet_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	switch (selector) {
++	case kPanfrostGetParam:
++		ret = sweet_mali_param(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kPanfrostCreateBo:
++		ret = createBo(&r.createBo);
++		break;
++	case kPanfrostMmapBo:                           /* (mapped by handle: client memory of that type) */
++	case kPanfrostGetBoOffset:
++		IOLockLock(gMaliLock);
++		b = buffer(r.boOffset.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else if (selector == kPanfrostMmapBo) {
++			r.mmapBo.offset = (uint64_t) r.mmapBo.handle << 32;
++		} else {
++			r.boOffset.offset = b->address;
++		}
++		IOLockUnlock(gMaliLock);
++		break;
++	case kPanfrostWaitBo: {
++		uint64_t fence = 0;
++
++		IOLockLock(gMaliLock);
++		b = buffer(r.waitBo.handle);
++		if (b != NULL) {
++			fence = b->fence;
++		}
++		IOLockUnlock(gMaliLock);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else if (fence != 0 && !sweet_mali_wait(fence, millisecondsUntil(r.waitBo.timeout_ns))) {
++			ret = kIOReturnTimeout;
++		}
++		break;
++	}
++	case kPanfrostSubmit:
++		ret = submit(&r.submit, size);
++		break;
++	case kPanfrostMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kPanfrostSetLabelBo:
++		break;
++	case kDrmGemClose:
++		IOLockLock(gMaliLock);
++		b = buffer(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			freeBuffer(b);
++			reap(false);
++		}
++		IOLockUnlock(gMaliLock);
++		break;
++	case kDrmSyncobjCreate:
++		ret = kIOReturnNoResources;
++		IOLockLock(gMaliLock);
++		for (uint32_t i = 0; i < MALI_SYNCOBJS; i++) {
++			if (fSyncobjs[i] == ~0ULL) {
++				fSyncobjs[i] = 0;               /* signalled or not, there is nothing to wait for yet */
++				r.syncCreate.handle = i + 1;
++				ret = kIOReturnSuccess;
++				break;
++			}
++		}
++		IOLockUnlock(gMaliLock);
++		break;
++	case kDrmSyncobjDestroy:
++		IOLockLock(gMaliLock);
++		if ((s = syncobj(r.syncDestroy.handle)) != NULL) {
++			*s = ~0ULL;
++		} else {
++			ret = kIOReturnBadArgument;
++		}
++		IOLockUnlock(gMaliLock);
++		break;
++	case kDrmSyncobjWait:
++		ret = syncobjWait(&r.syncWait);
++		break;
++	case kDrmSyncobjReset:
++	case kDrmSyncobjSignal:
++		ret = syncobjArray(&r.syncArray);
++		break;
++	case kRedwoodSyncobjSet:
++	case kRedwoodSyncobjGet:
++		IOLockLock(gMaliLock);
++		if ((s = syncobj(r.syncFence.handle)) == NULL) {
++			ret = kIOReturnBadArgument;
++		} else if (selector == kRedwoodSyncobjSet) {
++			*s = r.syncFence.fence;
++		} else {
++			r.syncFence.fence = *s;
++		}
++		IOLockUnlock(gMaliLock);
++		break;
++	case kRedwoodMaliCounts:
++		sweet_mali_counts(&r.counts.jobs, &r.counts.faults, &r.counts.resets, &r.counts.last);
++		break;
++	default:
++		IOLog("SWEET MALI: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t) size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetMali.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
