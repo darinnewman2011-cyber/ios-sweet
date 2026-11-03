@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..94e0b02 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,13 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/*
++ * boot-arg sweetfb_noconsole=N: stop drawing console text over the GUI from
++ * swap N on (1 = the first swap). On the A8 the boot logo comes long before
++ * SpringBoard is ready, so a count such as 30 keeps the text during boot and
++ * hides it once the GUI animates (the lock screen fading in).
++ */
++static uint32_t sweet_fb_quiet_after __attribute__((unused));
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -194,6 +201,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	PE_parse_boot_argn("sweetfb_noconsole", &sweet_fb_quiet_after, sizeof(sweet_fb_quiet_after));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+@@ -306,6 +314,12 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
++	if (sweet_fb_quiet_after && !sweet_console_muted && sweet_fb_swap_count >= sweet_fb_quiet_after) {
++		/* Not PE_initialize_console(kPEDisableScreen): its console switch
++		 * writes the read-only-late cons_ops_index and panics. */
++		sweet_console_muted = 1;
++		IOLog("SWEET FB: console text hidden after %llu swaps\n", sweet_fb_swap_count);
++	}
+ }
+ 
+ void
+@@ -314,16 +328,6 @@ AppleCLCD::present(const uint8_t *rec)
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+ 
+-	if (!fConsolePaused) {
+-		int quiet = 0;
+-		fConsolePaused = true;
+-		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+-			 * writes the read-only-late cons_ops_index and panics. */
+-			sweet_console_muted = 1;
+-		}
+-	}
+-
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;

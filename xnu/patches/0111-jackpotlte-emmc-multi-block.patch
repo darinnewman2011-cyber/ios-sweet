@@ -1,0 +1,252 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6d7b0c3..d77e3ff 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -376,6 +376,7 @@ static struct {
+ 	uint64_t wbad, rbad, zero, bad_lba;     /* write verification, see file_write_verified() */
+ 	uint64_t bad_want, bad_got;             /* first 8 bytes sent / read back at bad_lba */
+ 	uint64_t dirty;                         /* FIFO not empty after reset (write refused) */
++	uint64_t multi, mfail, mbad;            /* multi-sector commands, failed ones, write runs that read back wrong */
+ 	uint32_t where, a, b;
+ 	int err;
+ } wst;
+@@ -509,14 +510,14 @@ mmc_wait_tran(uint64_t lba)
+ #define INT_HTO                 (1u << 10)
+ #define MMC_WR_ERROR            (INT_ERROR & ~INT_HTO)
+ 
+-/* Push the rest of the 128 words of src into the FIFO, as far as it has room. */
++/* Push the rest of src (words 32-bit words) into the FIFO, as far as it has room. */
+ static void
+-mmc_fifo_fill(const uint32_t *src, uint32_t *np)
++mmc_fifo_fill(const uint32_t *src, uint32_t *np, uint32_t words)
+ {
+ 	uint32_t n = *np;
+ 
+ 	/* A 64-bit FIFO takes whole 64-bit entries (Linux dw_mmc: writeq). */
+-	while (n < 128 && !(ufs_rd(MMC_STATUS) & STATUS_FIFO_FULL)) {
++	while (n < words && !(ufs_rd(MMC_STATUS) & STATUS_FIFO_FULL)) {
+ 		if (mmc_fifo64) {
+ 			*(volatile uint64_t *)(su.regs + MMC_FIFO) = ((uint64_t)src[n + 1] << 32) | src[n];
+ 			n += 2;
+@@ -564,7 +565,7 @@ mmc_write_sector(uint64_t lba, const uint32_t *src)
+ 	for (;;) {
+ 		uint32_t r = ufs_rd(MMC_RINTSTS);
+ 
+-		mmc_fifo_fill(src, &n);
++		mmc_fifo_fill(src, &n, 128);
+ 		ufs_wr(MMC_RINTSTS, INT_TXDR | INT_HTO);
+ 		if (r & MMC_WR_ERROR) {
+ 			printf("SWEET MMC: write 0x%llx: rintsts 0x%x after %u words\n", lba, r, n);
+@@ -581,6 +582,101 @@ mmc_write_sector(uint64_t lba, const uint32_t *src)
+ 	return mmc_wait_tran(lba);
+ }
+ 
++/*
++ * CMD18 / CMD25: n sectors (up to MMC_MULTI_MAX) in one command, the
++ * controller sending CMD12 after the last block (SEND_STOP, as Linux dw_mmc
++ * does without CMD23). One command per sector kept the root at ~1 MB/s: every
++ * sector paid a FIFO reset, a command and, for writes, the card programming a
++ * lone sector plus CMD13 polling. On any error the transfer is stopped with
++ * CMD12 and the caller redoes the range one sector at a time.
++ */
++#define CMD_STOP_ABORT          (1u << 14)
++#define CMD_SEND_STOP           (1u << 12)
++#define INT_ACD                 (1u << 14)      /* auto CMD12 done */
++#define MMC_RESP1       0x034                   /* auto CMD12 response */
++#define MMC_MULTI_MAX   128u                    /* 64 KiB per command */
++
++static void
++mmc_abort(void)
++{
++	uint32_t resp = 0;
++
++	(void)mmc_cmd(12, 0, CMD_RESP_EXP | CMD_RESP_CRC | CMD_STOP_ABORT, &resp);
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
++	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
++	(void)mmc_wait(MMC_STATUS, STATUS_BUSY, 0, MMC_DATA_NS);
++}
++
++static int
++mmc_xfer_multi(uint64_t lba, uint32_t n, uint32_t *buf, bool write)
++{
++	uint32_t st, resp = 0, words = n * (UFS_BLOCK / 4), w = 0, r = 0;
++	uint64_t deadline;
++
++	if (n < 2 || n > MMC_MULTI_MAX || lba + n - 1 > UINT32_MAX) {
++		return EINVAL;
++	}
++	if (write && (lba < mmc_wr_lo || lba + n > mmc_wr_hi)) {
++		printf("SWEET MMC: refusing write of %u at 0x%llx (writable 0x%llx-0x%llx)\n", n, lba, mmc_wr_lo, mmc_wr_hi);
++		return wst_fail(EPERM, 1, lba, n, 0);
++	}
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
++	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
++	if (!mmc_wait(MMC_STATUS, STATUS_FCNT_MASK | STATUS_FIFO_EMPTY, STATUS_FIFO_EMPTY, 10 * NSEC_PER_MSEC)) {
++		wst.dirty += write;
++		return EIO;
++	}
++	ufs_wr(MMC_BLKSIZ, 512);
++	ufs_wr(MMC_BYTCNT, n * 512);
++	st = mmc_cmd(write ? 25 : 18, (uint32_t)lba, CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_PRV_DAT_WAIT |
++	    CMD_SEND_STOP | (write ? CMD_READ_WRITE : 0), &resp);
++	if (st == UINT32_MAX || (st & MMC_WR_ERROR) || (resp & R1_ERRORS)) {
++		r = st;
++		goto fail;
++	}
++	nanoseconds_to_absolutetime(4 * MMC_DATA_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t s = ufs_rd(MMC_STATUS);
++		r = ufs_rd(MMC_RINTSTS);
++		if (write) {
++			mmc_fifo_fill(buf, &w, words);
++			ufs_wr(MMC_RINTSTS, INT_TXDR | INT_HTO);
++		} else {
++			for (uint32_t c = STATUS_FCNT(s); c && w < words; c--) {
++				buf[w++] = ufs_rd(MMC_FIFO);
++				if (mmc_fifo64) {
++					buf[w++] = ufs_rd(MMC_FIFO + 4);
++				}
++			}
++			/* HTO on a read: the FIFO was full and the card clock stopped until it was drained. */
++			ufs_wr(MMC_RINTSTS, INT_RXDR | INT_HTO);
++		}
++		if (r & MMC_WR_ERROR) {
++			goto fail;
++		}
++		if ((r & INT_DATA_OVER) && w >= words) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			goto fail;
++		}
++	}
++	if (!mmc_wait(MMC_RINTSTS, INT_ACD, INT_ACD, MMC_CMD_NS) || (ufs_rd(MMC_RESP1) & R1_ERRORS)) {
++		r = ufs_rd(MMC_RINTSTS);
++		resp = ufs_rd(MMC_RESP1);
++		goto fail;
++	}
++	return write ? mmc_wait_tran(lba) : 0;
++fail:
++	if (!wst.mfail++) {
++		printf("SWEET MMC: CMD%u of %u at 0x%llx failed: rintsts 0x%x r1 0x%x, %u words; retrying per sector\n",
++		    write ? 25 : 18, n, lba, r, resp, w);
++	}
++	mmc_abort();
++	return EIO;
++}
++
+ /* count sectors at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -848,7 +944,8 @@ file_fully_written(void)
+  */
+ #define WRITE_TRIES     3
+ 
+-static uint32_t wverify[UFS_BLOCK / 4] __attribute__((aligned(64)));
++static uint32_t wverify[MMC_MULTI_MAX * UFS_BLOCK / 4] __attribute__((aligned(64)));
++static uint32_t root_verify = 1;                /* boot-arg sweetrootverify=0: no read-back */
+ 
+ static bool
+ sector_equal(const uint32_t *a, const uint32_t *b)
+@@ -872,7 +969,7 @@ file_write_verified(uint64_t dev, const uint32_t *src)
+ {
+ 	for (int t = 0; t < WRITE_TRIES; t++) {
+ 		int error = mmc_write_sector(dev, src);
+-		if (error) {
++		if (error || !root_verify) {
+ 			return error;
+ 		}
+ 		error = mmc_read_sector(dev, wverify);
+@@ -922,13 +1019,34 @@ file_write_blocks(uint64_t lba, uint32_t count)
+ 			printf("SWEET ROOT: no block behind file sector 0x%llx, refusing write\n", lba);
+ 			return wst_fail(EIO, 8, lba, count, n);
+ 		}
+-		for (uint32_t i = 0; i < n; i++) {
+-			int error = file_write_verified(su.first_block + pba + i,
+-			    (const uint32_t *)(const void *)(b + i * UFS_BLOCK));
+-			if (error) {
+-				return error;
++		for (uint32_t i = 0; i < n;) {
++			uint64_t dev = su.first_block + pba + i;
++			uint32_t m = MIN(n - i, MMC_MULTI_MAX);
++			uint32_t *src = (uint32_t *)(uintptr_t)(b + i * UFS_BLOCK);
++
++			/* Whole run in one CMD25, read back with one CMD18; anything wrong: per sector. */
++			if (m > 1) {
++				wst.multi++;
++				if (mmc_xfer_multi(dev, m, src, true) == 0) {
++					if (!root_verify) {
++						goto run_ok;
++					}
++					if (mmc_xfer_multi(dev, m, wverify, false) == 0 &&
++					    memcmp(wverify, src, m * UFS_BLOCK) == 0) {
++						goto run_ok;
++					}
++					wst.mbad++;
++				}
+ 			}
+-			wst.ok++;
++			for (uint32_t j = 0; j < m; j++) {
++				int error = file_write_verified(dev + j, src + j * (UFS_BLOCK / 4));
++				if (error) {
++					return error;
++				}
++			}
++run_ok:
++			wst.ok += m;
++			i += m;
+ 		}
+ 		b += n * UFS_BLOCK;
+ 		lba += n;
+@@ -949,9 +1067,11 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		printf("SWEET ROOT: %llu sectors written, %llu failed; first failure err %d where %u at 0x%llx (%#x %#x); "
+ 		    "verify: %llu rewrites, %llu read glitches, %llu zero readbacks, first at 0x%llx "
+-		    "(sent %016llx got %016llx); %llu dirty FIFO\n",
++		    "(sent %016llx got %016llx); %llu dirty FIFO; %llu multi-sector writes, %llu commands failed, "
++		    "%llu runs read back wrong\n",
+ 		    wst.ok, wst.fail, wst.err, wst.where, wst.lba, wst.a, wst.b,
+-		    wst.wbad, wst.rbad, wst.zero, wst.bad_lba, wst.bad_want, wst.bad_got, wst.dirty);
++		    wst.wbad, wst.rbad, wst.zero, wst.bad_lba, wst.bad_want, wst.bad_got, wst.dirty,
++		    wst.multi, wst.mfail, wst.mbad);
+ 	}
+ }
+ 
+@@ -970,12 +1090,20 @@ file_read_blocks(uint64_t lba, uint32_t count)
+ 		if (pba == UINT64_MAX) {
+ 			bzero(b, n * UFS_BLOCK);
+ 		} else {
+-			for (uint32_t i = 0; i < n; i++) {
+-				int error = mmc_read_sector(su.first_block + pba + i,
+-				    (uint32_t *)(void *)(b + i * UFS_BLOCK));
+-				if (error) {
+-					return error;
++			for (uint32_t i = 0; i < n;) {
++				uint64_t dev = su.first_block + pba + i;
++				uint32_t m = MIN(n - i, MMC_MULTI_MAX);
++				uint32_t *dst = (uint32_t *)(void *)(b + i * UFS_BLOCK);
++
++				if (m < 2 || mmc_xfer_multi(dev, m, dst, false) != 0) {
++					for (uint32_t j = 0; j < m; j++) {
++						int error = mmc_read_sector(dev + j, dst + j * (UFS_BLOCK / 4));
++						if (error) {
++							return error;
++						}
++					}
+ 				}
++				i += m;
+ 			}
+ 		}
+ 		b += n * UFS_BLOCK;
+@@ -1563,7 +1691,9 @@ sweet_ufs_init(void)
+ 		mmc_wr_lo = su.first_block;
+ 		mmc_wr_hi = su.first_block + part_blocks;
+ 		su.writable = true;
+-		printf("SWEET ROOT: read-write in place: writes go only into the file's own %u extents\n", xf.nrun);
++		PE_parse_boot_argn("sweetrootverify", &root_verify, sizeof(root_verify));
++		printf("SWEET ROOT: read-write in place: writes go only into the file's own %u extents, read-back %s\n",
++		    xf.nrun, root_verify ? "on" : "off");
+ 		thread_t wt;
+ 		if (kernel_thread_start(wst_thread, NULL, &wt) == KERN_SUCCESS) {
+ 			thread_deallocate(wt);
