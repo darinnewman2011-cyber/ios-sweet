@@ -465,6 +465,17 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     * (tools/mesa/air-ir3.patch): the tool was lowering correctly while the two harnesses
     * that actually draw were not.
     */
+   /* Panfrost does the viewport transform in the vertex shader and runs
+    * nir_lower_viewport_transform in its own preprocessing, but that pass rewrites only a
+    * store_deref of gl_Position: after nir_lower_io below it finds nothing, the quad's
+    * corners reach the tiler as clip space, and only pixel (0,0) is covered (G9 M2 run 8,
+    * every pixel printed). air_metal.c's finalize_for_gallium has done this since
+    * 25 October; this copy never got it. Done here while the outputs are still variables.
+    */
+   if (nir->info.stage == MESA_SHADER_VERTEX && screen->caps.viewport_transform_lowered) {
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_lower_viewport_transform);
+   }
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
 
