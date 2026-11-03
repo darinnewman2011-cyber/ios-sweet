@@ -718,6 +718,22 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     - **Run 9 (`_tmp/m2i.cmd`, air_run 6cfc55a): render target 0 is bit-identical to softpipe on all 16 pixels for
       all 8 clear shaders (01-08), 0 faults. M2's single-target draw path works.** Render target 1 is still all
       zero on the Mali for every shader that has one (04-08), so that is a separate bug, still open (MRT).
+  - **G9 M3 run 1 (2026-11-03): Metal has a device on the A8.** Kernel **0127** (commit 3e4cab1, xnu run 41707992044,
+    `_tmp/a8art39`) publishes IOAcceleratorES "sgx" under RedwoodMali without the plug-in properties; with
+    `sweetmetal=1` user space may set them. gpu run 41708355388 (commit 43f0a64) builds y2sios' RedwoodMetal bundle,
+    metal_props, metal_test (`gpu/src`, paths /redwood -> /sweet). Installed by full image edit (`_tmp/g9-m3a.sh`,
+    `%TEMP%/edit5.sh`, after Settings > General > Shut Down): `/sweet/lib/RedwoodMetal.bundle`, symlink
+    `/System/Library/Extensions/RedwoodMetal.bundle`, `/sweet/bin/metal_{props,test}`, libredwoodair from that run.
+    Test image ios41 (`cadf838a…`, 0127, 550 MHz, `sweetmetal=1 sweetreboot=240`), runner `_tmp/m3a.cmd`, log
+    `_tmp/m3a-run.log`: before the switch `MTLCreateSystemDefaultDevice() = nil`; after `metal_props on`
+    **`MTLCreateSystemDefaultDevice() = RedwoodMetalDevice`**, `RedwoodMali client opened`, `the compiler library
+    Mali-G71 (Panfrost)`; switch off again at the end. backboardd stays on GL (it starts before the switch).
+    - Cosmetic: the device calls itself "Mali-G77 MP11 (product 0x6000, Redwood)" (y2sios' name string); its
+      `targetDeviceInfo` asks for `pipelines.Mali-G77MP11(...)`. To fix: name from GPU_ID (G71 MP2).
+    - Not Metal: CoreImage's default and software CIContexts SIGSEGV in this process before and after the switch;
+      CIContext over EAGL works (filter result correct).
+    - Next: y2sios' `metal_drv_test.m` (compute + render through real Metal calls), then a Metal consumer
+      (wallpaper / PosterBoard) with the properties set before launchd.
     - CI caveat: gpu.yml reports success when air_run fails to compile (c5f4c8b: two printf strings split across
       lines); the artifact then simply has no `air_run`. Check the file list, not the run's colour.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
