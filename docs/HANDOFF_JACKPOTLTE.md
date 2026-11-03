@@ -680,7 +680,10 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       (light) and 67.7 → 39.2 ms (heavy).
     - **747 MHz: not stable at 0.8 V** (ios38: 2860 jobs, 652 faults/resets; the self test still passed). Would need
       the voltage raised (DVFS), not attempted.
-    - Everyday image now `_tmp/a8-ios37-boot.img` (550, `b996a3d5…`). Test images: ios36 (550, back to TWRP after
+    - **ios37/ios39 were built WITHOUT `sweetreboot=0`**, and 0095's default is 90 s, so every boot of them went
+      back to TWRP at 90 s (looked like a hang at `calling bsd_init`: the boot thread's stage stays there in a
+      normal boot). Everyday images must carry `sweetreboot=0`, as ios31/ios35 did. **Everyday image now
+      `_tmp/a8-ios42-boot.img`** (0126 kernel, 550 MHz, `sweetreboot=0`, `115841d8…`); ios37 is retired. Test images: ios36 (550, back to TWRP after
       600 s) and **ios40 (550, `sweetreboot=240`, `38c48c29…`) for short runner tests**.
   - **M2 (draws) run 1 (`_tmp/m2a.cmd`, PANDECODE trace):** the vertex/tiler job of `clearFragment01` does not
     complete. The trace shows the hand-built quad vertex shader's renderer state with **"Attribute count: 0"**
