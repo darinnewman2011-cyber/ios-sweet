@@ -111,3 +111,20 @@ if ninja -C "$B/$BUILD" $P/air_run $P/libredwoodair.dylib $P/air_metal_test > "$
 else
 	echo "build.sh: the AIR programs did not build:"; grep -E "error|FAILED" "$B/air-build.log" | head -40
 fi
+
+# GPU step G9 (Metal), M3: the Metal runtime itself, y2sios' RedwoodMetal (userland/src/redwoodmetal.m and
+# redwooddrawable.m, MIT; paths /redwood -> /sweet). Metal opens /System/Library/Extensions/<MetalPluginName>.bundle
+# off the IOAcceleratorES service (xnu 0127); the bundle's executable is out/RedwoodMetal and its Info.plist
+# out/RedwoodMetal.Info.plist (flat, so the checksum step sees files). It dlopens /sweet/lib/libredwoodair.dylib.
+#   out/metal_props   sets / removes MetalPluginName and MetalPluginClassName (needs boot-arg sweetmetal=1)
+#   out/metal_test    prints the discovery chain and what MTLCreateSystemDefaultDevice() returns
+# Not fatal, like the AIR programs: each one is built on its own and a failure is printed.
+M3LOG="$B/metal-build.log"; : > "$M3LOG"
+m3() { local what=$1; shift; if "$CLANG" $TARGET -O2 "$@" >> "$M3LOG" 2>&1; then codesign -s - -f "out/$what" >> "$M3LOG" 2>&1; echo "build.sh: out/$what"; else echo "build.sh: $what did not build:"; grep -E "error" "$M3LOG" | tail -20 || true; fi; }
+m3 RedwoodMetal -bundle -Wno-deprecated-declarations -framework Foundation -framework IOKit -framework Metal -lobjc \
+	-o out/RedwoodMetal src/redwoodmetal.m src/redwooddrawable.m
+cp src/metal_plugin.plist out/RedwoodMetal.Info.plist
+m3 metal_props -framework CoreFoundation -framework IOKit -o out/metal_props src/metal_props.c
+m3 metal_test -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
+	-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES -lMobileGestalt \
+	-o out/metal_test src/metal_test.m

@@ -21,7 +21,7 @@ jobs:
         if: always()
         run: |
           cd gpu/out 2>/dev/null && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS || true
-          mkdir -p ../logs && cp ../build/meson-setup.log ../build/build-softpipe-panfrost/meson-logs/meson-log.txt ../build/air-build.log ../logs/ 2>/dev/null || true
+          mkdir -p ../logs && cp ../build/meson-setup.log ../build/build-softpipe-panfrost/meson-logs/meson-log.txt ../build/air-build.log ../build/metal-build.log ../logs/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
