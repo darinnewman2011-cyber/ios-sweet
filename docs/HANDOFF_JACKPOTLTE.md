@@ -636,6 +636,24 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     (CalcCubeInputScaling, GenerateMask, InitMinMax, InitSpanTable, MinMax, fbs_bistochastize_init, ...); every
     AV1SW kernel's written image reads back all zero (one -1): image stores / texture reads on Bifrost are the next
     thing to check. Runner reset to `noop.cmd`; ios31 back on BOOT.
+  - **M1 runs 2-6 (2026-11-03, test images ios32-34 with `sweetreboot`, normal image ios35 = 0125 kernel):**
+    - 0125 (commit 09befcc, xnu run 41652928396): `hw_init()` hard-resets the G71 (soft only as fallback). **Did not
+      change anything** (run 4): after any process's GPU fault the AV1SW Blit kernels still read back all zeros
+      instead of (0,0,0,1), even the image's pre-filled pattern is gone, and it lasts across processes.
+    - Run 5 (`_tmp/m1w.cmd`, `--zero` constants): **compute texture reads are correct.** MetalFaceMask_MinMax gives the
+      same texture-derived words as softpipe (47135, 17563, 0xffffc51a) before and after a fault; its one extra
+      word (128) is an out-of-bounds texelFetch (Mali 0, softpipe clamps; Metal leaves it undefined). The earlier
+      MinMax mismatch was the harness's dummy constants pushing coordinates off the 4x4 texture.
+    - Run 6 (`_tmp/m1v.cmd`, `PAN_MESA_DEBUG=trace,sync PANDECODE_DUMP_FILE=stderr`): the job trace of BlitLuma before
+      and after a fault is **identical** (same GPU VAs, descriptors, shader) apart from CPU pointers. Every AV1SW Blit
+      kernel uses scratch (TLS at 0x7fc0000, TLS size 0 = 16 B/thread) and branches on a scratch load; every
+      kernel that matched softpipe is scratch-free (softpipe cannot run scratch). Guess: scratch/TLS memory goes bad
+      after a fault + reset; root cause in the kernel not found (hw_init redoes everything bring-up does).
+    - Fix on the translator side (commit 28a191e, gpu.yml run 41663781057): `nir_lower_scratch_to_var` +
+      `nir_lower_indirect_derefs` (≤16) + `nir_lower_vars_to_scratch` for the rest, so small private arrays never
+      touch scratch. Large indirect arrays would still hit the scratch problem.
+    - One test boot (ios34) hung at `bsd_init: calling IOKitInitializeTime` and rebooted after ~25 s (first time
+      seen; next boot of the same image was fine).
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
