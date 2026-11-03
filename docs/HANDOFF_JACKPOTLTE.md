@@ -703,6 +703,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     - **Run 5 (`_tmp/m2e.cmd`): clear shaders 01, 02, 03, 05, 06, 07 all bit-identical to softpipe, 0 faults.**
       Still 0: **04 and 08, the two that write only target 1** (float and int). Run 6 (`_tmp/m2f.cmd`, air_run
       f8e3fc6 `AIR_RUN_ALL_RT=1`) prints every target to see whether the output lands in target 0 or is dropped.
+    - Run 6: target 1 is never written on the Mali, by any shader (05/06 too). Run 7 (air_run 9052e25,
+      `AIR_RUN_RT8=1` rgba8 targets): same at 32 bpp, so not the tile buffer -- and only pixel 0 of target 0's
+      row was written.
+    - **Run 8 (air_run 108e30b, every pixel printed): even single-target 01 writes only pixel (0,0).** Every
+      "match" in runs 2-5 compared pixel (0,0) alone. Cause: Panfrost's `bifrost_preprocess_nir` runs
+      `nir_lower_viewport_transform`, which rewrites only a `store_deref` of gl_Position; air_run lowered I/O
+      first, so positions reached the tiler in clip space (a 2x2-pixel quad at the origin). **air_metal.c's
+      finalize_for_gallium has done the transform itself since 25 October; air_run's copy never got it. Fix
+      6cfc55a.** Whether target 1 is a separate bug is for run 9 (`_tmp/m2i.cmd`).
+    - CI caveat: gpu.yml reports success when air_run fails to compile (c5f4c8b: two printf strings split across
+      lines); the artifact then simply has no `air_run`. Check the file list, not the run's colour.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
