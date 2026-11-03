@@ -508,6 +508,35 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
   - **GPU step 4 (0113, commit 32f8b68, CI 41556352389):** Mali service (`sweetgpu=4`, docs/GPU_JACKPOTLTE.md);
     **ios20** (`f9ad1c64…`, ios19 + `sweetgpu=4 sweetgputrace=4`) flashed 2026-11-02 ~19:15; result pending
     (`SWEET MALI: self test:` line, early in the boot).
+  - ios20 log: no crash at boot; the 0113 self-test line had scrolled out of the 16 KB window. The run ended in
+    `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` at ~390 s (a restart from inside iOS that hung; not investigated).
+  - **GPU step 5 (commit 2e9b397, gpu.yml run 41558053357): success.** Mesa 25.0.7 panfrost built for iOS 16
+    (`out/libOSMesa.8.dylib`, `mali_test`, `gl_test`, PC copy `_tmp/gpu1`). The outputs were **unsigned** (ld only
+    signs macOS output); signed ad-hoc locally with `ipsw macho sign --ad-hoc`, and build.sh now runs `codesign -s -`
+    (commit 32c4849). **0114** (status line with the Mali result every 30 s) built in xnu run 41558123439.
+  - **Screen cut off** (iPhone X 1125x2436 shown as a centred crop): **0115** (commit 5ab05a8, xnu run 41559227460,
+    artifact `_tmp/a8art27`): boot-arg `sweetfb_fit=1` scales the frame by 2220/2436 to 1025x2220 at x=27 (black bars),
+    nearest-pixel, and SweetHID maps touches back through the same ratio.
+  - **Missing apps (only Safari, Messages, Camera, Photos, Settings, App Store, Phone):** iOS 16 ships the removable
+    system apps in `/private/var/staged_system_apps` and DataMigration installs them, which the `migration` tweak
+    skips. Fixed on the phone's image and in `tools/sweet-root-tweaks.py` (`staged_apps`: 32 apps moved to
+    `/Applications`). The LaunchServices csstore was deleted so lsd reseeds (expect a slow first boot).
+  - **Editing the phone's root image** (TWRP has no hfsplus): check the HFS journal is empty (JIB at block 105, header
+    at 0x6a000: start == end) and the volume header has the unmounted bit; `adb pull` the image into WSL
+    `/opt/sweet/phone-root.img` (20 MB/s, 11 min); `_tmp`-side edit script mounts it `-o loop,force`, edits, and lists
+    the changed 64 MiB chunks; `_tmp/pushchunks.sh` writes only those back with `dd conv=notrunc` and checks each md5,
+    then the full SHA-256 (2026-11-02: 31 chunks, `f0f40979…a7ba` on both sides; `ext4map.py` still shows the file fully
+    written). fsck after the edit: "Incorrect number of file hard links" + "Volume header needs minor repair" (not
+    repaired; probably from before the edit).
+  - The same edit added **G6** files: `/sweet/bin/{mali_test,gl_test}`, `/sweet/lib/libOSMesa.8.dylib`, and a launchd
+    job `com.sweet.malitest` (in `/System/Library/xpc/launchd.plist`) that runs `mali_test 1000` once at boot with
+    output to `/dev/console`.
+  - **ios21** (`f8901cca5273f9e960a1d79027dfba413e603065d76107625baa516d6568ec57`) = 0115 kernel, ios20 cmdline +
+    `sweetfb_fit=1`. Flashed 2026-11-02 19:53; result pending.
+  - User priorities (2026-11-02): GPU (G6, then G7 EAGL for smoothness, G8, G9 Metal for wallpapers), then Wi-Fi
+    (quick path: an Ethernet-style interface first), then the AppleKeyStore stub (keychain), Bluetooth, camera last.
+  - PC: the user's old Android build trees in WSL `/home/Darin` were deleted on request (200 GB inside WSL);
+    `gsi/lin23.2gsi-libfix.img` kept. C: still nearly full until the WSL disk is compacted.
   - `_tmp/flash-when-twrp.sh IMG SHA LOG`: waits for TWRP, saves ramoops, flashes BOOT with all checks, reboots.
   - Next for speed: IDMAC (DMA) instead of PIO.
   - Live log plan (user chose 2026-11-02): DWC3 device mode at `0x13600000` + Exynos USB PHY init, presenting

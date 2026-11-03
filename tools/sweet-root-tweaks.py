@@ -16,6 +16,9 @@ screen (image versions v8-v14 in NOTES.md):
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
                   on every boot
+  staged apps     the removable system apps (Mail, Notes, Weather, ...) moved from
+                  /private/var/staged_system_apps into /Applications: DataMigration
+                  installs them on a real device, and it is skipped above
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
@@ -122,6 +125,21 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def staged_apps(root):
+    src, dst = os.path.join(root, 'private/var/staged_system_apps'), os.path.join(root, 'Applications')
+    moved = 0
+    for app in sorted(glob.glob(os.path.join(src, '*.app'))):
+        target = os.path.join(dst, os.path.basename(app))
+        if os.path.exists(target):
+            continue
+        shutil.move(app, target)
+        for d, dirs, files in os.walk(target):
+            for n in [d] + [os.path.join(d, f) for f in dirs + files]:
+                os.lchown(n, 0, 0)
+        moved += 1
+    print(f'staged apps: {moved} moved to /Applications')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -130,6 +148,7 @@ def main():
     containers(root)
     activation(root)
     audio(root)
+    staged_apps(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
