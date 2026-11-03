@@ -615,6 +615,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       content checked on the phone first, new content verified after; `_tmp/gl-inplace.sh`). File data only, so no clean
       shutdown was needed. **ios28** (`6508f79b...c1e5`, ios27 cmdline + `sweetreboot=1200`) flashed 2026-11-03 ~01:45.
     - Fallbacks if backboardd still crashes: drop `sweetinject`; boot-args `sweetgl=0` (loader off) or `glpanel=0`.
+    - ios28/ios29 (0122/0123): backboardd ran 2 GPU jobs, then SIGSEGV in `IOSurfaceGetBulkAttachments` (far 0x30) from
+      `CA::Render::iosurface_get_edr_factor` <- `WindowServer::IOSurface::wrap_buffer` <- `GLESContext::retain_image`:
+      `CA::Render::Image::retain_iosurface` calls `IOSurfaceWrapClientImage` (IOSurfaceRoot **selector 6**; WrapClientMemory
+      is 7), and SweetSurface's default case answered success with a zeroed lock result (client without a shared state
+      page). **0123** refuses 7, **0124** (commit ddbb8b5, xnu run 41604655783) refuses 6 too; CA then uploads those
+      pictures as textures.
+    - **MILESTONE (ios30, `bdfca020…1eaa`, 2026-11-03 ~03:00): CoreAnimation draws on the Mali and the GPU puts the frame
+      on the panel.** gl.log: `panel: IOSurface 1, the 1125 x 2436 picture into 27,0 1025 x 2220 by the GPU: yes`,
+      `frame N (IOSurface 2/3) put on the panel by the GPU (0)`; frames 21–38 ms typical (≈20 ms of it waiting for the
+      GPU, polled, no IRQ), first frames 176/539 ms with shader compiles. No crash in 1200 s; backboardd stayed up.
+      Next for speed: GPU interrupts, GPU DVFS, CPU DVFS. **ios31** (`ec811190…8968`, same, `sweetreboot=0`) left booted.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
