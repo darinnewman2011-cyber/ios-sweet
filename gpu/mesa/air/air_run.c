@@ -467,6 +467,15 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
     */
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+
+   /* A Gallium frontend gathers the shader info before handing a shader over, and
+    * drivers size their descriptors from it. Without this the quad's vertex shader
+    * has inputs_read 0, Panfrost writes "Attribute count: 0" into its renderer
+    * state, and the shader's LD_ATTR of attribute 0 is out of range: every draw on
+    * the Mali faulted in the vertex/tiler job (G9 M2 run 1's pandecode trace).
+    * softpipe never minded because nir_to_tgsi declares inputs from the variables.
+    */
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
 /* -- compute ---------------------------------------------------------------
