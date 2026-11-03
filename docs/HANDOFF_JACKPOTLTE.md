@@ -547,7 +547,30 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     in the WSL copy; old contents checked on the phone before writing; WSL copy updated the same way).
   - **GPU step 6 part 1 DONE (ios22, second run): `SWEET MALI: up; 2001 jobs, 0 faults, 0 resets; self test PASSED`.**
     An iOS process drives the Mali through the panfrost UAPI (CREATE_BO, MMAP, SUBMIT, syncobj and WAIT_BO). Counters are
-    per boot. Next: gl_test (Mesa panfrost on the G71). The 16 KB ramoops window is flooded by backboardd's
+    per boot.
+  - **Test runner** (commit 18f9c08): `gpu/src/sweet_run.c` = `/sweet/bin/sweet-run`, launchd job `com.sweet.run` (replaces
+    com.sweet.malitest), runs `/sweet/run.cmd` (64 KiB, text up to the first NUL) once per boot, output into
+    `/sweet/run.log` (1 MiB). `tools/a8run.py cmd|log MAP.json` writes the commands / reads the log from TWRP through the
+    files' blocks in root.img (map: `_tmp/gpu1/out/run-map.json`, run.cmd at block 3049987, run.log 3050003..3051200;
+    `ADB` must be a Windows path). Built locally: LLVM clang + ld64.lld against theos' iPhoneOS16.5.sdk in `C:\sw\sdks`
+    (symlinks come out as text on Windows: link `libSystem.B.tbd` directly with `-nostdlib`), signed with `ipsw macho sign`.
+  - **Image edits now need a clean iOS shutdown first** (Settings > General > Shut Down; the Halt/Restart panic at the very
+    end comes after `hfs: unmount` and leaves the journal empty). A forced power-off left journal start != end and
+    `_tmp/runner-install.sh` refused to edit (as designed). `_tmp/pullchunks.sh` syncs the WSL copy by 64 MiB chunk
+    hashes (20-22 chunks after a session) instead of a full pull. Bug noted: `diff` exits 1 under `pipefail`, which ended
+    the edit scripts before their CHANGED line (finished by hand).
+  - **0117** (commit d2a6fb5, xnu run 41568100167): CPU clocks measured with the PMU cycle counter, **ios23**
+    (`76bbabbc…0df`): **A53 1013 MHz (DT max 1690), A73 1351 MHz (DT max 2184)**, so S-Boot leaves ~60 % of the top
+    clock. DT cpufreq domains: cal-id 0xB040003 (CPUs 0-5, 208-1690 MHz), 0xB040002 (6-7, 520-2184 MHz), voltages via
+    ACPM. DVFS is a later project (Samsung cal-if + ACPM sequence).
+  - ios23 runner: mali_test 100 PASS; **gl_test ran on softpipe**: Mesa's `panfrost_get_model()` matches the whole
+    GPU_PROD_ID, Mesa lists the G71 as 0x6000, this one reads 0x60a0. **0118** (commit cf0ec97, xnu run 41571825655)
+    reports `(gpu_id >> 16) & 0xf00f` (kbase's model mask).
+  - **GPU step 6 DONE (ios24, `613dffc2df2bbf93dfa938dc27121f016c14a2b97f24128ba206083306a6e71d`):**
+    `gl_test: Mesa; Mali-G71 (Panfrost); OpenGL ES 3.1 Mesa 25.0.7`, the triangle correct (26 % of pixels inside, as
+    geometry says), 479 ms with shader compiles. `gl_test fill` at 1125x2436: clear 3.3 ms, clear + 1 full-screen rect
+    4.2 ms, + 1 textured blended 6.2 ms, 4 blended 24 ms, 8 blended 45 ms; 1310 GPU jobs, 0 faults, 0 resets.
+    gl_test's "on the panel" step returns 0xe00002c7 (show is not implemented: G8). Next: G7 (EAGL / CoreAnimation). The 16 KB ramoops window is flooded by backboardd's
     `IOAcceleratorES` matching trace at ~80 s; the 30 s status line is the reliable place for results.
   - User priorities (2026-11-02): GPU (G6, then G7 EAGL for smoothness, G8, G9 Metal for wallpapers), then Wi-Fi
     (quick path: an Ethernet-style interface first), then the AppleKeyStore stub (keychain), Bluetooth, camera last.
