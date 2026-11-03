@@ -5,7 +5,8 @@
   (snapshot 68fe2e9), the Galaxy S20+ (Exynos 990, Mali-G77) XNU port, MIT licensed: `LICENSE.y2sios`.
   y2sios builds on HackiOS by OOSEX GANG (MIT).
 - `src/eagl.c`, `src/gl_osmesa.c`, `src/redwood_gl.h`, `src/eagl_slots.txt` and `mkeagl.py` (GPU step 7) are
-  copied unchanged from the same snapshot (`userland/`). `src/sweet_gl_loader.c` is this port's, after the
+  copied from the same snapshot (`userland/`); `src/eagl.c` has one addition of this port's, the G8 panel
+  present (`panel_present()`, marked "ios-sweet"). `src/sweet_gl_loader.c` is this port's, after the
   `opengl_es()` part of y2sios' `src/inject.c` (its address hooks for iOS 16.5 are not used).
 - Mesa itself (MIT) is downloaded by `build.sh` at build time and is not in this repository.
 - `build.sh` is this port's adaptation of y2sios' `tools/mk-mesa.sh` and `userland/build-gpu-y2s.sh`.

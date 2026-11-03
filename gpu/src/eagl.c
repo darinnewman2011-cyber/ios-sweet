@@ -57,6 +57,12 @@
  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
  * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
  * every frame (see frame_end()).
+ *
+ * ios-sweet (Galaxy A8, GPU step G8; not in y2sios): the display's driver there shows the iPhone X
+ * picture scaled down into the panel, and did that with the processor, 10 MB a frame. When it
+ * publishes where the panel is (SweetPanelSurface, the fit rectangle), the end of a frame has the
+ * GPU scale the picture into the panel's own memory instead and tells the kernel so (request 0x7a
+ * of RedwoodMali), which then copies nothing (see panel_present()). Boot-arg glpanel=0: not done.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -123,6 +129,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_DRAW_FRAMEBUFFER_BINDING     0x8ca6
 #define GL_COLOR_BUFFER_BIT             0x4000
 #define GL_NEAREST                      0x2600
+#define GL_LINEAR                       0x2601
 #define GL_LINES                        0x0001
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8cd0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8cd1
@@ -1022,6 +1029,157 @@ frame_begin(struct eagl *e)
  * glFlush, glFinish: what was drawn must be where the display takes it from. `finished`: the
  * library has been waited for already.
  */
+/* ---- ios-sweet G8: the frame into the panel by the GPU ---------------------------------------- */
+
+static int panel_on = 1;                /* boot-arg glpanel=0 */
+static struct {
+	bool asked, ready;
+	uint32_t surface;                      /* the panel's IOSurface */
+	GLint x, y, width, height;             /* where the picture goes in it */
+	GLint logical_width, logical_height;   /* and how big the display's pictures are */
+	GLuint texture, framebuffer, source;   /* the panel as a texture and a framebuffer; ours to read with */
+	io_connect_t gpu;                      /* RedwoodMali, for request 0x7a */
+	unsigned frames;
+} panel;
+
+static GLint
+panel_number(io_service_t display, const char *key)
+{
+	CFStringRef name = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+	CFTypeRef value = name ? IORegistryEntryCreateCFProperty(display, name, NULL, 0) : NULL;
+	int32_t number = -1;
+
+	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+		CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, &number);
+	}
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	if (name != NULL) {
+		CFRelease(name);
+	}
+	return number;
+}
+
+/* Once: where the panel is (the kernel's AppleCLCD says), the panel as a framebuffer of ours. */
+static void
+panel_setup(struct eagl *e)
+{
+	io_service_t display, gpu;
+	GLint bound = 0, framebuffer = 0;
+
+	panel.asked = true;
+	if (!panel_on) {
+		return;
+	}
+	display = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AppleCLCD"));
+	if (display == 0) {
+		return;
+	}
+	panel.surface = (uint32_t)panel_number(display, "SweetPanelSurface");
+	panel.x = panel_number(display, "SweetFitX");
+	panel.y = panel_number(display, "SweetFitY");
+	panel.width = panel_number(display, "SweetFitWidth");
+	panel.height = panel_number(display, "SweetFitHeight");
+	panel.logical_width = panel_number(display, "SweetLogicalWidth");
+	panel.logical_height = panel_number(display, "SweetLogicalHeight");
+	IOObjectRelease(display);
+	if ((int32_t)panel.surface <= 0 || panel.x < 0 || panel.y < 0 || panel.width <= 0 || panel.height <= 0 ||
+	    panel.logical_width <= 0 || panel.logical_height <= 0) {
+		say("redwood-gl: panel: the display's driver says nothing of where the panel is: the processor copies frames\n");
+		return;
+	}
+	gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RedwoodMali"));
+	if (gpu == 0 || IOServiceOpen(gpu, mach_task_self(), 0, &panel.gpu) != KERN_SUCCESS) {
+		if (gpu != 0) {
+			IOObjectRelease(gpu);
+		}
+		say("redwood-gl: panel: RedwoodMali cannot be opened: the processor copies frames\n");
+		return;
+	}
+	IOObjectRelease(gpu);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+	glGenTextures(1, &panel.texture);
+	glBindTexture(GL_TEXTURE_2D, panel.texture);
+	if (redwood_gl_surface_texture(e->gl, panel.surface)) {
+		glGenFramebuffers(1, &panel.framebuffer);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, panel.framebuffer);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, panel.texture, 0);
+		panel.ready = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+		glGenFramebuffers(1, &panel.source);
+	}
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)framebuffer);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	say("redwood-gl: panel: IOSurface %u, the %d x %d picture into %d,%d %d x %d by the GPU: %s\n", panel.surface,
+	    panel.logical_width, panel.logical_height, panel.x, panel.y, panel.width, panel.height,
+	    panel.ready ? "yes" : "NO (the panel cannot be drawn into; the processor copies frames)");
+}
+
+/* The display's picture of this frame, if it is one the panel can be drawn from: its index, or -1. */
+static int
+panel_picture(struct eagl *e)
+{
+	if (!panel.asked) {
+		panel_setup(e);
+	}
+	if (!panel.ready) {
+		return -1;
+	}
+	for (unsigned i = 0; i < e->image_count; i++) {
+		struct image *image = &e->images[i];
+
+		if (image->target && image->drawn && (image->shared || image->mirror != 0) &&
+		    image->width == panel.logical_width && image->height == panel.logical_height) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+/*
+ * The picture, as it is in its IOSurface's memory (the shared texture, or the mirror the GPU has just
+ * copied it into), scaled into the panel's fit rectangle. Before the frame's wait (frame_end()).
+ */
+static uint32_t
+panel_present(struct eagl *e, int index)
+{
+	struct image *image = &e->images[index];
+	GLint read = 0, draw = 0;
+	GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, panel.source);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+	    image->mirror != 0 ? image->mirror : image->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, panel.framebuffer);
+	if (scissor) {
+		glDisable(GL_SCISSOR_TEST);
+	}
+	glBlitFramebuffer(0, 0, image->width, image->height, panel.x, panel.y, panel.x + panel.width, panel.y + panel.height,
+	    GL_COLOR_BUFFER_BIT, GL_LINEAR);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	return IOSurfaceGetID(image->surface);
+}
+
+/* After the GPU is done: the kernel is to show that surface's picture as it is on the panel. */
+static void
+panel_shown(uint32_t surface)
+{
+	uint32_t request[2] = { surface, 0 }, answer[2];
+	size_t size = sizeof(answer);
+	kern_return_t kr = IOConnectCallStructMethod(panel.gpu, 0x7a, request, sizeof(request), answer, &size);
+
+	if (panel.frames++ < 3 || kr != KERN_SUCCESS) {
+		say("redwood-gl: panel: frame %u (IOSurface %u) put on the panel by the GPU (%#x)\n", panel.frames, surface, kr);
+	}
+}
+
 static void frame_functions(struct eagl *e);
 static void
 frame_end(struct eagl *e, bool finished)
@@ -1029,6 +1187,9 @@ frame_end(struct eagl *e, bool finished)
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	int picture = panel_picture(e);    /* (ios-sweet G8) */
+	uint32_t on_panel = 0;
+	bool waited_here;
 
 	clear_now(e);
 	before = now_us();
@@ -1042,6 +1203,11 @@ frame_end(struct eagl *e, bool finished)
 			in_place++;
 		}
 	}
+	if (picture >= 0) {
+		on_panel = panel_present(e, picture);
+		glFlush();
+	}
+	waited_here = in_place != 0 && !finished && wait_for_frames;
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames) {
@@ -1059,6 +1225,12 @@ frame_end(struct eagl *e, bool finished)
 			(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
 			glDeleteSync(sync);
 		}
+	}
+	if (on_panel != 0) {
+		if (!waited_here) {
+			glFinish();     /* (the panel's copy came after any wait of the library's) */
+		}
+		panel_shown(on_panel);
 	}
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -4156,6 +4328,7 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+		panel_on = strstr(arguments, "glpanel=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
