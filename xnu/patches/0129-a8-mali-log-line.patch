@@ -1,0 +1,50 @@
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -84,8 +84,18 @@ enum {
+ 	kRedwoodMaliCounts      = 0x7d,
+ 	kRedwoodSurface         = 0x7e,
+ 	kSweetShown             = 0x7a,
++	kSweetLog               = 0x79,
+ };
+ 
++/*
++ * 0x79: one line of text from the client into the kernel log ("m2m PosterBoard[200]: ..."). The Metal
++ * driver's records (gpu/src/m2m.h) have no /dev/m2m on this kernel, and a daemon's stdout is /dev/null;
++ * every Metal process has this service open anyway. At most 4000 lines a boot, then one line saying so.
++ */
++#define kSweetLogMax            480
++#define kSweetLogLines          4000
++static SInt32 sweet_mali_log_lines;
++
+ struct drm_panfrost_submit {
+ 	uint64_t jc, in_syncs;
+ 	uint32_t in_sync_count, out_sync;
+@@ -857,6 +867,27 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 	uint64_t * s;
+ 	IOReturn ret = kIOReturnSuccess;
+ 
++	if (selector == kSweetLog) {
++		char line[kSweetLogMax + 1];
++		size_t n = size < kSweetLogMax ? size : kSweetLogMax;
++		SInt32 count;
++
++		if (args->structureInput == NULL || n == 0) {
++			return kIOReturnBadArgument;
++		}
++		count = OSIncrementAtomic(&sweet_mali_log_lines);
++		if (count < kSweetLogLines) {
++			memcpy(line, args->structureInput, n);
++			line[n] = '\0';
++			while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\0')) {
++				line[--n] = '\0';
++			}
++			IOLog("m2m %s[%d]: %s\n", fName, fPid, line);
++		} else if (count == kSweetLogLines) {
++			IOLog("SWEET MALI: %d m2m lines this boot; the rest are dropped\n", kSweetLogLines);
++		}
++		return kIOReturnSuccess;
++	}
+ 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}

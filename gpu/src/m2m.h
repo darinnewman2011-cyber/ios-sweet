@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
+#include <IOKit/IOKitLib.h>
 
 #define M2M_DEVICE              "/dev/m2m"
 #define M2M_RECORD_MAX          1024
@@ -39,16 +40,38 @@ struct m2m_client {
 
 static int m2m_fd = -1;
 static int m2m_con = -1;	/* ios-sweet: no /dev/m2m and stdout is /dev/null (a daemon): the console */
+static io_connect_t m2m_mali;	/* ios-sweet: RedwoodMali's request 0x79, one line into the kernel log (xnu 0129) */
 static pthread_once_t m2m_once = PTHREAD_ONCE_INIT;
+#define M2M_MALI_LOG            0x79
+#define M2M_MALI_LOG_MAX        480
 
 static void
 m2m_open_once(void)
 {
 	struct stat out, null;
+	io_service_t mali;
 
 	m2m_fd = open(M2M_DEVICE, O_WRONLY | O_CLOEXEC);
 	if (m2m_fd >= 0) {
 		return;
+	}
+	/* ios-sweet: the kernel log through the GPU service, which every Metal process may open; a kernel
+	 * before 0129 answers 0x79 with an error, and then the console or stdout below is used */
+	mali = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RedwoodMali"));
+	if (mali != IO_OBJECT_NULL) {
+		static const char hello[] = "I M2M records follow in the kernel log (RedwoodMali 0x79)";
+
+		if (IOServiceOpen(mali, mach_task_self(), 0, &m2m_mali) != KERN_SUCCESS) {
+			m2m_mali = IO_OBJECT_NULL;
+		} else if (IOConnectCallStructMethod(m2m_mali, M2M_MALI_LOG, hello, sizeof(hello) - 1, NULL, NULL) !=
+		    KERN_SUCCESS) {
+			IOServiceClose(m2m_mali);
+			m2m_mali = IO_OBJECT_NULL;
+		}
+		IOObjectRelease(mali);
+		if (m2m_mali != IO_OBJECT_NULL) {
+			return;
+		}
 	}
 	if (fstat(STDOUT_FILENO, &out) != 0 || (stat("/dev/null", &null) == 0 && S_ISCHR(out.st_mode) &&
 	    out.st_rdev == null.st_rdev)) {
@@ -96,6 +119,9 @@ m2m_vlog(char sev, const char *cat, const char *fmt, va_list ap)
 	}
 	if (m2m_fd >= 0) {
 		(void)write(m2m_fd, rec, (size_t)n);
+	} else if (m2m_mali != IO_OBJECT_NULL) {
+		(void)IOConnectCallStructMethod(m2m_mali, M2M_MALI_LOG, rec,
+		    (size_t)n < M2M_MALI_LOG_MAX ? (size_t)n : M2M_MALI_LOG_MAX, NULL, NULL);
 	} else if (m2m_con >= 0) {
 		dprintf(m2m_con, "m2m[%s:%d]: %s\n", getprogname(), getpid(), rec);
 	} else {

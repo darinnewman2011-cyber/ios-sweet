@@ -5,6 +5,8 @@
  *
  *   sweet-dmesg           everything
  *   sweet-dmesg TEXT ...  only the lines that contain one of the TEXTs
+ *   sweet-dmesg -s BYTES  make the buffer that big (kern.msgbuf, root), say what it was and is, print nothing else:
+ *                         the boot's default is small and memorystatus fills it in under a minute
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +27,17 @@ main(int argc, char **argv)
 
 	if (sysctlbyname("kern.msgbuf", &size, &len, NULL, 0) != 0 || size <= 0) {
 		size = 1 << 20;
+	}
+	if (argc == 3 && strcmp(argv[1], "-s") == 0) {
+		int want = atoi(argv[2]), now = 0;
+
+		len = sizeof(now);
+		if (sysctlbyname("kern.msgbuf", NULL, NULL, &want, sizeof(want)) != 0) {
+			perror("sweet-dmesg: kern.msgbuf");
+		}
+		(void)sysctlbyname("kern.msgbuf", &now, &len, NULL, 0);
+		printf("sweet-dmesg: kernel message buffer %d bytes, asked %d, now %d\n", size, want, now);
+		return 0;
 	}
 	buf = calloc(1, (size_t)size + 1);
 	if (buf == NULL) {
