@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+index 1e22015..f2b3a29 100644
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -972,6 +972,23 @@ extern void SweetMaliStart(void);               /* iokit/Kernel/arm/SweetMali.cp
+  */
+ #define ST_JOBS         1000
+ 
++static char selftest_result[96] = "not run";
++
++/*
++ * One line for sweet_ufs.c's 30 s status thread, so the GPU's state stays in
++ * the last 16 KB that ramoops keeps (the self test runs seconds into the boot).
++ */
++void sweet_mali_status(void);
++void
++sweet_mali_status(void)
++{
++	if (pt_root == NULL) {
++		return;                 /* sweetgpu < 4 */
++	}
++	printf("SWEET MALI: %s; %llu jobs, %llu faults, %llu resets; self test %s\n", mali_up ? "up" : "DOWN", stat_jobs,
++	    stat_faults, stat_resets, selftest_result);
++}
++
+ static void
+ mali_selftest(void)
+ {
+@@ -1026,6 +1043,8 @@ mali_selftest(void)
+ 		}
+ 	}
+ 	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	snprintf(selftest_result, sizeof(selftest_result), "%s (%u jobs %s in %llu us, %u wrong values)",
++	    done && bad == 0 && stat_faults == 0 ? "PASSED" : "FAILED", ST_JOBS - 1, done ? "done" : "NOT DONE", ns / 1000, bad);
+ 	printf("SWEET MALI: self test: %u more jobs %s in %llu us (%llu us each), %u wrong values, %llu faults, %llu resets: %s\n",
+ 	    ST_JOBS - 1, done ? "done" : "NOT DONE", ns / 1000, ns / 1000 / (ST_JOBS - 1), bad, stat_faults, stat_resets,
+ 	    done && bad == 0 && stat_faults == 0 ? "PASSED (step 4 kernel core)" : "FAILED");
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d77e3ff..519516d 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_a8_input_init(void);
+ extern void sweet_a8_gpu_init(void);
++extern void sweet_mali_status(void);            /* sweet_a8gpu.c: one GPU line for wst_thread() */
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -1072,6 +1073,7 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    wst.ok, wst.fail, wst.err, wst.where, wst.lba, wst.a, wst.b,
+ 		    wst.wbad, wst.rbad, wst.zero, wst.bad_lba, wst.bad_want, wst.bad_got, wst.dirty,
+ 		    wst.multi, wst.mfail, wst.mbad);
++		sweet_mali_status();
+ 	}
+ }
+ 

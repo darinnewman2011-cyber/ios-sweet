@@ -1,0 +1,28 @@
+name: gpu-userland
+
+# GPU step 5 (docs/GPU_JACKPOTLTE.md): mali_test, Mesa panfrost and gl_test for arm64 iOS 16 (gpu/build.sh).
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install bison
+      - name: Build
+        run: bash gpu/build.sh
+      - name: Checksums
+        if: always()
+        run: |
+          cd gpu/out 2>/dev/null && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS || true
+          mkdir -p ../logs && cp ../build/meson-setup.log ../build/build-softpipe-panfrost/meson-logs/meson-log.txt ../logs/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-userland
+          path: |
+            gpu/out
+            gpu/logs
