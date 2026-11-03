@@ -3,6 +3,9 @@ name: gpu-userland
 # GPU step 5 (docs/GPU_JACKPOTLTE.md): mali_test, Mesa panfrost and gl_test for arm64 iOS 16 (gpu/build.sh).
 on:
   workflow_dispatch:
+  push:
+    branches: [jackpotlte]
+    paths: ['gpu/**', '.github/workflows/gpu.yml']
 
 jobs:
   build:
