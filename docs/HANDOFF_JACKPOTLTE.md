@@ -673,6 +673,25 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       only the file's own bytes in a partial last block). No clean shutdown needed when the size is unchanged.
     - One test boot (ios34) hung at `bsd_init: calling IOKitInitializeTime` and rebooted after ~25 s (first time
       seen; next boot of the same image was fine).
+  - **GPU clock (patch 0126, commit d20b3d6, xnu run 41682398236, kernel `b840c334…`):** boot-arg
+    `sweetgpumhz=550|747` reprograms PLL_G3D (CMU_G3D `0x11400000`, CON0 `+0x120`) with Samsung's PMS values,
+    voltage left at the 0.8 V boot default; falls back to the old values if the PLL does not lock.
+    - **550 MHz: verified.** 11,278 jobs and later 95,902 jobs with 0 faults from GL; GPU-bound frames ~23 → 15.8 ms
+      (light) and 67.7 → 39.2 ms (heavy).
+    - **747 MHz: not stable at 0.8 V** (ios38: 2860 jobs, 652 faults/resets; the self test still passed). Would need
+      the voltage raised (DVFS), not attempted.
+    - Everyday image now `_tmp/a8-ios37-boot.img` (550, `b996a3d5…`). Test images: ios36 (550, back to TWRP after
+      600 s) and **ios40 (550, `sweetreboot=240`, `38c48c29…`) for short runner tests**.
+  - **M2 (draws) run 1 (`_tmp/m2a.cmd`, PANDECODE trace):** the vertex/tiler job of `clearFragment01` does not
+    complete. The trace shows the hand-built quad vertex shader's renderer state with **"Attribute count: 0"**
+    while its code does `LD_ATTR_IMM` of attribute 0: air_run never called `nir_shader_gather_info`, so
+    `inputs_read` was 0. **Fix 8e490f7 (gpu run 41691402136)**; GL draws were never affected (Mesa's frontend
+    gathers info).
+    - **Run 2 (`_tmp/m2b.cmd`, air_run 8e490f7 installed in place): `clearFragment01` is the first Metal fragment
+      shader drawn correctly on the Mali** -- pixel (0,0) = 2.10170319e-18, 0.178894654, 1.48687698e+16,
+      1.21394141e+33, bit-identical to softpipe; 0 faults, 2 jobs.
+    - `clearFragment04` (writes only FRAG_RESULT_DATA1, 2 render targets): 0 faults but **render target 1 reads back
+      0** on the Mali vs the softpipe value. Open: next run traces it (blend descriptor / BLEND RT index).
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
