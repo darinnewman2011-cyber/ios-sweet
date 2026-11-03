@@ -659,6 +659,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       Blit images are 16-bit (`R16G16B16A16_UINT`, image_shapes), and air_run's texel printout reads every image as
       four 32-bit channels, so those numbers were never the texels. 32-bit images (DrawSpans, DrawEye) do show the
       pattern. Commit 2a9b6f3: `AIR_RUN_DUMP=1` prints raw bytes after upload and after dispatch, plus constants.
+    - **Run 8 (`_tmp/m1t.cmd`, dumps): the cause.** Uploads land; the kernels write every texel before and after a
+      fault; only channels 2-3 differ (1 before, 0 after). The translator's `air.write_texture_*` took its NIR
+      `src_type` from the intrinsic's return type (void), so the store was a sizeless `uint`: Bifrost read four
+      32-bit registers for a 16-bit vector and channels 2-3 were stale register contents (the reset zeroes them).
+    - **Fix 783e17e (gpu run 41678797957): the store's type comes from the stored value** (base and bit size).
+      **Run 9 (`_tmp/m1s.cmd`, installed in place with `_tmp/air-inplace.sh`, same size): every image byte is
+      identical before and after a fault**; images are now `r16g16b16a16_*` and BlitKernel_Unorm copies the
+      texture's texel exactly (half 1100, 200, 300, 400). BlitLuma's 0 and BlitChroma's +inf follow from the
+      harness's dummy constants (unverified: softpipe cannot run 16-bit code). The post-fault problem is closed.
+    - In-place installs: `_tmp/wsl/fibmap2.sh PATH` maps a file's blocks in the WSL copy (works with a dirty
+      journal, read-only mount); `_tmp/air-inplace.sh` checks the old bytes on the phone, writes, verifies (compares
+      only the file's own bytes in a partial last block). No clean shutdown needed when the size is unchanged.
     - One test boot (ios34) hung at `bsd_init: calling IOKitInitializeTime` and rebooted after ~25 s (first time
       seen; next boot of the same image was fine).
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
