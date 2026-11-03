@@ -29,6 +29,7 @@ fi
 
 # The test of the kernel's interface needs nothing else: first, so it is there even if Mesa fails.
 "$CLANG" $TARGET -O1 -framework IOKit -o out/mali_test src/mali_test.c
+codesign -s - -f out/mali_test
 echo "build.sh: out/mali_test ($(wc -c < out/mali_test) bytes)"
 
 cd "$B"
@@ -81,4 +82,6 @@ cp "$B/$BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib" out/libOSMesa.8.dyli
 xcrun strip -x out/libOSMesa.8.dylib
 install_name_tool -id /sweet/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
 "$CLANG" $TARGET -O1 -framework CoreFoundation -framework IOKit out/libOSMesa.8.dylib -o out/gl_test src/gl_test.c
+# ld only signs macOS arm64 output by itself; iOS kills unsigned code, and the kernel's AMFI takes ad-hoc.
+codesign -s - -f out/mali_test out/gl_test out/libOSMesa.8.dylib
 echo "build.sh: out/libOSMesa.8.dylib ($(wc -c < out/libOSMesa.8.dylib) bytes), out/gl_test"
