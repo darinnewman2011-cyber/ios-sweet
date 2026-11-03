@@ -598,6 +598,23 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     and the xnu1–xnu5 images were deleted (hashes above; rebuildable from CI). Delete `a.zip` right after unzipping.
   - Note: `shim/a8/build.sh` needs `/c/Program Files/LLVM/bin` on PATH (otherwise it silently keeps the old
     `out/Image`), and `adb push` from Git Bash needs `MSYS_NO_PATHCONV=1`.
+  - **G7/G8 (2026-11-03): CoreAnimation on the Mali.**
+    - 0119 (AMFI dyld policy, IOSurface import 0x7e, CPU-side fence + flush), 0120 (panel kick after each present,
+      request 0x7a "shown by the GPU", AppleCLCD SweetPanelSurface/SweetFit* properties), 0121 (boot-arg
+      `sweetinject=NAME`: the kernel adds `DYLD_INSERT_LIBRARIES=/sweet/lib/libsweet-gl-loader.dylib` to that program's
+      environment, because launchd strips DYLD_* from plists), 0122 ('b3a8' surfaces described to Mesa as their BGRA plane).
+    - `gpu/src/eagl.c` + `sweet_gl_loader.c` (from y2sios, MIT) build `libredwood-gl.dylib` locally (LLVM + ld64.lld,
+      iPhoneOS16.5 SDK, `ipsw macho sign`); log in `/sweet/gl.log`, read with `tools/a8run.py gllog _tmp/gpu1/out/gl-map.json`.
+    - ios26 (0120, no inject): CA still on the CPU (loader never loaded). **ios27** (0121 + `sweetinject=backboardd`): the
+      GL library loads into backboardd (all 8 EAGLContext methods replaced, Mesa on Mali-G71) but CA's display target is a
+      **'b3a8'** IOSurface (2 planes: BGRA + opacity), attach refused, `glDrawElements: error 0x506`, backboardd SIGSEGV
+      (far 0x30) in a loop, 0 GPU submits.
+    - Fix: eagl.c attaches plane 0 of 'b3a8'; 0122 (commit dde9a9d, xnu run 41596238901). The new dylib (same size,
+      557056 bytes, SHA-256 `3971a8f5...ff26`) was written into root.img **in place** over the old one's blocks (HFS FIBMAP
+      of the WSL copy: runs 1627813+5, 1951777+15, 3047062, 3049970, 3049983+4, 3050583+3, 3050877+88, 3051201+19; old
+      content checked on the phone first, new content verified after; `_tmp/gl-inplace.sh`). File data only, so no clean
+      shutdown was needed. **ios28** (`6508f79b...c1e5`, ios27 cmdline + `sweetreboot=1200`) flashed 2026-11-03 ~01:45.
+    - Fallbacks if backboardd still crashes: drop `sweetinject`; boot-args `sweetgl=0` (loader off) or `glpanel=0`.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
