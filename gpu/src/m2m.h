@@ -22,8 +22,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
 
@@ -36,13 +38,26 @@ struct m2m_client {
 #define M2M_IOC_CLIENT          _IOW('m', 1, struct m2m_client)
 
 static int m2m_fd = -1;
+static int m2m_con = -1;	/* ios-sweet: no /dev/m2m and stdout is /dev/null (a daemon): the console */
 static pthread_once_t m2m_once = PTHREAD_ONCE_INIT;
 
 static void
 m2m_open_once(void)
 {
+	struct stat out, null;
+
 	m2m_fd = open(M2M_DEVICE, O_WRONLY | O_CLOEXEC);
-	if (m2m_fd < 0) {
+	if (m2m_fd >= 0) {
+		return;
+	}
+	if (fstat(STDOUT_FILENO, &out) != 0 || (stat("/dev/null", &null) == 0 && S_ISCHR(out.st_mode) &&
+	    out.st_rdev == null.st_rdev)) {
+		m2m_con = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+	}
+	if (m2m_con >= 0) {
+		dprintf(m2m_con, "m2m[%s:%d]: W M2M %s: no channel; records follow on the console\n",
+		    getprogname(), getpid(), M2M_DEVICE);
+	} else {
 		printf("m2m-nodev: W M2M %s: %s; records follow on stdout\n", M2M_DEVICE, strerror(errno));
 		fflush(stdout);
 	}
@@ -81,6 +96,8 @@ m2m_vlog(char sev, const char *cat, const char *fmt, va_list ap)
 	}
 	if (m2m_fd >= 0) {
 		(void)write(m2m_fd, rec, (size_t)n);
+	} else if (m2m_con >= 0) {
+		dprintf(m2m_con, "m2m[%s:%d]: %s\n", getprogname(), getpid(), rec);
 	} else {
 		printf("m2m-nodev: %s\n", rec);
 		fflush(stdout);
