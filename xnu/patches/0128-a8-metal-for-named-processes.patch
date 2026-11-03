@@ -9,7 +9,7 @@ diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccel
  
  extern "C" void proc_selfname(char * buf, int size);
  
-@@ -32,16 +33,115 @@
+@@ -32,16 +33,116 @@
  
  static bool gSweetMetal;
  
@@ -20,6 +20,7 @@ diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccel
 + * all, reads a service without them and keeps GL. Metal reads them once per process, through
 + * IORegistryEntryCreateCFProperty (copyProperty) or the whole table (serializeProperties),
 + * in the reading thread, so the caller's name is at hand. Independent of sweetmetal=1.
++ * sweetmetalfor=* gives it to every process: the whole system on Metal, backboardd included.
 + */
 +static char gSweetMetalFor[256];
 +static SInt32 gSweetMetalSaid;
@@ -38,7 +39,7 @@ diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccel
 +	const char * p = gSweetMetalFor;
 +	bool shown = false;
 +
-+	if (gSweetMetalFor[0] == '\0') {
++	if (gSweetMetalFor[0] == '\0' || strcmp(gSweetMetalFor, "*") == 0) {
 +		return true;
 +	}
 +	proc_selfname(who, sizeof(who));
@@ -125,7 +126,7 @@ diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccel
  IOReturn
  IOAcceleratorES::setProperties(OSObject * properties)
  {
-@@ -101,11 +201,21 @@
+@@ -101,11 +202,21 @@
  	uint32_t metal = 0;
  
  	gSweetMetal = PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0;
