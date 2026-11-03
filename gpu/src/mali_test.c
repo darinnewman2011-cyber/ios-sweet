@@ -74,7 +74,8 @@ write_value_job(uint8_t *cpu, uint64_t target, uint64_t value)
 	uint32_t *w = (uint32_t *)cpu;
 
 	memset(cpu, 0, 64);
-	w[4] = (2U << 1) | (1U << 16);          /* type WRITE_VALUE, index 1 */
+	/* 64-bit descriptor (bit 0: Bifrost needs it, the Valhall G77 this came from ignores it), type WRITE_VALUE, index 1 */
+	w[4] = 1U | (2U << 1) | (1U << 16);
 	memcpy(cpu + 32, &target, 8);
 	w[10] = 7;                              /* IMMEDIATE 64 */
 	memcpy(cpu + 48, &value, 8);
