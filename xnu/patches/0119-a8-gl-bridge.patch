@@ -1,0 +1,349 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..cfb5cba 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -367,6 +367,51 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * dyld asks the policy named "AMFI" what it may do for a process it starts
++ * (__mac_syscall("AMFI", 0x5a, { flags in, pointer to flags out })). With
++ * no such policy the call fails and dyld ignores every DYLD_* variable, so
++ * nothing can be inserted into a daemon. Allow all of it (0xff: 	paths,
++ * DYLD_* variables, inserted libraries, interposing): that is how the GL
++ * bridge gets into backboardd (DYLD_INSERT_LIBRARIES). Every other request
++ * gets ENOPOLICY, what user space got before. (Approach from y2sios'
++ * kern_minimac.c, stormtroopxyz/y2sios, MIT.)
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++
++static int
++sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = SWEET_AMFI_DYLD_ALLOW_ALL;
++	int error;
++
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
++static const struct mac_policy_ops sweet_amfi_dyld_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_dyld_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET dyld policy stand-in",
++	.mpc_ops = &sweet_amfi_dyld_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_dyld_mac_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -379,5 +424,8 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_dyld_mac_conf, &sweet_amfi_dyld_mac_handle, NULL);
++	printf("SWEET AMFI: dyld policy (DYLD_INSERT_LIBRARIES allowed) %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b216599..71b17a6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -391,6 +391,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
++#if defined(SWEET_JACKPOTLTE)
++		sweet_mali_surface_for_cpu(s, src);    /* drawn by the GPU: done, and out of the CPU's cache */
++#endif
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index 8e1b7bf..217f6f5 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -11,13 +11,19 @@
+  *
+  *   panfrost   SUBMIT, WAIT_BO, CREATE_BO, MMAP_BO, GET_PARAM, GET_BO_OFFSET, MADVISE, SET_LABEL_BO
+  *   drm        GEM_CLOSE, SYNCOBJ_CREATE / DESTROY / WAIT / RESET / SIGNAL
+- *   ours       0x7b / 0x7c a syncobj's fence set / read, 0x7d counters
+- *              (0x7e IOSurface import and 0x7f show are not here yet: step 7)
++ *   ours       0x7b / 0x7c a syncobj's fence set / read, 0x7d counters, 0x7e an IOSurface as a buffer
++ *              (0x7f show is not here: the framebuffer shows surfaces)
+  *
+  * A buffer's memory is the client memory of the type that is its handle (what Linux does with mmap()
+  * on the device). Buffers are wired, zeroed and write-combined; the GPU's mappings are not cached
+  * and its caches are cleaned and invalidated around every job. All clients share the GPU's one
+  * address space; a fence is a job's sequence number, and jobs run in submission order.
++ *
++ * IOSurfaces (SweetSurface.cpp) are ordinary cached memory, and this SoC is not coherent: a
++ * surface is pushed out of the CPU's cache before a job that names it when its seed changed
++ * (an unlock after the CPU wrote it) and the first time, and the framebuffer calls
++ * sweet_mali_surface_for_cpu() before it copies one the GPU drew into, so it waits for that job
++ * and reads memory, not stale cache lines.
+  */
+ 
+ #if defined(SWEET_JACKPOTLTE)
+@@ -34,6 +40,8 @@
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ 
++#include "SweetSurface.h"
++
+ extern "C" {
+ /* bsd/dev/sweet_a8gpu.c */
+ #define SWEET_MALI_MAP_NOEXEC   0x1
+@@ -73,6 +81,7 @@ enum {
+ 	kRedwoodSyncobjSet      = 0x7b,
+ 	kRedwoodSyncobjGet      = 0x7c,
+ 	kRedwoodMaliCounts      = 0x7d,
++	kRedwoodSurface         = 0x7e,
+ };
+ 
+ struct drm_panfrost_submit {
+@@ -136,6 +145,15 @@ struct redwood_syncobj_fence {
+ struct redwood_mali_counts {
+ 	uint64_t jobs, faults, resets, last;
+ };
++/* 0x7e: an IOSurface's pixels as a buffer (handle kRedwoodDescribe: only what it is) */
++struct redwood_surface {
++	uint32_t surface, handle;
++	uint64_t size;
++	uint32_t offset, rowBytes, width, height, pixelFormat, planes;
++	/* (appended: an older caller asks with the struct above and gets it) each plane's start and row */
++	uint32_t planeOffset[2], planeRowBytes[2];
++};
++#define kRedwoodDescribe        0xffffffffu
+ 
+ #define PANFROST_BO_NOEXEC              1
+ #define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL 1
+@@ -146,6 +164,7 @@ struct redwood_mali_counts {
+ #define MALI_SUBMIT_BOS         16384
+ #define MALI_PATIENCE_MS        5000            /* for a wait without a limit */
+ #define MALI_LEFT               256
++#define MALI_SURFACE_WAIT_MS    100             /* the framebuffer's patience with the GPU, a frame */
+ 
+ static IOLock * gMaliLock;
+ 
+@@ -225,6 +244,9 @@ struct mali_buffer {
+ 	uint64_t                address, size;
+ 	uint32_t                flags;
+ 	uint64_t                fence;          /* the last job that names it */
++	SweetSurface *          surface;        /* an IOSurface's pixels (retained), or NULL */
++	uintptr_t               kernel;         /* where they are for the kernel */
++	uint32_t                seed;           /* the surface's when it was last pushed out of the cache */
+ };
+ 
+ /* A buffer given back while the GPU may still use it: kept until its job is done. */
+@@ -255,6 +277,7 @@ class RedwoodMaliUserClient : public IOUserClient
+ 	void reap(bool wait);
+ 	uint64_t * syncobj(uint32_t handle);
+ 	IOReturn createBo(struct drm_panfrost_create_bo * request);
++	IOReturn surfaceBuffer(struct redwood_surface * request);
+ 	IOReturn submit(struct drm_panfrost_submit * request, size_t size);
+ 	IOReturn syncobjWait(struct drm_syncobj_wait * request);
+ 	IOReturn syncobjArray(struct drm_syncobj_array * request);
+@@ -403,6 +426,7 @@ RedwoodMaliUserClient::freeBuffer(struct mali_buffer * b)
+ 		}
+ 		b->memory->release();
+ 	}
++	OSSafeReleaseNULL(b->surface);
+ 	b->memory = NULL;
+ 	fBufferCount--;
+ 	fBufferBytes -= b->size;
+@@ -494,6 +518,86 @@ RedwoodMaliUserClient::createBo(struct drm_panfrost_create_bo * request)
+ 	return kIOReturnSuccess;
+ }
+ 
++static uint32_t gMaliSurfacesLogged;
++
++/* An IOSurface's pixels as a buffer (as y2sios' RedwoodMali surfaceBuffer()): the same surface is the same buffer. */
++IOReturn
++RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++	struct mali_buffer * b = NULL;
++	uint64_t size;
++	uintptr_t kernel;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	size = round_page_64(s->allocSize);
++	kernel = s->kernelAddress();
++	if (s->memory == NULL || kernel == 0 || size == 0 || size > MALI_BUFFER_MAX || size > s->memory->getLength()) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	for (uint32_t i = 0; i < 2; i++) {
++		bool real = i < s->planeCount;
++
++		request->planeOffset[i] = real ? s->planes[i].offset : (i == 0 ? s->offset : 0);
++		request->planeRowBytes[i] = real ? s->planes[i].bytesPerRow : (i == 0 ? s->bytesPerRow : 0);
++	}
++	if (request->handle == kRedwoodDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		s->release();
++	} else if ((b = newBuffer(s->memory, size, SWEET_MALI_MAP_NOEXEC, &request->handle)) != NULL) {
++		s->memory->retain();
++		b->memory = s->memory;
++		b->surface = s;                        /* (takes the reference) */
++		b->kernel = kernel;
++		if (gMaliSurfacesLogged++ < 8) {
++			IOLog("SWEET MALI: %s imports IOSurface %u (%ux%u, format %#x, %llu KB) as buffer %u at %#llx\n", fName, s->id,
++			    s->width, s->height, s->pixelFormat, size >> 10, request->handle, b->address);
++		}
++	} else {
++		s->release();
++	}
++	IOLockUnlock(gMaliLock);
++	return b != NULL ? kIOReturnSuccess : kIOReturnNoMemory;
++}
++
++void
++sweet_mali_surface_for_cpu(SweetSurface * s, uintptr_t kaddr)
++{
++	uint64_t fence = s->gpuFence;
++	static uint32_t late;
++
++	if (fence == 0 || fence == s->gpuSeen || kaddr == 0) {
++		return;
++	}
++	if (!sweet_mali_wait(fence, MALI_SURFACE_WAIT_MS) && late++ < 8) {
++		IOLog("SWEET MALI: IOSurface %u: job %llu not done after %u ms; shown as it is\n", s->id, fence, MALI_SURFACE_WAIT_MS);
++	}
++	sweet_mali_to_memory((const void *) kaddr, s->allocSize);
++	s->gpuSeen = fence;
++}
++
+ IOReturn
+ RedwoodMaliUserClient::submit(struct drm_panfrost_submit * request, size_t size)
+ {
+@@ -516,6 +620,19 @@ RedwoodMaliUserClient::submit(struct drm_panfrost_submit * request, size_t size)
+ 		}
+ 	}
+ 	IOLockLock(gMaliLock);
++	/* IOSurfaces: out of the CPU's cache when somebody has said they changed, and always the first time */
++	for (uint32_t i = 0; i < count; i++) {
++		struct mali_buffer * b = buffer(handles[i]);
++
++		if (b != NULL && b->surface != NULL) {
++			uint32_t seed = b->surface->seed();
++
++			if (seed != b->seed || b->fence == 0) {
++				b->seed = seed;
++				sweet_mali_to_memory((const void *) b->kernel, b->size);
++			}
++		}
++	}
+ 	sweet_mali_to_memory(NULL, 0);                  /* the program's writes to memory first: a barrier */
+ 	fence = sweet_mali_submit(request->jc, request->requirements);
+ 	if (fence != 0) {
+@@ -524,6 +641,9 @@ RedwoodMaliUserClient::submit(struct drm_panfrost_submit * request, size_t size)
+ 
+ 			if (b != NULL) {
+ 				b->fence = fence;
++				if (b->surface != NULL) {
++					b->surface->gpuFence = fence;
++				}
+ 			}
+ 		}
+ 		if (request->out_sync != 0 && (out = syncobj(request->out_sync)) != NULL) {
+@@ -694,6 +814,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		struct drm_syncobj_array syncArray;
+ 		struct redwood_syncobj_fence syncFence;
+ 		struct redwood_mali_counts counts;
++		struct redwood_surface surface;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct mali_buffer * b;
+@@ -808,6 +929,9 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 	case kRedwoodMaliCounts:
+ 		sweet_mali_counts(&r.counts.jobs, &r.counts.faults, &r.counts.resets, &r.counts.last);
+ 		break;
++	case kRedwoodSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
+ 	default:
+ 		IOLog("SWEET MALI: request %#x (%zu bytes) is not known here\n", selector, size);
+ 		ret = kIOReturnUnsupported;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..2145800 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,11 +40,22 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
++	/* The A8's GPU (SweetMali.cpp): its last job that names this surface, and the last one whose drawing the CPU was let see */
++	volatile uint64_t         gpuFence;
++	uint64_t                  gpuSeen;
++
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
++
++	/* The seed in the shared state page: bumped by every unlock that may have written the pixels. */
++	uint32_t
++	seed()
++	{
++		return *(volatile uint32_t *)((uint8_t *)state->getBytesNoCopy() + 0xc);
++	}
+ };
+ 
+ /* Retained surface for an id, or NULL. */
+@@ -61,5 +72,14 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * Before the CPU reads a surface's pixels at kaddr (its kernel address): wait
++ * for the GPU's last job on it and drop the CPU's stale cache lines
++ * (SweetMali.cpp). Nothing to do for a surface the GPU never touched.
++ */
++void sweet_mali_surface_for_cpu(SweetSurface *surface, uintptr_t kaddr);
++#endif
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
