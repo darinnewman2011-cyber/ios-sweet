@@ -1,0 +1,81 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f41b75b..348f17e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,49 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(SWEET_JACKPOTLTE)
++#include <pexpert/pexpert.h>
++/*
++ * Boot-arg sweetinject=NAME (GPU step G8, the A8): the program whose file is called NAME is started
++ * with DYLD_INSERT_LIBRARIES=/sweet/lib/libsweet-gl-loader.dylib in its environment, so dyld loads
++ * the GL bridge's loader into it (dyld honours that because of the "AMFI" dyld policy, 0119).
++ * launchd will not pass DYLD_ variables from a job's EnvironmentVariables, so the kernel adds it
++ * here, as y2sios' exec_inject_env() does (stormtroopxyz/y2sios, MIT). Without the boot-arg nothing
++ * changes.
++ */
++#define SWEET_INJECT_LIBRARY    "/sweet/lib/libsweet-gl-loader.dylib"
++
++static char sweet_inject_name[32];
++static int sweet_inject_read;
++static uint32_t sweet_inject_count;
++
++static bool
++sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
++{
++	size_t namelen;
++
++	if (!sweet_inject_read) {
++		if (!PE_parse_boot_argn("sweetinject", sweet_inject_name, sizeof(sweet_inject_name))) {
++			sweet_inject_name[0] = 0;
++		}
++		sweet_inject_read = 1;
++	}
++	if (sweet_inject_name[0] == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	if (namelen == 0 || namelen != strnlen(sweet_inject_name, sizeof(sweet_inject_name)) ||
++	    strncmp(imgp->ip_ndp->ni_cnd.cn_nameptr, sweet_inject_name, namelen) != 0) {
++		return false;
++	}
++	strlcpy(env, "DYLD_INSERT_LIBRARIES=" SWEET_INJECT_LIBRARY, size);
++	if (sweet_inject_count++ < 8) {
++		printf("SWEET INJECT: %s started with %s\n", sweet_inject_name, env);
++	}
++	return true;
++}
++#endif
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5784,26 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(SWEET_JACKPOTLTE)
++	/* one more variable for the program named by sweetinject (see sweet_exec_inject) */
++	{
++		char inject_env[96];
++
++		if (sweet_exec_inject(imgp, inject_env, sizeof(inject_env))) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
