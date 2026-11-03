@@ -2206,24 +2206,32 @@ main(int argc, char **argv)
    }
    pipe->texture_unmap(pipe, xfer);
 
-   /* AIR_RUN_ALL_RT=1: the first 16 bytes of row 0 of every bound target (pixel (0, 0)
-    * of a 128-bit target, pixels 0-3 of a 32-bit one) as raw words, to tell an
-    * output that landed in the wrong target from one that was dropped (G9 M2 run 5:
-    * clearFragment04 and 08, which write only target 1, read back 0 on the Mali).
+   /* AIR_RUN_ALL_RT=1: every pixel of every bound target as raw words, row by row, to
+    * tell an output that landed in the wrong target or pixel from one that was dropped
+    * (G9 M2 run 5: clearFragment04/08, which write only target 1, read back 0 on the
+    * Mali; run 7: with two rgba8 targets only pixel (0, 0) of target 0 was written).
     */
    const char *all_rt = getenv("AIR_RUN_ALL_RT");
    if (all_rt && *all_rt == '1') {
+      unsigned words = util_format_get_blocksize(rt_format) / 4;
       for (unsigned i = 0; i < num_rt; i++) {
          struct pipe_transfer *x;
-         uint32_t *w = pipe->texture_map(pipe, rt_res[i], 0, PIPE_MAP_READ,
-                                         &(struct pipe_box){ .width = WIDTH, .height = 1,
-                                                             .depth = 1 }, &x);
-         if (!w) {
-            printf("air_run: render target %u could not be read back\n", i);
+         uint8_t *m = pipe->texture_map(pipe, rt_res[i], 0, PIPE_MAP_READ,
+                                        &(struct pipe_box){ .width = WIDTH, .height = HEIGHT,
+                                                            .depth = 1 }, &x);
+         if (!m) {
+            printf("air_run: render target %u could not be read back
+", i);
             continue;
          }
-         printf("air_run: render target %u pixel (0, 0) words %08x %08x %08x %08x\n", i,
-                w[0], w[1], w[2], w[3]);
+         for (unsigned y = 0; y < HEIGHT; y++) {
+            const uint32_t *w = (const uint32_t *)(m + y * x->stride);
+            printf("air_run: render target %u row %u:", i, y);
+            for (unsigned k = 0; k < WIDTH * words; k++)
+               printf(" %08x", w[k]);
+            printf("
+");
+         }
          pipe->texture_unmap(pipe, x);
       }
    }
