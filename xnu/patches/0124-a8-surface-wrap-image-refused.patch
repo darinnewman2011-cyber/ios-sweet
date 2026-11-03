@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2a202b4..bd71759 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -43,6 +43,7 @@
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
+ 	kSweetSurfaceWrapClientMemory   = 7,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+@@ -773,9 +774,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case kSweetSurfaceWrapClientImage:
+ 	case kSweetSurfaceWrapClientMemory:
+ 		/*
+-		 * IOSurfaceWrapClientImage/Memory: a surface around the caller's own memory. Not done
++		 * IOSurfaceWrapClientImage (6) / IOSurfaceWrapClientMemory (7): a surface around the caller's own memory. Not done
+ 		 * here, and saying so is what matters: an empty "success" leaves the library a surface
+ 		 * with no shared state page, and CoreAnimation's OpenGL ES renderer, which wraps its
+ 		 * pictures this way, then dies reading it (IOSurfaceGetBulkAttachments, address 0x30).
