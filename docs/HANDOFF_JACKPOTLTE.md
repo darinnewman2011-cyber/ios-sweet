@@ -652,6 +652,13 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     - Fix on the translator side (commit 28a191e, gpu.yml run 41663781057): `nir_lower_scratch_to_var` +
       `nir_lower_indirect_derefs` (≤16) + `nir_lower_vars_to_scratch` for the rest, so small private arrays never
       touch scratch. Large indirect arrays would still hit the scratch problem.
+    - **Run 7 (`_tmp/m1u.cmd`, 28a191e installed by a full image edit): scratch is gone from BlitLuma's Bifrost code
+      (no `.tl` access, `uint[2] scratch` promoted), but the results are unchanged**: (0,0,0,1) before the fault,
+      zeros after. So scratch was **not** the cause. New observation: with `--zero` BlitLuma's bounds check
+      (`gid < ubo0.xy`) fails, so it stores nothing, yet its image does not read back as the upload pattern. The
+      Blit images are 16-bit (`R16G16B16A16_UINT`, image_shapes), and air_run's texel printout reads every image as
+      four 32-bit channels, so those numbers were never the texels. 32-bit images (DrawSpans, DrawEye) do show the
+      pattern. Commit 2a9b6f3: `AIR_RUN_DUMP=1` prints raw bytes after upload and after dispatch, plus constants.
     - One test boot (ios34) hung at `bsd_init: calling IOKitInitializeTime` and rebooted after ~25 s (first time
       seen; next boot of the same image was fine).
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
