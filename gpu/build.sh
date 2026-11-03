@@ -94,3 +94,20 @@ python3 mkeagl.py src/eagl_slots.txt "$B/mesa-$VERSION/src/mapi/glapi/registry/g
 "$CLANG" $TARGET -O2 -dynamiclib -install_name /sweet/lib/libsweet-gl-loader.dylib -framework IOKit 	-o out/libsweet-gl-loader.dylib src/sweet_gl_loader.c
 codesign -s - -f out/mali_test out/gl_test out/libOSMesa.8.dylib out/libredwood-gl.dylib out/libsweet-gl-loader.dylib
 echo "build.sh: out/libOSMesa.8.dylib ($(wc -c < out/libOSMesa.8.dylib) bytes), out/gl_test"
+
+# GPU step G9 (Metal), M0: the AIR translator's programs against panfrost (air-panfrost.patch). Not fatal:
+# the OpenGL ES outputs above stay usable if these fail to build.
+#   out/air_run              a .metallib's compute kernel (or draw) on the GPU, checked against softpipe
+#   out/libredwoodair.dylib  the GPU half of the Metal driver (air_metal.h), install name /sweet/lib/libredwoodair.dylib
+#   out/air_metal_test       that library driven the way the Metal runtime drives it
+P=src/gallium/drivers/panfrost
+if ninja -C "$B/$BUILD" $P/air_run $P/libredwoodair.dylib $P/air_metal_test > "$B/air-build.log" 2>&1; then
+	cp "$B/$BUILD/$P/air_run" "$B/$BUILD/$P/libredwoodair.dylib" "$B/$BUILD/$P/air_metal_test" out/
+	install_name_tool -id /sweet/lib/libredwoodair.dylib out/libredwoodair.dylib
+	install_name_tool -change /redwood/lib/libredwoodair.dylib /sweet/lib/libredwoodair.dylib out/air_metal_test
+	xcrun strip -x out/libredwoodair.dylib
+	codesign -s - -f out/air_run out/libredwoodair.dylib out/air_metal_test
+	echo "build.sh: out/air_run, out/libredwoodair.dylib ($(wc -c < out/libredwoodair.dylib) bytes), out/air_metal_test"
+else
+	echo "build.sh: the AIR programs did not build:"; grep -E "error|FAILED" "$B/air-build.log" | head -40
+fi
