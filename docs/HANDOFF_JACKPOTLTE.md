@@ -691,7 +691,18 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       shader drawn correctly on the Mali** -- pixel (0,0) = 2.10170319e-18, 0.178894654, 1.48687698e+16,
       1.21394141e+33, bit-identical to softpipe; 0 faults, 2 jobs.
     - `clearFragment04` (writes only FRAG_RESULT_DATA1, 2 render targets): 0 faults but **render target 1 reads back
-      0** on the Mali vs the softpipe value. Open: next run traces it (blend descriptor / BLEND RT index).
+      0** on the Mali vs the softpipe value.
+    - Run 3 (`_tmp/m2c.cmd`, first on the 4-minute ios40 image): 03 and 05 right; 02, 04, 08 read back 0. The
+      pandecode trace of 04 shows both colour targets set up correctly (RAW128, bases `0x...8000`/`0x...c000`,
+      tile-buffer offsets 0/2048), the shader's BLEND using blend_descriptor_1.
+    - Run 4 (`_tmp/m2d.cmd`, `BIFROST_MESA_DEBUG=shaders`): 02 and 03 compile identically apart from the UBO
+      offset. **02's values are >= 2^31 and the output was declared `ivec4`**: BLEND.s32 into a uint target
+      clamps them to 0 (softpipe copies bits). **Fix 59a3d94**: air_to_nir declares an output unsigned when
+      `air.arg_type_name` starts with `u`; air_run uses an SINT target for int outputs and sets every blend
+      target with independent blending.
+    - **Run 5 (`_tmp/m2e.cmd`): clear shaders 01, 02, 03, 05, 06, 07 all bit-identical to softpipe, 0 faults.**
+      Still 0: **04 and 08, the two that write only target 1** (float and int). Run 6 (`_tmp/m2f.cmd`, air_run
+      f8e3fc6 `AIR_RUN_ALL_RT=1`) prints every target to see whether the output lands in target 0 or is dropped.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
