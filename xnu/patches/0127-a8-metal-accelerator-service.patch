@@ -1,0 +1,158 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -0,0 +1,123 @@
++/*
++ * Metal's device discovery for the Galaxy A8 (G9 Metal, step M3). After y2sios' IOAcceleratorES
++ * in MiniIOMobileFramebuffer.cpp (stormtroopxyz/y2sios, MIT; on HackiOS, MIT).
++ *
++ * Metal finds a GPU in one way: MTLRegisterDevices() walks IOServiceMatching("IOAcceleratorES"),
++ * reads "MetalPluginName" off each service, opens "/System/Library/Extensions/" + that + ".bundle"
++ * and instantiates the class "MetalPluginClassName" names. This service is published WITHOUT the
++ * two properties, so nothing walks the Metal road at boot: backboardd, SpringBoard and the rest
++ * keep the GL path they have. A program sets them afterwards with IORegistryEntrySetCFProperties
++ * (sweet/bin/metal_props), and only processes started after that see a Metal device; setting a
++ * property to "" removes it again.
++ *
++ * Gated on boot-arg sweetmetal=1: without it setProperties is refused, as IORegistryEntry's own
++ * is. Metal's checks on a device object are asserts, so a half-made device aborts the process
++ * that asked, and an aborting daemon is restarted by launchd in a loop; a boot that can have the
++ * properties at all is one made on purpose. Only those two keys, as strings, are taken.
++ */
++
++#if defined(SWEET_JACKPOTLTE)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
++#include <pexpert/pexpert.h>
++
++extern "C" void proc_selfname(char * buf, int size);
++
++#define kSweetPluginNameKey  "MetalPluginName"
++#define kSweetPluginClassKey "MetalPluginClassName"
++
++static bool gSweetMetal;
++
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++IOReturn
++IOAcceleratorES::setProperties(OSObject * properties)
++{
++	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator * keys;
++	OSObject * next;
++	char who[32] = "?";
++
++	proc_selfname(who, sizeof(who));
++	if (!gSweetMetal) {
++		IOLog("SWEET METAL: %s asks to set properties on IOAcceleratorES; boot-arg sweetmetal=1 was not given\n", who);
++		return kIOReturnUnsupported;
++	}
++	if (dict == NULL || dict->getCount() == 0) {
++		return kIOReturnBadArgument;
++	}
++	keys = OSCollectionIterator::withCollection(dict);
++	if (keys == NULL) {
++		return kIOReturnNoMemory;
++	}
++	/* everything is checked before anything is set: refused whole or taken whole */
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
++
++		if (key == NULL || (!key->isEqualTo(kSweetPluginNameKey) && !key->isEqualTo(kSweetPluginClassKey)) ||
++		    OSDynamicCast(OSString, dict->getObject(key)) == NULL) {
++			IOLog("SWEET METAL: refusing what %s sent: only string " kSweetPluginNameKey " and "
++			    kSweetPluginClassKey " are taken\n", who);
++			keys->release();
++			return kIOReturnUnsupported;
++		}
++	}
++	keys->reset();
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
++		OSString * value = OSDynamicCast(OSString, dict->getObject(key));
++
++		if (value->getLength() == 0) {
++			removeProperty(key);
++			IOLog("SWEET METAL: %s removed by %s\n", key->getCStringNoCopy(), who);
++		} else if (setProperty(key, value)) {
++			IOLog("SWEET METAL: %s = %s, set by %s\n", key->getCStringNoCopy(), value->getCStringNoCopy(), who);
++		} else {
++			keys->release();
++			return kIOReturnNoMemory;
++		}
++	}
++	keys->release();
++	return kIOReturnSuccess;
++}
++
++/* Called by RedwoodMali::start (SweetMali.cpp): the accelerator hangs off the GPU's own service. */
++extern "C" void
++sweet_publish_accelerator(IOService * provider)
++{
++	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
++	uint32_t metal = 0;
++
++	gSweetMetal = PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0;
++	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
++		accelerator->setName("sgx");
++		accelerator->registerService();
++		IOLog("SWEET METAL: IOAcceleratorES \"sgx\" published%s\n",
++		    gSweetMetal ? "; sweetmetal=1: it takes MetalPluginName/MetalPluginClassName from user space" : "");
++	}
++	OSSafeReleaseNULL(accelerator);
++}
++
++#else
++
++#include <IOKit/IOService.h>
++
++extern "C" void
++sweet_publish_accelerator(__unused IOService * provider)
++{
++}
++
++#endif /* SWEET_JACKPOTLTE */
++
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -181,6 +181,8 @@
+ 
+ OSDefineMetaClassAndStructors(RedwoodMali, IOService);
+ 
++extern "C" void sweet_publish_accelerator(IOService * provider);   /* SweetAccelerator.cpp */
++
+ bool
+ RedwoodMali::start(IOService * provider)
+ {
+@@ -194,6 +196,7 @@
+ 	setName("RedwoodMali");
+ 	registerService();
+ 	IOLog("SWEET MALI: service RedwoodMali ready (product %#llx); programs speak panfrost 1.3 to it\n", id);
++	sweet_publish_accelerator(this);
+ 	return true;
+ }
+ 
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,5 +18,6 @@
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetMali.cpp                                   optional iokitcpp
++iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
