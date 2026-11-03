@@ -1692,9 +1692,20 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
       if (!coord)
          return false;
+      /* The type of a store is the type of what it stores. dest_type comes
+       * from the intrinsic's return type, which for a write is void: the store
+       * went out as a sizeless "uint", the Mali took that as four 32-bit
+       * registers, and a half4/ushort4 value fills only two -- so the third
+       * and fourth channels of every AV1SW Blit image were whatever the
+       * register file held, 1 before an earlier process's GPU fault and 0
+       * after the reset (G9 M1 run 8, AIR_RUN_DUMP).
+       */
+      dest_type = tex_dest_type(c, in->operands[arg]->type, n);
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
+      if (nir_alu_type_get_type_size(dest_type) != value->bit_size)
+         dest_type = nir_alu_type_get_base_type(dest_type) | value->bit_size;
       uint64_t lod;
       if (!tex_flag(c, in, arg, &lod))
          return false;
