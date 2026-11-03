@@ -86,6 +86,44 @@ There is **no Metal**. iOS 16 CoreAnimation normally renders with Metal; the S7 
    DVFS (raise the clock step by step with Samsung's own table and voltages, never above `gpu_max_clock`),
    thermal limits, fault recovery (the S7 still sees occasional GPU read faults).
 
+## Plan from 2026-11-02: follow y2sios (Galaxy S20+, Mali-G77), MIT
+
+`stormtroopxyz/y2sios` (snapshot 68fe2e9, MIT, on top of HackiOS, MIT; Mesa MIT; read only, credit when reusing)
+has the whole stack working on a Job-Manager Mali, the same job interface as our G71:
+
+```
+CoreAnimation -> EAGL (userland/src/eagl.c, 4.2k lines) -> OSMesa -> Mesa 25.0.7 panfrost
+  -> redwood-drm (libdrm stand-in, tools/mesa/redwood-drm) -> IOKit RedwoodMali (panfrost UAPI 1.3, 1.1k lines)
+  -> bsd/dev/redwood_mali.c (1.3k lines: power, reset, quirks, page tables, VA, FIFO scheduler, fault reset)
+Metal later: RedwoodMetal.bundle (redwoodmetal.m 9.8k lines) + AIR->NIR translator (tools/mesa/air, ~20k lines)
+```
+
+Their order, which we copy: GL first (CoreAnimation on the GPU through EAGL; PosterBoard's wallpaper already showed
+on GL), Metal second (wallpaper renderer, widgets, Metal apps). Their docs/plans/04-gpu.md, 05-metal.md and
+10-mali2metal.md log every bug they hit; the ones that will hit us too: Mesa's deadline clock vs the kernel's
+(every wait expired), UBO slot 0 must be a user buffer, Panfrost needs 64-byte IOSurface rows (copy-import odd
+pitches, never round the kernel's), 16-bit varyings must be widened (Valhall; check on Bifrost), cached GPU memory
+needs inner-shareable PTEs, the tiler heap should be lazy and small (128 MB per process otherwise).
+
+A8 differences:
+- G71 r0p0 (`GPU_ID 0x60a00002`, Bifrost v6), 2 cores. Linux panfrost supports it (TMIx quirks/issues); Mesa
+  25.0.7 has a `G71` model row but its docs say "not yet supported" (G72, same v6, is conformant). **Biggest risk.**
+- Power: rail and domain already on at hand-over, no PMU/TZPC SMC needed (steps 2-3 ran without them).
+- XNU here has 4 KiB pages (theirs 16 KiB): GPU page == CPU page, simpler.
+- Userland must be built on macOS with the iPhoneOS SDK: a new GitHub workflow on the macOS runners.
+- Our built-in AMFI (patches 0025/0035/0036) runs any ad-hoc-signed binary on the root filesystem as a platform
+  binary, so test tools and dylibs can be added to root.img. Still to check: dylib injection into backboardd
+  (HakiOS `inject.c` / dyld env policy) and writing new files into the journaled HFS+ root.img from WSL.
+
+Steps:
+- G4 kernel: port redwood_mali.c + RedwoodMali.cpp to the A8 (G71 quirks from Linux `panfrost_gpu.c`/`panfrost_issues.h`),
+  self-test with `sweetgpu=4` (job loop through the scheduler, ramoops log).
+- G5 userland CI: macOS workflow building Mesa panfrost (G71 row) + redwood-drm + `mali_test` + `gl_test` for iOS arm64.
+- G6 root image: add the tools to root.img; `mali_test` then `gl_test` triangle on the phone.
+- G7 EAGL bridge + injection into backboardd: CoreAnimation on the GPU.
+- G8 display: GPU scales into the panel buffer (ends the CPU copy), then IRQs and GPU DVFS.
+- G9 Metal (wallpaper, widgets).
+
 ## Risks and unknowns
 
 - `pd-g3d` state at S-Boot hand-over is unknown (read it first; turning a domain on is a PMU write).
