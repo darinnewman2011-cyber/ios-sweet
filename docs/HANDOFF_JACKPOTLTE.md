@@ -532,7 +532,23 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     job `com.sweet.malitest` (in `/System/Library/xpc/launchd.plist`) that runs `mali_test 1000` once at boot with
     output to `/dev/console`.
   - **ios21** (`f8901cca5273f9e960a1d79027dfba413e603065d76107625baa516d6568ec57`) = 0115 kernel, ios20 cmdline +
-    `sweetfb_fit=1`. Flashed 2026-11-02 19:53; result pending.
+    `sweetfb_fit=1`. Flashed 2026-11-02 19:53.
+  - **ios21 panicked** when mali_test made its first buffer: `phystokv_range: illegal PA: 0xa31b4000` from
+    `pmap_sync_page_attributes_phys` (write-combined IOBufferMemoryDescriptor): `(vm_offset_t)(pp << PAGE_SHIFT)` shifts
+    the 32-bit ppnum_t before widening, dropping bit 35 of `0x8a31b4000` (code that Apple's coherent SoCs never build).
+    **0116** (commit 2538631, xnu run 41563096789, `_tmp/a8art28`) shifts in 64 bits (checked in the disassembly).
+  - **ios21n** (`b826dad0…7fe3`, 0115 kernel, no `sweetgpu`): user confirmed the restored apps on the home screen and the
+    fit mode (whole screen, home bar and battery icon visible). First boot took ~20 min (LaunchServices reseed).
+  - **ios22** (`7ab935a706029e6243fc7786081f192dbf87a91571e26ff0e87d107963be7e08`, 0116 kernel, ios21 cmdline): no panic.
+    First run: `2001 jobs, 1001 faults, 1001 resets; self test PASSED`: every mali_test job faulted. Cause: y2sios wrote
+    mali_test for the Valhall G77; on Bifrost the job header needs bit 0 (64-bit descriptor), as the kernel self test has.
+    Fixed in source (commit d9d7a86) and on the phone by patching the two `mov w8,#4` to `#5` in the installed binary,
+    re-signing at the same size (81920 bytes) and writing only the 2 changed 4 KiB blocks into root.img (found by content
+    in the WSL copy; old contents checked on the phone before writing; WSL copy updated the same way).
+  - **GPU step 6 part 1 DONE (ios22, second run): `SWEET MALI: up; 2001 jobs, 0 faults, 0 resets; self test PASSED`.**
+    An iOS process drives the Mali through the panfrost UAPI (CREATE_BO, MMAP, SUBMIT, syncobj and WAIT_BO). Counters are
+    per boot. Next: gl_test (Mesa panfrost on the G71). The 16 KB ramoops window is flooded by backboardd's
+    `IOAcceleratorES` matching trace at ~80 s; the 30 s status line is the reliable place for results.
   - User priorities (2026-11-02): GPU (G6, then G7 EAGL for smoothness, G8, G9 Metal for wallpapers), then Wi-Fi
     (quick path: an Ethernet-style interface first), then the AppleKeyStore stub (keychain), Bluetooth, camera last.
   - PC: the user's old Android build trees in WSL `/home/Darin` were deleted on request (200 GB inside WSL);
