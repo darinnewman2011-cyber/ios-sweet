@@ -125,6 +125,7 @@ m3 RedwoodMetal -bundle -Wno-deprecated-declarations -framework Foundation -fram
 	-o out/RedwoodMetal src/redwoodmetal.m src/redwooddrawable.m
 cp src/metal_plugin.plist out/RedwoodMetal.Info.plist
 m3 metal_props -framework CoreFoundation -framework IOKit -o out/metal_props src/metal_props.c
+m3 sweet-dmesg -o out/sweet-dmesg src/sweet_dmesg.c          # the kernel message buffer, whole (no dmesg on iOS)
 m3 metal_test -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
 	-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES -lMobileGestalt \
 	-o out/metal_test src/metal_test.m
