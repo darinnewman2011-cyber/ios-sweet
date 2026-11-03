@@ -10,8 +10,9 @@
  * other hooks there are addresses inside iOS 16.5's shared cache and are not used here.
  *
  * Boot-arg sweetgl=0: leave CoreAnimation on its software renderer.
- * The library's log lines ("redwood-gl: ...") go to stderr, which is sent to the console when it was
- * /dev/null, so they reach the kernel's log.
+ * The library's log lines ("redwood-gl: ...") go to stderr. When the image has /sweet/gl.log (1 MiB, made
+ * by tools/a8run.py glprepare, written in place so TWRP can read it: a8run.py gllog), stderr goes there,
+ * cleared at every start; otherwise to the console if it was /dev/null.
  */
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
@@ -25,6 +26,7 @@
 #include <unistd.h>
 
 #define SWEET_GL "/sweet/lib/libredwood-gl.dylib"
+#define SWEET_GL_LOG "/sweet/gl.log"
 
 static void
 say(const char *format, ...)
@@ -44,12 +46,29 @@ say(const char *format, ...)
 	}
 }
 
-/* stderr to the console if it goes nowhere (launchd gives a job /dev/null) */
+/* stderr into /sweet/gl.log (in place: cleared, never truncated), or to the console if it goes nowhere */
 static void
 stderr_to_console(void)
 {
-	struct stat err, null;
+	static const char zero[4096];
+	struct stat err, null, log;
 	int fd;
+
+	fd = open(SWEET_GL_LOG, O_WRONLY | O_NOCTTY);
+	if (fd >= 0 && fstat(fd, &log) == 0 && log.st_size > 0) {
+		for (off_t o = 0; o < log.st_size; o += (off_t)sizeof(zero)) {
+			pwrite(fd, zero, sizeof(zero), o);
+		}
+		lseek(fd, 0, SEEK_SET);
+		dup2(fd, 2);
+		if (fd != 2) {
+			close(fd);
+		}
+		return;
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
 
 	if (fstat(2, &err) != 0 || stat("/dev/null", &null) != 0) {
 		return;

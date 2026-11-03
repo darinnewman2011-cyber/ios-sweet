@@ -6,6 +6,9 @@ read /sweet/run.log straight through their 4 KiB blocks inside /data/sweet/root.
     a8run.py map IMAGE MAP.json      find the marked blocks in a root image that has them installed (in WSL, local copy)
     a8run.py cmd MAP.json FILE       write FILE (up to 4000 bytes of commands) into run.cmd's first block on the phone
     a8run.py log MAP.json [OUT]      read run.log from the phone (to OUT or stdout)
+    a8run.py glprepare DIR           make DIR/gl.log (1 MiB, marked), libsweet-gl-loader's log (GPU step G8)
+    a8run.py glmap IMAGE MAP.json    find gl.log's blocks in a root image that has it installed
+    a8run.py gllog MAP.json [OUT]    read gl.log from the phone
 
 The files are only ever overwritten in place (sweet-run uses pwrite inside the fixed size), so HFS+ keeps their blocks
 where `map` found them. `cmd` checks the block's marker on the phone before writing it.
@@ -17,6 +20,7 @@ import sys
 
 B = 4096
 CMD_BLOCKS, LOG_BLOCKS = 16, 256
+GL_BLOCKS = 256
 MARK = b'SWEETRUN %s %04d\n'
 ADB = os.environ.get('ADB', 'adb')
 DEFAULT_CMD = b'''# sweet-run commands: tools/a8run.py cmd MAP.json FILE writes them on the phone
@@ -41,12 +45,17 @@ def prepare(d):
         f.write(b''.join(block('log', i) for i in range(LOG_BLOCKS)))
 
 
-def find(image, out):
+def glprepare(d):
+    with open(os.path.join(d, 'gl.log'), 'wb') as f:
+        f.write(b''.join(block('glg', i) for i in range(GL_BLOCKS)))
+
+
+def find(image, out, kinds=(('cmd', CMD_BLOCKS), ('log', LOG_BLOCKS))):
     want = {}
-    for kind, count in (('cmd', CMD_BLOCKS), ('log', LOG_BLOCKS)):
+    for kind, count in kinds:
         for i in range(count):
             want[MARK % (kind.encode(), i)] = (kind, i)
-    found = {'cmd': [None] * CMD_BLOCKS, 'log': [None] * LOG_BLOCKS}
+    found = {kind: [None] * count for kind, count in kinds}
     with open(image, 'rb') as f:
         off = 0
         while True:
@@ -69,7 +78,7 @@ def find(image, out):
             sys.exit(f'{kind}: blocks {[i for i, b in enumerate(found[kind]) if b is None]} not found')
     with open(out, 'w') as f:
         json.dump(found, f)
-    print(f'run.cmd blocks start {found["cmd"][0]}, run.log blocks {found["log"][0]}..{found["log"][-1]}')
+    print(', '.join(f'{kind} blocks {found[kind][0]}..{found[kind][-1]}' for kind in found))
 
 
 def shell(script, binary=False):
@@ -102,8 +111,8 @@ def cmd(mapfile, src):
     print(f'run.cmd: {len(text)} bytes written')
 
 
-def log(mapfile, out=None):
-    data = read_blocks(json.load(open(mapfile))['log'])
+def log(mapfile, out=None, kind='log'):
+    data = read_blocks(json.load(open(mapfile))[kind])
     text = data.split(b'\0', 1)[0]       # sweet-run clears the whole file (markers too), then writes from 0
     if out:
         open(out, 'wb').write(text)
@@ -121,5 +130,11 @@ if __name__ == '__main__':
         cmd(a[1], a[2])
     elif a[:1] == ['log'] and len(a) in (2, 3):
         log(*a[1:])
+    elif a[:1] == ['glprepare'] and len(a) == 2:
+        glprepare(a[1])
+    elif a[:1] == ['glmap'] and len(a) == 3:
+        find(a[1], a[2], (('glg', GL_BLOCKS),))
+    elif a[:1] == ['gllog'] and len(a) in (2, 3):
+        log(a[1], a[2] if len(a) == 3 else None, 'glg')
     else:
         sys.exit(__doc__)
