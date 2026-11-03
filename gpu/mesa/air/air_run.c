@@ -904,6 +904,53 @@ sampler_for_slot(const struct air_shader_info *info, unsigned idx, bool unnormal
    };
 }
 
+/* The first two rows of a resource as bytes, through the driver's own map.
+ *
+ * The texel printout further down reads every image as four 32-bit channels,
+ * which is wrong for the 16-bit formats image_shapes picks for a narrow store:
+ * on the Mali the AV1SW Blit kernels' images read back as (0,0,0,1) before an
+ * earlier process's GPU fault and all zero after it (G9 M1 runs 4-7), and
+ * whether that was the upload, the store or the readback could not be told
+ * from it. So the bytes, once after the upload and once after the dispatch.
+ * Only with AIR_RUN_DUMP=1: a map is itself an operation on the resource, and
+ * a run without it stays the run it always was.
+ */
+static bool
+want_dump(void)
+{
+   const char *e = getenv("AIR_RUN_DUMP");
+   return e && *e && *e != '0';
+}
+
+static void
+dump_resource(struct pipe_context *pipe, struct pipe_resource *res, const char *what,
+              unsigned slot, const char *when)
+{
+   if (!want_dump())
+      return;
+   struct pipe_transfer *xfer;
+   unsigned bpt = util_format_get_blocksize(res->format);
+   unsigned row = bpt * TEX_SIZE;
+   void *p = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ,
+                               &(struct pipe_box){ .width = TEX_SIZE, .height = 2, .depth = 1 },
+                               &xfer);
+   if (!p) {
+      printf("air_run: %s %u (%s) %s: could not be mapped\n", what, slot,
+             util_format_short_name(res->format), when);
+      return;
+   }
+   printf("air_run: %s %u (%s, %u bytes a texel, row stride %u) %s, rows 0-1:", what, slot,
+          util_format_short_name(res->format), bpt, xfer->stride, when);
+   for (unsigned y = 0; y < 2; y++) {
+      const uint8_t *r = (const uint8_t *)p + y * xfer->stride;
+      printf("\n   ");
+      for (unsigned b = 0; b < MIN2(row, 64); b += 4)
+         printf(" %08x", r[b] | r[b + 1] << 8 | r[b + 2] << 16 | (uint32_t)r[b + 3] << 24);
+   }
+   printf("\n");
+   pipe->texture_unmap(pipe, xfer);
+}
+
 static int
 dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
                 nir_shader *cs, const char *name, const char *how)
@@ -976,6 +1023,12 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
             m[0] = m[5] = m[10] = m[15] = 1.0f;
             printf("air_run: constant buffer %u is a %s, so it holds the identity and "
                    "not the fill\n", r->index, r->type_name);
+         }
+         if (want_dump()) {
+            printf("air_run: constant buffer %u, %u bytes, first words:", r->index, bytes);
+            for (unsigned w = 0; w < MIN2(bytes / 4, 8); w++)
+               printf(" %08x", ((const uint32_t *)bits)[w]);
+            printf("\n");
          }
          struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
                                                       PIPE_USAGE_DEFAULT, bytes);
@@ -1090,6 +1143,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
                             iisf[i] ? (const void *)texels : (const void *)itexels,
                             TEX_SIZE * 4 * sizeof(float),
                             TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+      dump_resource(pipe, imgs[i], "image", i, "after the upload");
       ivs[i] = (struct pipe_image_view){
          .resource = imgs[i],
          .format = ifmt[i],
@@ -1155,6 +1209,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
                             tisf[i] ? (const void *)texels : (const void *)itexels,
                             TEX_SIZE * 4 * sizeof(float),
                             TEX_SIZE * TEX_SIZE * 4 * sizeof(float));
+      dump_resource(pipe, texes[i], "texture", i, "after the upload");
       struct pipe_sampler_view vtempl = { 0 };
       u_sampler_view_default_template(&vtempl, texes[i], texes[i]->format);
       views[i] = pipe->create_sampler_view(pipe, texes[i], &vtempl);
@@ -1291,6 +1346,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
    for (unsigned i = 0; i < num_img; i++) {
       if (!img_write[i])
          continue;
+      dump_resource(pipe, imgs[i], "image", i, "after the dispatch");
       struct pipe_transfer *xfer;
       unsigned depth = idim[i] == GLSL_SAMPLER_DIM_3D ? TEX_SIZE : 1;
       void *pix = pipe->texture_map(pipe, imgs[i], 0, PIPE_MAP_READ,
