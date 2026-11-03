@@ -499,7 +499,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     0 read glitches, 0 dirty FIFO, no panic. The LaunchServices reseed that blocked SpringBoard finished on its own
     (guess: it was just slow PIO I/O, ~1 MB/s). bluetoothd and fairplayd.H2 still crash-loop; touch and keys deliver
     HID events. The verbose console faded and the Apple logo came back right before the lock screen.
-  - Next for speed: multi-block writes/reads (CMD25/CMD18) or IDMAC; every sector is one PIO command today (~1 MB/s).
+  - **0111** (multi-block CMD18/CMD25, 64 KiB per command, run read back with one CMD18; `sweetrootverify=0` skips)
+    + **0112** (`sweetfb_noconsole=N`: console text hidden from GUI swap N on), commit 625e42c, CI 41552897282.
+    **ios18** (`7b891a4c…`, `sweetfb_noconsole=30 sweetfb_hz=30`): into iOS in under 5 min (was ~34), 0 failures.
+    **ios19** (`514a6db4…`, same + **`cpus=8`**): boots with the two A73s too (user: "it boots"); log: 1095 s, no
+    panic, 288958 sectors / 7506 multi-sector writes, 0 failed. Still laggy (CPU rendering). Guess (from y2sios): CPUs
+    may be at S-Boot clocks; check DVFS.
+  - **GPU step 4 (0113, commit 32f8b68, CI 41556352389):** Mali service (`sweetgpu=4`, docs/GPU_JACKPOTLTE.md);
+    **ios20** (`f9ad1c64…`, ios19 + `sweetgpu=4 sweetgputrace=4`) flashed 2026-11-02 ~19:15; result pending
+    (`SWEET MALI: self test:` line, early in the boot).
+  - `_tmp/flash-when-twrp.sh IMG SHA LOG`: waits for TWRP, saves ramoops, flashes BOOT with all checks, reboots.
+  - Next for speed: IDMAC (DMA) instead of PIO.
   - Live log plan (user chose 2026-11-02): DWC3 device mode at `0x13600000` + Exynos USB PHY init, presenting
     CDC-ACM (Windows `usbser` COM port, no driver needed) instead of sweet's CDC-ECM. Not started beyond reading
     sweet's `sweet_usb.c` (patches 0072–0077, 0081).
