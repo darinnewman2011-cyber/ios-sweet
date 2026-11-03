@@ -1692,6 +1692,19 @@ main(int argc, char **argv)
       fprintf(stderr, "air_run: %s writes no colour attachment\n", name);
       return 1;
    }
+   /* AIR_RUN_RT8=1: 32-bit targets of the same kind (rgba8 unorm/uint/sint). A
+    * diagnostic only: values are converted, so the pixel printed below is not
+    * comparable and only AIR_RUN_ALL_RT's raw words mean anything. It tests whether
+    * target 1 is dropped because two 128-bit targets fill the G71's tile buffer
+    * (G9 M2 run 6: target 1 stayed 0 for every shader on the Mali).
+    */
+   const char *rt8 = getenv("AIR_RUN_RT8");
+   if (rt8 && *rt8 == '1' && !rt_is_half) {
+      rt_format = rt_format == PIPE_FORMAT_R32G32B32A32_FLOAT  ? PIPE_FORMAT_R8G8B8A8_UNORM
+                : rt_format == PIPE_FORMAT_R32G32B32A32_SINT   ? PIPE_FORMAT_R8G8B8A8_SINT
+                                                               : PIPE_FORMAT_R8G8B8A8_UINT;
+      rt_is_float = false;
+   }
 
    /* A shader may declare a render target and never store to it:
     * texturedFragment3DDepth returns {undef, depth} and its only real output
@@ -2193,7 +2206,8 @@ main(int argc, char **argv)
    }
    pipe->texture_unmap(pipe, xfer);
 
-   /* AIR_RUN_ALL_RT=1: pixel (0, 0) of every bound target as raw words, to tell an
+   /* AIR_RUN_ALL_RT=1: the first 16 bytes of row 0 of every bound target (pixel (0, 0)
+    * of a 128-bit target, pixels 0-3 of a 32-bit one) as raw words, to tell an
     * output that landed in the wrong target from one that was dropped (G9 M2 run 5:
     * clearFragment04 and 08, which write only target 1, read back 0 on the Mali).
     */
@@ -2202,7 +2216,7 @@ main(int argc, char **argv)
       for (unsigned i = 0; i < num_rt; i++) {
          struct pipe_transfer *x;
          uint32_t *w = pipe->texture_map(pipe, rt_res[i], 0, PIPE_MAP_READ,
-                                         &(struct pipe_box){ .width = 1, .height = 1,
+                                         &(struct pipe_box){ .width = WIDTH, .height = 1,
                                                              .depth = 1 }, &x);
          if (!w) {
             printf("air_run: render target %u could not be read back\n", i);
