@@ -12,6 +12,7 @@
  * printed and the next one runs. Signed with PosterBoard's com.apple.private.coreservices.canmaplsdatabase.
  */
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -139,6 +140,10 @@ via_record(NSString *bundle)
 			say(@"record: no LSApplicationExtensionRecord");
 			return;
 		}
+		if (![c instancesRespondToSelector:s]) {
+			say(@"record: LSApplicationExtensionRecord has no -initWithBundleIdentifier:error:");
+			return;
+		}
 		r = ((id (*)(id, SEL, id, NSError **))objc_msgSend)([c alloc], s, bundle, &err);
 		if (r == nil) {
 			say(@"record %@: none; %@", bundle, err ? describe(err) : @"no error");
@@ -158,7 +163,14 @@ probe(NSString *point, NSArray<NSString *> *bundles)
 	via_launchservices(point);
 	via_nsextension(point);
 	via_extensionkit(point);
+}
+
+/* the records last and each announced first: run 11's crashed (SIGSEGV, far 0x20) and took the rest with it */
+static void
+records(NSArray<NSString *> *bundles)
+{
 	for (NSString *b in bundles) {
+		say(@"record %@: asking", b);
 		via_record(b);
 	}
 }
@@ -167,7 +179,11 @@ int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
-		say(@"uid %d", getuid());
+		/* LSApplicationWorkspace lives in MobileCoreServices, which Foundation does not load (run 11: "no
+		 * LSApplicationWorkspace") */
+		say(@"uid %d; MobileCoreServices %s", getuid(),
+		    dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW) ?
+		    "loaded" : dlerror());
 		if (argc > 1) {
 			NSMutableArray *b = [NSMutableArray array];
 
@@ -175,15 +191,17 @@ main(int argc, char **argv)
 				[b addObject:@(argv[i])];
 			}
 			probe(@(argv[1]), b);
+			records(b);
 			return 0;
 		}
-		probe(@"com.apple.posterkit.provider", @[
+		probe(@"com.apple.posterkit.provider", @[]);
+		probe(@"com.apple.widgetkit-extension", @[]);
+		records(@[
 		    @"com.apple.WallpaperKit.CollectionsPoster",
 		    @"com.apple.GradientPoster.GradientPosterExtension",
 		    @"com.apple.EmojiPoster.EmojiPosterExtension",
 		    @"com.apple.PhotosUIPrivate.PhotosPosterProvider",
 		]);
-		probe(@"com.apple.widgetkit-extension", @[]);
 	}
 	return 0;
 }
