@@ -69,6 +69,7 @@
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "redwood_drawable.h"
@@ -414,12 +415,34 @@ static const struct rwd_format rwd_formats[] = {
 	{ 555, 'w30r', 4, 1, "a ten-bit XR format" },
 };
 
+/*
+ * The XR formats, served after all (2026-11-03). Refusing them was right while the GL path drew
+ * the screen; with backboardd on Metal they ARE the screen ('b3a8' is CoreAnimation's display
+ * surface), and refusing them left it black with 0 command buffers. The surface is BGRA because
+ * the kernel made it so, the scanout reads it as BGRA, and libredwoodair aliases these numbers to
+ * BGRA8 -- so the colours drawn are the colours shown; only the extended range is lost.
+ * RWA_XR=0 refuses them again, the same switch the library reads.
+ */
+static int
+rwd_xr_served(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *v = getenv("RWA_XR");
+
+		on = !(v != NULL && *v == '0');
+	}
+	return on;
+}
+
 /* Whether a surface of `fourcc` may stand under Metal format `metal` (a format may have several). */
 static int
 rwd_fourcc_serves(unsigned metal, uint32_t fourcc)
 {
 	for (size_t i = 0; i < sizeof(rwd_formats) / sizeof(rwd_formats[0]); i++) {
-		if (rwd_formats[i].metal == metal && rwd_formats[i].fourcc == fourcc && !rwd_formats[i].substituted) {
+		if (rwd_formats[i].metal == metal && rwd_formats[i].fourcc == fourcc &&
+		    (!rwd_formats[i].substituted || rwd_xr_served())) {
 			return 1;
 		}
 	}
@@ -435,6 +458,16 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 
 		if (f->metal != metal_pixel_format) {
 			continue;
+		}
+		if (f->substituted && rwd_xr_served()) {
+			/* ios-sweet: served as what the kernel made, 'BGRA'; see rwd_xr_served */
+			if (fourcc != NULL) {
+				*fourcc = 'BGRA';
+			}
+			if (bytes_per_pixel != NULL) {
+				*bytes_per_pixel = 4;
+			}
+			return 0;
 		}
 		if (f->substituted) {
 			rwd_say(why, why_size, "pixel format %u is %s, whose surface this "

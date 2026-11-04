@@ -1157,6 +1157,21 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
     * second resource on the first one's `next`, as Mesa's own NV12 import builds it.
     */
    { 500, "MTLPixelFormatYCBCR8_420_2P",   PIPE_FORMAT_R8_G8B8_420_UNORM },
+   /*
+    * CoreAnimation's display surface is 'b3a8': plane 0 is 10-bit extended-range BGR in
+    * 32 bits, plane 1 is alpha. backboardd asks for it as 550/551 (Apple's private
+    * two-plane BGR10A8_2P_XR10 pair, by every sign in the logs) and for its colour plane as
+    * 554/555 (BGR10_XR). Gallium has no XR format, and refusing them leaves the whole
+    * system with no target: 0 command buffers, a black screen (2026-11-03). So they are
+    * ALIASES, not equivalents: four bytes of BGRA8 in plane 0, the alpha plane never
+    * touched. That is the same reading the GL path and the kernel's scanout (xnu 0122)
+    * already give plane 0, so what is drawn here is what the panel shows; extended range
+    * is lost, and RWA_XR=0 declines them again.
+    */
+   { 550, "MTLPixelFormatBGR10A8_2P_XR10 (as BGRA8)",      PIPE_FORMAT_B8G8R8A8_UNORM },
+   { 551, "MTLPixelFormatBGR10A8_2P_XR10_sRGB (as BGRA8)", PIPE_FORMAT_B8G8R8A8_SRGB },
+   { 554, "MTLPixelFormatBGR10_XR (as BGRA8)",             PIPE_FORMAT_B8G8R8A8_UNORM },
+   { 555, "MTLPixelFormatBGR10_XR_sRGB (as BGRA8)",        PIPE_FORMAT_B8G8R8A8_SRGB },
 };
 
 /* Whether a format carries each aspect, asked of Mesa's own description rather than of
@@ -1232,10 +1247,24 @@ packed16_served(void)
    return on != 0;
 }
 
+/* The XR aliases above; RWA_XR=0 takes them out. Read once, as packed16_served. */
+static bool
+xr_served(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("RWA_XR");
+      on = !(v && *v == '0');
+   }
+   return on != 0;
+}
+
 static const struct rwa_pixel_format *
 pixel_format(unsigned mtl)
 {
    if (mtl >= 40 && mtl <= 43 && !packed16_served())
+      return NULL;
+   if (mtl >= 550 && mtl <= 555 && !xr_served())
       return NULL;
    for (unsigned i = 0; i < ARRAY_SIZE(rwa_pixel_formats); i++)
       if (rwa_pixel_formats[i].mtl == mtl)
