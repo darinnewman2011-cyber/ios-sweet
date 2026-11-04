@@ -790,11 +790,21 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
         `could not create extension point record for com.apple.widget-extension: ... Code=-10814`.
         So iOS's cache of extension POINT definitions is missing/empty on this root, every extension is rejected as
         invalid, and no poster or widget is ever registered.
-      - Open question (not yet found): which file that extension cache is. Not under `/System/Library/Caches` (only
-        com.apple.dyld, factorydata, kernelcaches). Only 8 `.appexpt` in `/System/Library/ExtensionKit/ExtensionPoints`.
-        Suspects: it lives in the OS cryptex (`ignition_level=1` skips cryptex/preboot) or in the dyld shared cache's
-        MobileInstallation; check the strings of MobileInstallation.framework / what `MICopyExtensionCacheEntryWithPlatform`
-        opens (`ipsw dyld a2s`, the single-dylib extract works; whole-cache disassembly runs out of memory).
+      - **The cache file is `/System/Library/xpc/extensions.plist`** (104731 B, plus `extensions.plist.sig`, 1852 B), and it
+        DOES hold the entries (`com.apple.widgetkit-extension`, `com.apple.posterkit.provider`,
+        `com.apple.intents-service` are all keys). The code that reads it is in ExtensionFoundation
+        (`extensionCacheFileURLs`; the string `System/Library/xpc/extensions.plist` is at dsc 0x19375445c); the lookup
+        that fails is `MICopyExtensionCacheEntryWithPlatform` in InstalledContentLibrary (log string at dsc
+        0x1b124c485), reached from `-[MIAppExtensionBundle extensionCacheEntryWithError:]`. Both cryptex roots
+        (`/private/preboot/Cryptexes/{OS,App}`, filled by mkiosroot, 3.2 GB) have no `xpc/extensions.plist`.
+      - So the data is there and iOS still reports no entry. Not yet determined why. Candidates, cheapest first:
+        (1) lsd/installd never open or cannot read the file (sandbox, or the ignition_level=1 path): log opens of
+        `extensions.plist` from the kernel or run `sweet-ext` through ExtensionFoundation's own loader;
+        (2) the `.sig` is checked (launchd.plist.sig sits next to the patched launchd.plist and launchd still works, so
+        signature checks are lax elsewhere, but this one may not be); (3) the lookup is keyed by a platform value that
+        this ADT/MobileGestalt gives differently (`MICopyExtensionCacheEntryWithPlatform` takes a platform).
+        Tools: `ipsw dyld extract DSC IMAGE --output DIR` then `ipsw macho disass --vaddr`; symbols are stripped, find
+        code by string xrefs (`ipsw dyld str DSC --pattern ...` gives the image and address).
     - ios50 (`6b827b62...`, no GL: no `sweetinject`, `sweetgl=0`): icons round (GL gives square icons: our GL path
       misses the icon mask), choppy, SpringBoard respawns often, PosterBoard crashes repeatedly. ios51 (`08a6713b...`,
       kernel a8art43 = 0130, GL hybrid, `sweettime=` baked in at build) is on the phone, `sweetreboot=0`.
