@@ -763,6 +763,17 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       MIT, A5XELTE_PROGRESS.md, Mali-T720 port).
     - ios48 (`a7d0114e…`, kernel 0129, RedwoodMetal with kernel-log records, `sweetreboot=0`): flashed 18:08,
       runner `_tmp/w8.cmd`. **Darin keeps test images flashed: no flash-back to ios42.**
+    - Run 9 (ios48 + 49b6591, XR formats 550/551/554/555 served as BGRA8 in libredwoodair and the surface
+      import): no format errors and no Metal errors at all, 14 CA pipelines compile, but backboardd still makes
+      **0 command buffers**. Thread samples: CA's render-server and IOMFBServer threads idle in mach_msg; one
+      backboardd thread blocks forever in `dispatch_group_wait(..., FOREVER)` at backboardd `0x100018a74`
+      (func_100018a58, a block). Something it waits for never finishes on the Metal path (not yet traced).
+    - Run 10 (ios49 `5df45a4b...`, kernel a8art42): **hybrid**. backboardd/SpringBoard on GL, `sweetmetalfor=`
+      PosterBoard plus the poster extensions (CollectionsPoster, PhotosPosterProvider, Emoji/Gradient/Unity/Pride
+      PosterExtension, WeatherPoster, AegirPoster, ExtragalacticPoster, LegacyPoster), `metal_profile=1`,
+      `sweetreboot=0`; runner `_tmp/w10.cmd` (10 min). mkpayload's boot-args limit is 607 bytes, silently cut:
+      this line is 566.
+    - Working files moved to `C:/Users/Darin/iOS` (`ios-sweet/`, `_tmp/`) on 2026-11-03.
     - Process lessons:
       - Flash scripts take a lock (`/tmp/g9-run.lock`). Two copies once raced: one replaced the test commands
         with noop.
