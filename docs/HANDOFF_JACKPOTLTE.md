@@ -860,3 +860,10 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
 `dtb4-rev07-static.dts` (decompiled Samsung DTB from the user's boot.img, rev07), `live-redacted.dts` (live FDT with serial
 values removed), `iomem.txt`, `partitions.txt`, `byname.txt`, `dmesg_filtered.txt`, `props.txt`, `SHA256SUMS`,
 `bootinfo.py` (header/section splitter used to take the boot.img apart; stdlib only), `a8-diag-boot.img`.
+
+### TWRP flash zip (2026-11-03)
+
+`python tools/mka8flashzip.py <image>.img flash-<name>.zip` makes a zip Darin can flash from TWRP (Install → zip → swipe)
+without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the image's hash, writes BOOT, reads it back
+(restores the Android backup on a mismatch) and does not reboot. `flash-ios42.zip` (the daily GL build, image
+115841d8…) is on the phone's /sdcard. Images and zips stay out of git.
