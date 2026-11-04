@@ -774,6 +774,31 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       `sweetreboot=0`; runner `_tmp/w10.cmd` (10 min). mkpayload's boot-args limit is 607 bytes, silently cut:
       this line is 566.
     - Working files moved to `C:/Users/Darin/iOS` (`ios-sweet/`, `_tmp/`) on 2026-11-03.
+    - **Why there is no wallpaper and no widget (2026-11-04, runs 10-15).** Not the GPU, not GL, not the clock.
+      - PosterBoard runs, never asks for Metal, and its extension store is empty. `sweet-ext` (gpu/src/sweet_ext.m,
+        commit 43abbb2): NSExtension and ExtensionKit find 0 extensions for `com.apple.posterkit.provider` and for
+        `com.apple.widgetkit-extension`; LaunchServices has 1 plugin registered of 628 `.appex` on the root.
+      - Setting aside the LaunchServices store (`*.csstore` in the lsd container) so lsd rebuilds it, three times,
+        gave the same 1 plugin. With the clock right (xnu 0130, boot-arg `sweettime=`, commit 481d898, ios51) too: the
+        1970 clock was not the cause.
+      - **Cause, from the unified log of the ios51 boot** (read on the PC with Mandiant `unifiedlog_iterator` v0.7.0,
+        Apache-2.0, in `/opt/sweet/uli` in WSL): installd/lsd `MICopyExtensionCacheEntryWithPlatform: Extension cache
+        does not have an entry for com.apple.widgetkit-extension` (also intents-service, diagnostics-service,
+        usernotifications.content-extension, ...); `-[MIPluginKitBundle extensionPointOverlay]: Failed to fetch
+        extension cache entry`; `+[MILaunchServicesDatabaseGatherer enumerateAppExtensionsInBundle...]: Ignoring app
+        extension ... due to validation issue(s)`; pkd (PlugInKit): `Candidate plugin count from LaunchServices: 0`,
+        `could not create extension point record for com.apple.widget-extension: ... Code=-10814`.
+        So iOS's cache of extension POINT definitions is missing/empty on this root, every extension is rejected as
+        invalid, and no poster or widget is ever registered.
+      - Open question (not yet found): which file that extension cache is. Not under `/System/Library/Caches` (only
+        com.apple.dyld, factorydata, kernelcaches). Only 8 `.appexpt` in `/System/Library/ExtensionKit/ExtensionPoints`.
+        Suspects: it lives in the OS cryptex (`ignition_level=1` skips cryptex/preboot) or in the dyld shared cache's
+        MobileInstallation; check the strings of MobileInstallation.framework / what `MICopyExtensionCacheEntryWithPlatform`
+        opens (`ipsw dyld a2s`, the single-dylib extract works; whole-cache disassembly runs out of memory).
+    - ios50 (`6b827b62...`, no GL: no `sweetinject`, `sweetgl=0`): icons round (GL gives square icons: our GL path
+      misses the icon mask), choppy, SpringBoard respawns often, PosterBoard crashes repeatedly. ios51 (`08a6713b...`,
+      kernel a8art43 = 0130, GL hybrid, `sweettime=` baked in at build) is on the phone, `sweetreboot=0`.
+    - TWRP zip: `tools/mka8flashzip.py` (f847203). `gpu/src/sweet_settime.c` (f8c4739) is superseded by xnu 0130.
     - Process lessons:
       - Flash scripts take a lock (`/tmp/g9-run.lock`). Two copies once raced: one replaced the test commands
         with noop.
