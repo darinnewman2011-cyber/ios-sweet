@@ -5,6 +5,7 @@
  * the wallpaper picker is empty and no poster ever draws. This asks every registry PosterBoard could be using and
  * prints what each answers, so one boot says where discovery breaks.
  *
+ *   sweet-ext --cache                   why ExtensionFoundation drops /System/Library/xpc/extensions.plist
  *   sweet-ext [POINT [BUNDLE-ID ...]]   default: com.apple.posterkit.provider and the poster bundle IDs,
  *                                        then com.apple.widgetkit-extension for comparison
  *
@@ -13,6 +14,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
+#import <sys/stat.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -175,6 +177,91 @@ records(NSArray<NSString *> *bundles)
 	}
 }
 
+/*
+ * --cache: why does ExtensionFoundation drop /System/Library/xpc/extensions.plist? (G9: every extension point
+ * "not in the cache" although the file has them). -[EXExtensionPointEnumerator initWithSDKDictionary:urls:config:]
+ * loads it with +[NSDictionary _EX_dictionaryWithSignedURL:error:] when enforceXPCCacheCodeSigning is on, and drops
+ * the cache without a word when that fails. This calls the same thing and prints the error.
+ */
+static void
+describe_error(NSError *e, int depth)
+{
+	for (; e != nil && depth < 5; depth++) {
+		say(@"  error[%d] %@ %ld: %@", depth, e.domain, (long)e.code, e.localizedDescription);
+		say(@"  error[%d] userInfo %@", depth, describe(e.userInfo));
+		e = e.userInfo[NSUnderlyingErrorKey];
+	}
+}
+
+static void
+cache_probe(void)
+{
+	static const char *const paths[] = {
+		"/System/Library/PrivateFrameworks/ExtensionFoundation.framework/ExtensionFoundation",
+		"/System/Library/Frameworks/ExtensionFoundation.framework/ExtensionFoundation",
+		"/usr/lib/swift/libswiftExtensionFoundation.dylib",
+	};
+	NSString *file = @"/System/Library/xpc/extensions.plist";
+	struct stat st;
+
+	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		say(@"dlopen %s: %s", paths[i], dlopen(paths[i], RTLD_NOW) ? "ok" : dlerror());
+	}
+	for (NSString *f in @[ file, [file stringByAppendingString:@".sig"], @"/System/Library/xpc/launchd.plist" ]) {
+		say(@"stat %@: %s, %lld bytes", f, stat(f.UTF8String, &st) == 0 ? "ok" : strerror(errno), (long long)st.st_size);
+	}
+	/* who answers enforceXPCCacheCodeSigning, and with what */
+	SEL enforce = sel_registerName("enforceXPCCacheCodeSigning");
+	unsigned count = 0;
+	Class *all = objc_copyClassList(&count);
+
+	for (unsigned i = 0; i < count; i++) {
+		BOOL inst = class_getInstanceMethod(all[i], enforce) != NULL;
+		BOOL cls = class_getClassMethod(all[i], enforce) != NULL;
+
+		if (!inst && !cls) {
+			continue;
+		}
+		say(@"enforceXPCCacheCodeSigning is implemented by %s (%s%s)", class_getName(all[i]), cls ? "class" : "",
+		    inst ? " instance" : "");
+		@try {
+			if (cls) {
+				say(@"  [%s enforceXPCCacheCodeSigning] = %d", class_getName(all[i]),
+				    ((BOOL (*)(id, SEL))objc_msgSend)((id)all[i], enforce));
+			} else {
+				id shared = call0((id)all[i], "sharedInstance");
+
+				if (shared != nil) {
+					say(@"  [[%s sharedInstance] enforceXPCCacheCodeSigning] = %d", class_getName(all[i]),
+					    ((BOOL (*)(id, SEL))objc_msgSend)(shared, enforce));
+				}
+			}
+		} @catch (NSException *e) {
+			say(@"  threw %@: %@", e.name, e.reason);
+		}
+	}
+	free(all);
+	/* the signed load, as the enumerator does it */
+	@try {
+		SEL signed_ = sel_registerName("_EX_dictionaryWithSignedURL:error:");
+		NSError *err = nil;
+		id d;
+
+		if (![NSDictionary respondsToSelector:signed_]) {
+			say(@"NSDictionary has no +_EX_dictionaryWithSignedURL:error: (ExtensionFoundation not loaded?)");
+			return;
+		}
+		d = ((id (*)(id, SEL, id, NSError **))objc_msgSend)([NSDictionary class], signed_,
+		    [NSURL fileURLWithPath:file], &err);
+		say(@"signed load of %@: %@ (%lu keys)", file, d ? @"LOADED" : @"FAILED", (unsigned long)[(NSDictionary *)d count]);
+		describe_error(err, 0);
+		d = [NSDictionary dictionaryWithContentsOfURL:[NSURL fileURLWithPath:file]];
+		say(@"plain load of %@: %lu keys", file, (unsigned long)[(NSDictionary *)d count]);
+	} @catch (NSException *e) {
+		say(@"signed load threw %@: %@", e.name, e.reason);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -184,6 +271,10 @@ main(int argc, char **argv)
 		say(@"uid %d; MobileCoreServices %s", getuid(),
 		    dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW) ?
 		    "loaded" : dlerror());
+		if (argc == 2 && strcmp(argv[1], "--cache") == 0) {
+			cache_probe();
+			return 0;
+		}
 		if (argc > 1) {
 			NSMutableArray *b = [NSMutableArray array];
 
