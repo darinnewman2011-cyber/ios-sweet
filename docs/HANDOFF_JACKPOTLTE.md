@@ -736,6 +736,38 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       (wallpaper / PosterBoard) with the properties set before launchd.
     - CI caveat: gpu.yml reports success when air_run fails to compile (c5f4c8b: two printf strings split across
       lines); the artifact then simply has no `air_run`. Check the file list, not the run's colour.
+  - **G9 wallpaper, then the whole system on Metal (2026-11-03).**
+    - Why the wallpaper is missing (crash reports, GL boots): PosterBoard aborts in
+      `-[PBFHomeScreenPreviewImageBuilder _imageForView:]`. It makes a CARenderer over an MTLTexture.
+      `MTLCreateSystemDefaultDevice()` is nil, so the nil command queue goes into an NSDictionary and throws.
+      PosterBoard needs Metal.
+    - xnu 0128: boot-arg `sweetmetalfor=NAME,...` publishes IOAcceleratorES with both properties set, but
+      `copyProperty`/`serializeProperties` hide them from processes not on the list (p_comm, 16 chars).
+      `sweetmetalfor=*` means every process.
+      - Verified on runs 3 and 5: "Metal device hidden from backboardd / SpringBoard / chronod".
+      - With PosterBoard listed it opened the GPU (run 1) but died without submitting. In idle boots it never
+        asked for Metal within 6 min: it draws only on demand.
+    - Logging, on this kernel:
+      - Console writes from user space do NOT reach the kernel message buffer, and memorystatus fills that
+        buffer in under a minute.
+      - New: `sweet-dmesg [TEXT...]`, plus `-s BYTES` to grow kern.msgbuf.
+      - xnu 0129: RedwoodMali request 0x79 writes one client line into the kernel log as `m2m NAME[PID]: ...`.
+        m2m.h uses it when there is no /dev/m2m.
+    - **Boot-arg `sweetgpumhz=550` is required** for the 550 MHz clock; without it the GPU stays at 343
+      (ios43/44/45 were missing it at first).
+    - ios46 (`sweetmetalfor=*`): SpringBoard crash-loops on "Failed to get MPSDevice"
+      (MPSImageGaussianBlur). Fix: `metal_profile=1` (claims Apple2, the lowest rung MPS asks about).
+    - ios47 (`*` + `metal_profile=1`): no crash loop, but the **screen stays black**. The GPU is nearly idle
+      (8 jobs per 30 s after its self-test), so backboardd submits almost nothing. Suspect: the compositor
+      waits on a pipeline that never compiles, as ios-a5xelte found (`fixed_frag_lph_cph`; orhunnx/ios-a5xelte,
+      MIT, A5XELTE_PROGRESS.md, Mali-T720 port).
+    - ios48 (`a7d0114e…`, kernel 0129, RedwoodMetal with kernel-log records, `sweetreboot=0`): flashed 18:08,
+      runner `_tmp/w8.cmd`. **Darin keeps test images flashed: no flash-back to ios42.**
+    - Process lessons:
+      - Flash scripts take a lock (`/tmp/g9-run.lock`). Two copies once raced: one replaced the test commands
+        with noop.
+      - A forced power-off leaves the HFS+ journal dirty. Before editing the root again, boot ios42 once and
+        shut down from Settings.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
