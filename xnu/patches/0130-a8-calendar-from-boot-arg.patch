@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1366,6 +1366,33 @@
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
++	/*
++	 * ios-sweet (A8): no RTC is read, so the calendar starts at 0 (1970) and Apple's signing certificates are
++	 * not yet valid; LaunchServices then registers no extensions (no posters, no widgets). The boot image
++	 * carries the time it was built at, boot-arg sweettime=SECONDS: hours behind, which no certificate minds.
++	 */
++	if (*secs < 1000000000) {
++		static uint64_t sweet_time = 0;
++		static bool sweet_time_said = false;
++
++		if (sweet_time == 0 && !PE_parse_boot_argn("sweettime", &sweet_time, sizeof(sweet_time))) {
++			sweet_time = 1;
++		}
++		/* a later reading (a wake, a resync) must not set the clock back: add the time since the first */
++		static uint64_t sweet_time_abs = 0;
++		uint64_t since = 0;
++
++		if (sweet_time > 1) {
++			if (!sweet_time_said) {
++				sweet_time_said = true;
++				sweet_time_abs = mach_absolute_time();
++				IOLog("SWEET TIME: no RTC; the calendar starts at sweettime=%llu\n", sweet_time);
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - sweet_time_abs, &since);
++			*secs = (clock_sec_t)(sweet_time + since / NSEC_PER_SEC);
++			nsecs = (clock_nsec_t)(since % NSEC_PER_SEC);
++		}
++	}
+ 
+ 	assert(nsecs < NSEC_PER_SEC);
+ 	*usecs = nsecs / NSEC_PER_USEC;
