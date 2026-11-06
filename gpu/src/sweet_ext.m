@@ -12,7 +12,7 @@
  *                                        then com.apple.widgetkit-extension for comparison
  *
  * Every lookup is by name through the runtime (these are SPI), each in its own @try: a missing class or a throw is
- * printed and the next one runs. Signed with PosterBoard's com.apple.private.coreservices.canmaplsdatabase.
+ * printed and the next one runs (--cache and --platform added 2026-11-05). Signed with PosterBoard's com.apple.private.coreservices.canmaplsdatabase.
  */
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
