@@ -6,6 +6,8 @@
  * prints what each answers, so one boot says where discovery breaks.
  *
  *   sweet-ext --cache                   why ExtensionFoundation drops /System/Library/xpc/extensions.plist
+ *   sweet-ext --platform                does iOS's own lookup (extensionPointForIdentifier:platform:) find an entry, and for
+ *                                        which platform value? (installd says "Extension cache does not have an entry")
  *   sweet-ext [POINT [BUNDLE-ID ...]]   default: com.apple.posterkit.provider and the poster bundle IDs,
  *                                        then com.apple.widgetkit-extension for comparison
  *
@@ -262,6 +264,82 @@ cache_probe(void)
 	}
 }
 
+/*
+ * --platform: installd's MICopyExtensionCacheEntryWithPlatform(identifier, platform, &error) asks the extension
+ * point cache through +extensionPointForIdentifier:platform: and fails when the result has no SDKDictionary. The
+ * cache itself loads fine (--cache: 138 keys, signed load OK), so try the lookup with every platform value that
+ * could be the right one, on the identifiers that fail in the log.
+ */
+static void platform_probe(void)
+{
+	static NSString *const ids[] = { @"com.apple.widgetkit-extension", @"com.apple.posterkit.provider" };
+	static NSString *const strs[] = { @"iphoneos", @"iOS", @"ios", @"iPhoneOS", @"iphone", @"" };
+	SEL sel = sel_registerName("extensionPointForIdentifier:platform:");
+	unsigned count = 0, found = 0;
+	Class *all;
+
+	dlopen("/System/Library/PrivateFrameworks/ExtensionFoundation.framework/ExtensionFoundation", RTLD_NOW);
+	dlopen("/System/Library/PrivateFrameworks/InstalledContentLibrary.framework/InstalledContentLibrary", RTLD_NOW);
+	all = objc_copyClassList(&count);
+	for (unsigned i = 0; i < count; i++) {
+		Method m = class_getClassMethod(all[i], sel);
+		char *t;
+
+		if (m == NULL) {
+			continue;
+		}
+		found++;
+		t = method_copyArgumentType(m, 3);
+		say(@"+[%s extensionPointForIdentifier:platform:] platform argument type '%s', return '%s'", class_getName(all[i]),
+		    t, method_getTypeEncoding(m));
+		for (unsigned n = 0; n < sizeof(ids) / sizeof(ids[0]); n++) {
+			if (t[0] == '@') {
+				for (unsigned k = 0; k < sizeof(strs) / sizeof(strs[0]); k++) {
+					@try {
+						id r = ((id (*)(id, SEL, id, id))objc_msgSend)((id)all[i], sel, ids[n], strs[k]);
+						id sdk = call0(r, "SDKDictionary");
+
+						say(@"  %@ platform \"%@\": point %@, SDKDictionary %@", ids[n], strs[k], r ? @"yes" : @"nil",
+						    sdk ? [NSString stringWithFormat:@"%lu keys", (unsigned long)[sdk count]] : @"nil");
+					} @catch (NSException *e) {
+						say(@"  %@ platform \"%@\": threw %@", ids[n], strs[k], e.name);
+					}
+				}
+			} else {
+				for (unsigned long long v = 0; v <= 12; v++) {
+					@try {
+						id r = ((id (*)(id, SEL, id, unsigned long long))objc_msgSend)((id)all[i], sel, ids[n], v);
+						id sdk = call0(r, "SDKDictionary");
+
+						say(@"  %@ platform %llu: point %@, SDKDictionary %@", ids[n], v, r ? @"yes" : @"nil",
+						    sdk ? [NSString stringWithFormat:@"%lu keys", (unsigned long)[sdk count]] : @"nil");
+					} @catch (NSException *e) {
+						say(@"  %@ platform %llu: threw %@", ids[n], v, e.name);
+					}
+				}
+			}
+		}
+		free(t);
+	}
+	free(all);
+	if (found == 0) {
+		say(@"no class implements +extensionPointForIdentifier:platform: (libraries loaded? %d classes seen)", (int)count);
+	}
+	/* and the C function itself, as installd calls it */
+	void *fn = dlsym(RTLD_DEFAULT, "MICopyExtensionCacheEntryWithPlatform");
+
+	say(@"MICopyExtensionCacheEntryWithPlatform is %s", fn ? "exported" : "not exported");
+	if (fn != NULL) {
+		for (unsigned long long v = 0; v <= 6; v++) {
+			NSError *err = nil;
+			id r = ((id (*)(id, unsigned long long, NSError **))fn)(@"com.apple.widgetkit-extension", v, &err);
+
+			say(@"  MICopyExtensionCacheEntryWithPlatform(widgetkit, %llu): %@ %@", v, r ? @"entry" : @"nil",
+			    err ? describe(err) : @"");
+		}
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -271,6 +349,10 @@ main(int argc, char **argv)
 		say(@"uid %d; MobileCoreServices %s", getuid(),
 		    dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW) ?
 		    "loaded" : dlerror());
+		if (argc == 2 && strcmp(argv[1], "--platform") == 0) {
+			platform_probe();
+			return 0;
+		}
 		if (argc == 2 && strcmp(argv[1], "--cache") == 0) {
 			cache_probe();
 			return 0;
