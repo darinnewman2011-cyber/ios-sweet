@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15   # macos-14 stopped being offered (2026-11: "configuration macos-14-arm64-us-default is not supported")
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
