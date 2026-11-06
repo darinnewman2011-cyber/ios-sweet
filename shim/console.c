@@ -61,6 +61,18 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 	buf[digits] = 0;
 }
 
+void con_text(int r, int c, const char *s, uint32_t fg, uint32_t bg)
+{
+	uint32_t keep_bg = con_bg;
+	int keep_row = row;
+
+	con_bg = bg;
+	row = r;
+	put_str(c, s, fg);
+	con_bg = keep_bg;
+	row = keep_row;
+}
+
 void con_skip(void)
 {
 	row++;

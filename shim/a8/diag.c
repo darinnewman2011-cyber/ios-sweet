@@ -13,6 +13,7 @@
 #include "../console.h"
 #include "../fdt.h"
 #include "../loader.h"
+#include "menu.h"
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" :: "r"((uint64_t)(v)))
@@ -208,6 +209,13 @@ static int a8_present(void)
 	return ok;
 }
 
+/* for menu.c */
+uint64_t a8_now(void) { return now(); }
+uint64_t a8_ticks(void) { return ticks_per_sec(); }
+void a8_delay_ms(unsigned ms) { delay_ms(ms); }
+int a8_present_for_menu(void) { return a8_present(); }
+uint32_t a8_rd32(uintptr_t addr) { return mmio32(addr); }
+
 /* ---- XNU loader (milestone 4) ---- */
 
 /* payload.S (build.sh): the SWEETXNU payload linked into this Image, or nothing. */
@@ -237,6 +245,17 @@ void loader_hook_jump(void)
 
 static void a8_boot_xnu(void)
 {
+#ifdef A8_BUTTON_PROBE
+	menu_probe();	/* -DA8_BUTTON_PROBE: show which pin register bit changes with each button, then boot */
+#endif
+#ifdef A8_MENU
+	{
+		const char *base = loader_payload_cmdline((uintptr_t)a8_payload);
+
+		if (base)
+			menu_run(base);	/* may set loader_cmdline_override */
+	}
+#endif
 	con_clear(BLUE);
 	con_str("A8 SHIM", "milestone 4: xnu loader");
 	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));

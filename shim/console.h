@@ -23,6 +23,10 @@ extern volatile uint32_t *con_fb;
 
 void con_clear(uint32_t bg);
 void con_skip(void);
+/* text at row r (0-based), column c, explicit colours: for menus, which redraw whole screens */
+void con_text(int r, int c, const char *s, uint32_t fg, uint32_t bg);
+#define CON_ROWS ((FB_H - 2 * 24) / 48)
+#define CON_COLS ((FB_W - 2 * 24) / 24)
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */

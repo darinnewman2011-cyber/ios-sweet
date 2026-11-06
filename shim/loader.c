@@ -99,6 +99,15 @@ const char *loader_boot(uintptr_t dtb)
 	return loader_boot_payload(rd_start, rd_end);
 }
 
+const char *loader_cmdline_override;
+
+const char *loader_payload_cmdline(uintptr_t rd_start)
+{
+	const struct payload *p = (const struct payload *)rd_start;
+
+	return magic_ok(p->magic) ? p->cmdline : 0;
+}
+
 const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end)
 {
 	const struct payload *p = (const struct payload *)rd_start;
@@ -149,8 +158,10 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end)
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
+	const char *line = loader_cmdline_override ? loader_cmdline_override : p->cmdline;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
-		ba->CommandLine[i] = p->cmdline[i];
+		ba->CommandLine[i] = line[i];
+	ba->CommandLine[BOOT_LINE_LENGTH - 1] = 0;
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 

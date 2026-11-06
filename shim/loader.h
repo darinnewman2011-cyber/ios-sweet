@@ -8,3 +8,7 @@ const char *loader_boot_payload(uintptr_t start, uintptr_t end);
 /* Board hooks, weak no-ops by default: before writing [pa, pa+len), and right before the jump. */
 void loader_hook_dst(uintptr_t pa, uint64_t len);
 void loader_hook_jump(void);
+
+/* The boot menu (a8/menu.c) may replace the payload's command line; NULL: use the payload's own. */
+extern const char *loader_cmdline_override;
+const char *loader_payload_cmdline(uintptr_t start);
