@@ -18,7 +18,7 @@
 #include "menu.h"
 
 #ifndef MENU_DAT
-#define MENU_DAT	0x11CB0024UL	/* gpa1 data register: bank at 0x20, DAT at +4 (Exynos pinctrl layout) */
+#define MENU_DAT	0x11CB0064UL	/* probe 2026-11-05: vol up bit 5, vol down bit 6, power bit 7, all low when pressed */
 #endif
 #ifndef MENU_UP
 #define MENU_UP		5
