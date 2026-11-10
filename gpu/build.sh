@@ -122,7 +122,7 @@ fi
 M3LOG="$B/metal-build.log"; : > "$M3LOG"
 m3() { local what=$1; shift; if "$CLANG" $TARGET -O2 "$@" >> "$M3LOG" 2>&1; then codesign -s - -f "out/$what" >> "$M3LOG" 2>&1; echo "build.sh: out/$what"; else echo "build.sh: $what did not build:"; grep -E "error" "$M3LOG" | tail -20 || true; fi; }
 m3 RedwoodMetal -bundle -Wno-deprecated-declarations -framework Foundation -framework IOKit -framework Metal -lobjc \
-	-o out/RedwoodMetal src/redwoodmetal.m src/redwooddrawable.m
+	-o out/RedwoodMetal src/redwoodmetal.m src/redwooddrawable.m src/redwoodtrace.m
 cp src/metal_plugin.plist out/RedwoodMetal.Info.plist
 m3 metal_props -framework CoreFoundation -framework IOKit -o out/metal_props src/metal_props.c
 m3 sweet-dmesg -o out/sweet-dmesg src/sweet_dmesg.c          # the kernel message buffer, whole (no dmesg on iOS)
