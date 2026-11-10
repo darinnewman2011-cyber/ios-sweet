@@ -809,6 +809,34 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
       misses the icon mask), choppy, SpringBoard respawns often, PosterBoard crashes repeatedly. ios51 (`08a6713b...`,
       kernel a8art43 = 0130, GL hybrid, `sweettime=` baked in at build) is on the phone, `sweetreboot=0`.
     - TWRP zip: `tools/mka8flashzip.py` (f847203). `gpu/src/sweet_settime.c` (f8c4739) is superseded by xnu 0130.
+    - **2026-11-05..10: boot menu, reinstall, first true Metal-only run.**
+      - `shim/a8/menu.c` (`EXTRA_CFLAGS=-DA8_MENU`, commits 54447e0, 30e0a39): menu on the S-Boot framebuffer, 5 s
+        countdown then the payload's own line; presets GL+Metal posters / GL only / Metal only / neither, toggles, reset.
+        Buttons: register `0x11CB0064`, bits 5 (vol up), 6 (vol down), 7 (power), low when pressed (probe build
+        `-DA8_BUTTON_PROBE`, verified on the phone). Works (user).
+      - The earlier ScreenTimeAgent/calaccessd/cloudd/mobileactivationd crash loop was damaged state in the old root
+        (not the clock): a fresh root has none of it.
+      - Darin formatted Data. **Fresh root** `_tmp/wsl/mkfreshroot.sh` + `_tmp/freshfix.sh`: mkiosroot 13G + tweaks, then
+        only `/sweet`, the RedwoodMetal link and the `com.sweet.run` job from the old root; pristine run.cmd/run.log/gl.log
+        (`a8run.py prepare`), maps in `_tmp/fresh-maps/` (cmd block 3043267). WSL: `/opt/sweet/fresh/ios16-root-fresh.img`
+        (`8085eb4f...`), base without our layer `ios16-root-base.img`. On the phone: `/data/sweet/root.img` **inode 913922**
+        (108 extents, none unwritten), pushed by `_tmp/g9-inst.sh` (a8push --dense from `//wsl.localhost/Ubuntu/...`).
+        Boot image **ios55m** (`0ed00454...`, kernel a8art43, menu, `sweetrootino=913922`). `/sdcard`: flash-ios55m.zip,
+        flash-android.zip, a8bak/BOOT.img restored. First boot fine: only driverkitd crashes.
+      - WSL lost hfsplus after a restart: `insmod -f /opt/sweet/linux/fs/hfsplus/hfsplus.ko`.
+      - gpu.yml moved to macos-15 (macos-14 runners refused, 1aa1ccc); xnu.yml still says macos-14 (needs Xcode 15's iig).
+      - `sweet-ext --cache`: ExtensionFoundation's signed load of extensions.plist works (138 keys), so the cache is
+        fine; `sweet-ext --platform` (e26848c) is written, not yet run.
+      - The "stuck thread" of run 9 (backboardd 0x100018a58) is `-[BKButtonHapticsController _configureAsyncWithBlock:]`
+        waiting for haptics: unrelated to drawing.
+      - **Run 24, true Metal-only (menu preset: no sweetinject, sweetgl=0, sweetmetalfor=*, metal_profile=1): black.**
+        backboardd opens the device at 107 s, compiles 14 CA pipelines, makes/frees 23 small textures (776x24: a
+        warm-up), then makes no Metal call at all (0 command buffers, no IOSurface texture, no refusal logged) while
+        it swaps frames from 115 s on (surfaces 2/3, 'b3a8'). With Metal hidden and no GL (ios50) CA draws on the CPU
+        and the picture shows; with Metal visible it shows nothing. So CA takes its Metal path and stops before the
+        first Metal call of a frame. Next: log every device/queue method CA calls after the warm-up (a call counter
+        that prints even when idle), or read `CA::OGL::MetalContext::set_destination_iosurface` / `update_surface`
+        (0x188302550, 0x1883163e0) for the check that fails.
     - Process lessons:
       - Flash scripts take a lock (`/tmp/g9-run.lock`). Two copies once raced: one replaced the test commands
         with noop.
