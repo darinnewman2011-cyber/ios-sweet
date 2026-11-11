@@ -855,8 +855,8 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
         in-block 0x328; originals in `_tmp/efblk.orig`, list in `_tmp/dscpatch.txt`. To make lsd reseed without an HFS
         edit: zero the first 4 KiB of both `*.csstore` files (find block 0 with FIBMAP on the WSL copy; they move at
         each rebuild). A rebuilt root image must get the same patch (or a kernel AMFI stub).
-      - `sweet-run` keeps 8 boots in `/sweet/runs.log` (252c573, gpu run 42947899394), `a8run.py runslog`; built, not
-        yet installed. All boots share the baked `sweettime`, so unified-log timestamps of different boots overlap.
+      - `sweet-run` keeps 8 boots in `/sweet/runs.log` (252c573, gpu run 42947899394), `a8run.py runslog
+        _tmp/fresh-maps/runs-map.json`; installed on the phone 2026-11-10 (root 044f1d11...). All boots share the baked `sweettime`, so unified-log timestamps of different boots overlap.
     - Process lessons:
       - Flash scripts take a lock (`/tmp/g9-run.lock`). Two copies once raced: one replaced the test commands
         with noop.
