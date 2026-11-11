@@ -35,6 +35,18 @@ extern char **environ;
 static int logfd = -1, con = -1;
 static off_t logpos;
 
+/*
+ * The history: /sweet/runs.log holds the logs of the last RUNS_SLOTS boots, one slot each, so a later boot does not
+ * destroy the log that was wanted (run.log alone is rewritten at every boot). A slot starts with "SWEETBOOT N";
+ * this boot takes the slot without that line, or else the one with the lowest N, and numbers itself max + 1.
+ * Fixed size, only ever overwritten in place, as run.log (tools/a8run.py runslog reads it from TWRP).
+ */
+#define RUNS_PATH "/sweet/runs.log"
+#define RUNS_SLOTS 8
+#define RUNS_SLOT (1024 * 1024)
+static int runsfd = -1;
+static off_t runsbase, runspos;
+
 static void
 out(const char *buf, size_t n)
 {
@@ -48,6 +60,50 @@ out(const char *buf, size_t n)
 		pwrite(logfd, buf, n, logpos);
 		logpos += n;
 	}
+	if (runsfd >= 0 && runspos < RUNS_SLOT - 1) {
+		size_t m = runspos + (off_t)n > RUNS_SLOT - 1 ? (size_t)(RUNS_SLOT - 1 - runspos) : n;
+
+		pwrite(runsfd, buf, m, runsbase + runspos);
+		runspos += m;
+	}
+}
+
+static void
+runs_open(const char *zero, size_t zero_size)
+{
+	unsigned long best = 0, newest = 0;
+	int slot = -1;
+	char head[32];
+
+	if ((runsfd = open(RUNS_PATH, O_RDWR)) < 0) {
+		return;
+	}
+	for (int i = 0; i < RUNS_SLOTS; i++) {
+		unsigned long n = 0;
+
+		memset(head, 0, sizeof(head));
+		pread(runsfd, head, sizeof(head) - 1, (off_t)i * RUNS_SLOT);
+		if (sscanf(head, "SWEETBOOT %lu", &n) != 1 || n == 0) {
+			if (slot < 0 || best != 0) {
+				slot = i;       /* a free slot: the first one wins over any used one */
+				best = 0;
+			}
+			continue;
+		}
+		if (n > newest) {
+			newest = n;
+		}
+		if (slot < 0 || (best != 0 && n < best)) {
+			slot = i;
+			best = n;
+		}
+	}
+	runsbase = (off_t)slot * RUNS_SLOT;
+	for (off_t o = 0; o < RUNS_SLOT; o += (off_t)zero_size) {
+		pwrite(runsfd, zero, zero_size, runsbase + o);
+	}
+	runspos = snprintf(head, sizeof(head), "SWEETBOOT %lu\n", newest + 1);
+	pwrite(runsfd, head, (size_t)runspos, runsbase);
 }
 
 static void
@@ -142,6 +198,7 @@ main(void)
 			pwrite(logfd, zero, sizeof(zero), o);
 		}
 	}
+	runs_open(zero, sizeof(zero));
 	if ((fd = open(CMD_PATH, O_RDONLY)) < 0 || (n = read(fd, cmd, CMD_MAX)) < 0) {
 		outf("sweet-run: no %s: %s\n", CMD_PATH, strerror(errno));
 		return 1;

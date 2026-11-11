@@ -9,6 +9,9 @@ read /sweet/run.log straight through their 4 KiB blocks inside /data/sweet/root.
     a8run.py glprepare DIR           make DIR/gl.log (1 MiB, marked), libsweet-gl-loader's log (GPU step G8)
     a8run.py glmap IMAGE MAP.json    find gl.log's blocks in a root image that has it installed
     a8run.py gllog MAP.json [OUT]    read gl.log from the phone
+    a8run.py runsprepare DIR         make DIR/runs.log (8 MiB, marked): sweet-run's history, one 1 MiB slot per boot
+    a8run.py runsmap IMAGE MAP.json  find runs.log's blocks in a root image that has it installed
+    a8run.py runslog MAP.json [OUT]  read the history from the phone: the last 8 boots, oldest first
 
 The files are only ever overwritten in place (sweet-run uses pwrite inside the fixed size), so HFS+ keeps their blocks
 where `map` found them. `cmd` checks the block's marker on the phone before writing it.
@@ -21,6 +24,7 @@ import sys
 B = 4096
 CMD_BLOCKS, LOG_BLOCKS = 16, 256
 GL_BLOCKS = 256
+RUNS_SLOTS, RUNS_SLOT_BLOCKS = 8, 256
 MARK = b'SWEETRUN %s %04d\n'
 ADB = os.environ.get('ADB', 'adb')
 DEFAULT_CMD = b'''# sweet-run commands: tools/a8run.py cmd MAP.json FILE writes them on the phone
@@ -81,6 +85,27 @@ def find(image, out, kinds=(('cmd', CMD_BLOCKS), ('log', LOG_BLOCKS))):
     print(', '.join(f'{kind} blocks {found[kind][0]}..{found[kind][-1]}' for kind in found))
 
 
+def runsprepare(d):
+    with open(os.path.join(d, 'runs.log'), 'wb') as f:
+        f.write(b''.join(block('rns', i) for i in range(RUNS_SLOTS * RUNS_SLOT_BLOCKS)))
+
+
+def runslog(mapfile, out=None):
+    blocks = json.load(open(mapfile))['rns']
+    boots = []
+    for s in range(RUNS_SLOTS):
+        text = read_blocks(blocks[s * RUNS_SLOT_BLOCKS:(s + 1) * RUNS_SLOT_BLOCKS]).split(b'\0', 1)[0]
+        if text.startswith(b'SWEETBOOT '):
+            boots.append((int(text.split(b'\n', 1)[0].split()[1]), text))
+    boots.sort()
+    data = b''.join(b'\n======== boot %d (%d bytes) ========\n' % (n, len(t)) + t for n, t in boots)
+    if out:
+        open(out, 'wb').write(data)
+        print('boots:', ' '.join(f'{n}({len(t)})' for n, t in boots))
+    else:
+        sys.stdout.buffer.write(data)
+
+
 def shell(script, binary=False):
     return subprocess.run([ADB, 'exec-out', script], check=True, capture_output=True).stdout
 
@@ -130,6 +155,12 @@ if __name__ == '__main__':
         cmd(a[1], a[2])
     elif a[:1] == ['log'] and len(a) in (2, 3):
         log(*a[1:])
+    elif a[:1] == ['runsprepare'] and len(a) == 2:
+        runsprepare(a[1])
+    elif a[:1] == ['runsmap'] and len(a) == 3:
+        find(a[1], a[2], kinds=(('rns', RUNS_SLOTS * RUNS_SLOT_BLOCKS),))
+    elif a[:1] == ['runslog'] and len(a) in (2, 3):
+        runslog(*a[1:])
     elif a[:1] == ['glprepare'] and len(a) == 2:
         glprepare(a[1])
     elif a[:1] == ['glmap'] and len(a) == 3:
