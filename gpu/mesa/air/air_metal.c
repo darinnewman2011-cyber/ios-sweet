@@ -1172,6 +1172,41 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 551, "MTLPixelFormatBGR10A8_2P_XR10_sRGB (as BGRA8)", PIPE_FORMAT_B8G8R8A8_SRGB },
    { 554, "MTLPixelFormatBGR10_XR (as BGRA8)",             PIPE_FORMAT_B8G8R8A8_UNORM },
    { 555, "MTLPixelFormatBGR10_XR_sRGB (as BGRA8)",        PIPE_FORMAT_B8G8R8A8_SRGB },
+   /*
+    * ASTC, low dynamic range (G9 run 31): AegirPoster's Earth and Moon maps are 190, 198 and 208, and
+    * without them its passes draw from nothing. The Mali decodes ASTC itself; whether THIS screen
+    * takes a size is still asked of is_format_supported at creation, as for every row here. Texels
+    * come in blocks: caller_stride and rwa_texture_write count rows of blocks for these, and nothing
+    * renders into one (so no mipmap generation). The HDR numbers (222-236) stay declined.
+    */
+   { 186, "MTLPixelFormatASTC_4x4_sRGB", PIPE_FORMAT_ASTC_4x4_SRGB },
+   { 187, "MTLPixelFormatASTC_5x4_sRGB", PIPE_FORMAT_ASTC_5x4_SRGB },
+   { 188, "MTLPixelFormatASTC_5x5_sRGB", PIPE_FORMAT_ASTC_5x5_SRGB },
+   { 189, "MTLPixelFormatASTC_6x5_sRGB", PIPE_FORMAT_ASTC_6x5_SRGB },
+   { 190, "MTLPixelFormatASTC_6x6_sRGB", PIPE_FORMAT_ASTC_6x6_SRGB },
+   { 192, "MTLPixelFormatASTC_8x5_sRGB", PIPE_FORMAT_ASTC_8x5_SRGB },
+   { 193, "MTLPixelFormatASTC_8x6_sRGB", PIPE_FORMAT_ASTC_8x6_SRGB },
+   { 194, "MTLPixelFormatASTC_8x8_sRGB", PIPE_FORMAT_ASTC_8x8_SRGB },
+   { 195, "MTLPixelFormatASTC_10x5_sRGB", PIPE_FORMAT_ASTC_10x5_SRGB },
+   { 196, "MTLPixelFormatASTC_10x6_sRGB", PIPE_FORMAT_ASTC_10x6_SRGB },
+   { 197, "MTLPixelFormatASTC_10x8_sRGB", PIPE_FORMAT_ASTC_10x8_SRGB },
+   { 198, "MTLPixelFormatASTC_10x10_sRGB", PIPE_FORMAT_ASTC_10x10_SRGB },
+   { 199, "MTLPixelFormatASTC_12x10_sRGB", PIPE_FORMAT_ASTC_12x10_SRGB },
+   { 200, "MTLPixelFormatASTC_12x12_sRGB", PIPE_FORMAT_ASTC_12x12_SRGB },
+   { 204, "MTLPixelFormatASTC_4x4_LDR",  PIPE_FORMAT_ASTC_4x4 },
+   { 205, "MTLPixelFormatASTC_5x4_LDR",  PIPE_FORMAT_ASTC_5x4 },
+   { 206, "MTLPixelFormatASTC_5x5_LDR",  PIPE_FORMAT_ASTC_5x5 },
+   { 207, "MTLPixelFormatASTC_6x5_LDR",  PIPE_FORMAT_ASTC_6x5 },
+   { 208, "MTLPixelFormatASTC_6x6_LDR",  PIPE_FORMAT_ASTC_6x6 },
+   { 210, "MTLPixelFormatASTC_8x5_LDR",  PIPE_FORMAT_ASTC_8x5 },
+   { 211, "MTLPixelFormatASTC_8x6_LDR",  PIPE_FORMAT_ASTC_8x6 },
+   { 212, "MTLPixelFormatASTC_8x8_LDR",  PIPE_FORMAT_ASTC_8x8 },
+   { 213, "MTLPixelFormatASTC_10x5_LDR",  PIPE_FORMAT_ASTC_10x5 },
+   { 214, "MTLPixelFormatASTC_10x6_LDR",  PIPE_FORMAT_ASTC_10x6 },
+   { 215, "MTLPixelFormatASTC_10x8_LDR",  PIPE_FORMAT_ASTC_10x8 },
+   { 216, "MTLPixelFormatASTC_10x10_LDR",  PIPE_FORMAT_ASTC_10x10 },
+   { 217, "MTLPixelFormatASTC_12x10_LDR",  PIPE_FORMAT_ASTC_12x10 },
+   { 218, "MTLPixelFormatASTC_12x12_LDR",  PIPE_FORMAT_ASTC_12x12 },
 };
 
 /* Whether a format carries each aspect, asked of Mesa's own description rather than of
@@ -1305,8 +1340,8 @@ pixel_format_refusal(unsigned f)
       return "one of the EAC or ETC2 compressed formats, whose texels come in blocks this "
              "library cannot make";
    if (f >= 186 && f <= 236)
-      return "one of the ASTC compressed formats, whose texels come in blocks this library "
-             "cannot make";
+      return "one of the ASTC formats this library has no row for: the HDR ones (222-236), "
+             "or a number Metal's enumeration leaves empty";
    if (f == 240 || f == 241)
       return "one of Metal's packed 4:2:2 video formats (GBGR422, BGRG422), where one block "
              "holds two texels and a region in texels is not a region in bytes";
@@ -2152,6 +2187,15 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
       say(why, why_size, "slice %u of a texture with %u", layer, texture->layers);
       return false;
    }
+   /* A compressed level smaller than a block is written as one whole block (Metal's rule for
+    * -replaceRegion: on ASTC): the region may reach past the level by less than a block.
+    */
+   if (util_format_is_compressed(res->format)) {
+      if (o[0] < w && o[0] + s[0] > w && o[0] + s[0] < w + util_format_get_blockwidth(res->format))
+         s[0] = w - o[0];
+      if (o[1] < h && o[1] + s[1] > h && o[1] + s[1] < h + util_format_get_blockheight(res->format))
+         s[1] = h - o[1];
+   }
    if (!s[0] || !s[1] || !s[2]) {
       say(why, why_size, "a region of %ux%ux%u texels has no texels in it", s[0], s[1], s[2]);
       return false;
@@ -2187,8 +2231,8 @@ static bool
 caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, size_t stride,
               size_t *out, char *why, size_t why_size)
 {
-   unsigned texel = util_format_get_blocksize(texture->res->format);
-   size_t least = (size_t)box->width * texel;
+   /* a row of blocks for a compressed format; width x texel bytes otherwise (block width 1) */
+   size_t least = util_format_get_stride(texture->res->format, box->width);
    if (stride == 0) {
       *out = least;
       return true;
@@ -2271,7 +2315,8 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res,
                                           texture->base_level + level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
-                                          row * box.height);
+                                          row * util_format_get_nblocksy(texture->res->format,
+                                                                         box.height));
    return 0;
 }
 
