@@ -837,6 +837,21 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
         first Metal call of a frame. Next: log every device/queue method CA calls after the warm-up (a call counter
         that prints even when idle), or read `CA::OGL::MetalContext::set_destination_iosurface` / `update_surface`
         (0x188302550, 0x1883163e0) for the check that fails.
+      - **Why no extension registers (found 2026-11-10 in lsd's unified log of the fresh root):** `Failed to read
+        extension point cache at URL ... Error Domain=com.apple.extensionKit.errorDomain Code=12 "Unable to find AMFI"`.
+        `-[EXExtensionPointEnumerator initWithSDKDictionary:urls:config:]` (ExtensionFoundation, dsc 0x19373f038) reads
+        `/System/Library/xpc/extensions.plist` with `_EX_dictionaryWithSignedURL:` when `enforceXPCCacheCodeSigning`
+        is on, which needs the AMFI kernel service this kernel lacks; only the 6 `.appexpt` points get registered, so
+        every appex fails "Extension cache does not have an entry" during the LaunchServices gather.
+        (`sweet-ext --platform`: only platform 2 finds an entry once the DB is seeded; a patch forcing platform 2 in
+        `MICopyExtensionCacheEntryWithPlatform` changed nothing and was reverted.)
+      - **Patch on the phone (in place, not yet confirmed by a boot):** dsc file `.05` offset 0x5b5b328 (VA
+        0x19373f328) `tbz w0,#0,+0xc0` (00060036) -> `b +0xc0` (30000014): always the plain read. Image block 2301174,
+        in-block 0x328; originals in `_tmp/efblk.orig`, list in `_tmp/dscpatch.txt`. To make lsd reseed without an HFS
+        edit: zero the first 4 KiB of both `*.csstore` files (find block 0 with FIBMAP on the WSL copy; they move at
+        each rebuild). A rebuilt root image must get the same patch (or a kernel AMFI stub).
+      - `sweet-run` keeps 8 boots in `/sweet/runs.log` (252c573, gpu run 42947899394), `a8run.py runslog`; built, not
+        yet installed. All boots share the baked `sweettime`, so unified-log timestamps of different boots overlap.
     - Process lessons:
       - Flash scripts take a lock (`/tmp/g9-run.lock`). Two copies once raced: one replaced the test commands
         with noop.
