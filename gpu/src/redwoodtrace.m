@@ -253,7 +253,9 @@ rwt_start(void)
 	const char *off = getenv("RWA_CALLTRACE");
 	pthread_t thread;
 
-	if (strcmp(getprogname(), "backboardd") != 0 || (off != NULL && off[0] == '0')) {
+	/* AegirPoster too (G9 run 34): with ASTC textures served it makes its queues and then no command buffer */
+	if ((strcmp(getprogname(), "backboardd") != 0 && strcmp(getprogname(), "AegirPoster") != 0) ||
+	    (off != NULL && off[0] == '0')) {
 		return;
 	}
 	for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
