@@ -4099,6 +4099,18 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
  * class (docs/metal.md 10.1's trap).
  */
 - (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1; }
+/*
+ * ios-sweet (G9 run 30): QuartzCore's layer_private_check_pixel_format (0x1883712dc) asks this of the device when a
+ * CAMetalLayer is given an extended-range format, and raises CAMetalLayerInvalid "unsupported extended range format"
+ * on NO. AegirPoster (the Earth/Moon wallpapers) died of that 25 times a boot. The XR formats are served, as BGRA8
+ * (air_metal.c's table, redwooddrawable.m's rwd_xr_served), so say so; RWA_XR=0 takes both back.
+ */
+- (BOOL)supportsExtendedXR10Formats
+{
+	const char *v = getenv("RWA_XR");
+
+	return !(v != NULL && *v == '0');
+}
 - (MTLSize)sparseTileSizeWithTextureType:(NSUInteger)type
 			     pixelFormat:(NSUInteger)format
 			     sampleCount:(NSUInteger)samples
