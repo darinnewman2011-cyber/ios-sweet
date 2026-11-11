@@ -845,7 +845,12 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
         every appex fails "Extension cache does not have an entry" during the LaunchServices gather.
         (`sweet-ext --platform`: only platform 2 finds an entry once the DB is seeded; a patch forcing platform 2 in
         `MICopyExtensionCacheEntryWithPlatform` changed nothing and was reverted.)
-      - **Patch on the phone (in place, not yet confirmed by a boot):** dsc file `.05` offset 0x5b5b328 (VA
+      - **CONFIRMED by the user 2026-11-10 (run 28, default GL + Metal posters):** with the patch below the wallpaper
+        picker lists wallpapers and the widget picker shows more widgets. New problem: the wallpaper previews are
+        black or black with white garbage, and AegirPoster crashed at least once. Run 28's log ended (520 s) before
+        the picker was opened, so the poster processes' `m2m` lines are not captured yet: run 29 (`w29.cmd`) dumps
+        `CRASH Poster m2m` at 8 and 15 min.
+      - **Patch on the phone (in place):** dsc file `.05` offset 0x5b5b328 (VA
         0x19373f328) `tbz w0,#0,+0xc0` (00060036) -> `b +0xc0` (30000014): always the plain read. Image block 2301174,
         in-block 0x328; originals in `_tmp/efblk.orig`, list in `_tmp/dscpatch.txt`. To make lsd reseed without an HFS
         edit: zero the first 4 KiB of both `*.csstore` files (find block 0 with FIBMAP on the WSL copy; they move at
