@@ -850,6 +850,33 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
         black or black with white garbage, and AegirPoster crashed at least once. Run 28's log ended (520 s) before
         the picker was opened, so the poster processes' `m2m` lines are not captured yet: run 29 (`w29.cmd`) dumps
         `CRASH Poster m2m` at 8 and 15 min.
+      - **Night of 2026-11-10/11 (runs 30-33, unattended):**
+        - Unattended loop: `_tmp/g9-cycle.sh NAME CMDFILE` flashes the auto-return image (`flashboot.sh`, all
+          checks; **ios57t** `442f2a2d...`, = ios55m with `sweetreboot=900`; ios56t `882e7f66...` = 600), reboots, waits
+          for TWRP, reads `runslog`. `g9-everyday.sh` puts ios55m back (done 01:50; phone left in TWRP).
+          `/sdcard/a8bak/BOOT.img` had been lost to the Data format: pushed again from `_tmp/BOOT.img`, hash checked.
+          `pullchunks.sh` now limits each transfer to 240 s and retries (one `adb exec-out` hung for 26 min).
+        - **AegirPoster's abort** (20+ a boot, in every mode): `CAMetalLayerInvalid 'unsupported extended range
+          format'`, raised by QuartzCore `layer_private_check_pixel_format` (0x1883712dc) when the device answers NO to
+          `-supportsExtendedXR10Formats`. Fixed: 758b51a (gpu run 42967946530), installed. Run 31: 0 aborts; it
+          compiles and draws aegir_{starfield,star,earth,luna,threshold,post,sprite} through Metal on the Mali.
+        - Run 31 then showed `E RES pixel format 190/198/208` (ASTC maps refused). 6ae4922 (gpu run 42972631388)
+          adds ASTC LDR 186-200/204-218 to `air_metal.c`; installed (root `73548926...` before the boots).
+          **UNTESTED**: in runs 32/33 AegirPoster starts at ~306 s, makes 4 queues and never draws (nothing asks:
+          the gallery snapshots were saved in run 31). Needs the wallpaper picker opened by hand, or the cache removed.
+        - **Why the previews are black (observed in the files, not yet fixed):** PosterBoard's saved snapshots are
+          `/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore/59/Extensions/<ext>/.../
+          SNAPSHOT_GALLERY-*` (Apple ATX: `AAPL\r\n\x1a\n`, ASTC blocks). Of 22 looked at, every GALLERY and SWITCHER
+          one is a single repeated void-extent block (opaque black, 93-99 %) -- including Gradient/Emoji/Pride, which
+          use no Metal. Only the small `SNAPSHOT_GALLERY_HERO` ones hold a picture (300-522 distinct blocks). So the
+          snapshot taken of a poster scene comes back black whatever the poster drew: look at the render-server
+          snapshot path in backboardd under GL (offscreen target / IOSurface readback), not at the posters.
+        - Also in the unified log (not chased): PosterBoard `SandboxExtensionError ... cannot extend access of
+          <PRSServerPosterPath ...> errno=2`; NTKFaceSnapshotService SIGABRT (7 reports; watch faces draw pink);
+          KonaSynthesizer / MacinTalkAUSP / SiriTTSSynthesizerAU abort ~24 times a boot each, assetsd a few times
+          (uncaught ObjC exception, reason not read yet); chronod `Reload failure` for weather/calendar/news widgets.
+        - Scion (github.com/Scion-Project, site scion-project.github.io): S9 lists "USB log and console" (dwc3 +
+          exynos_usb), ABOX audio, brcmfmac Wi-Fi, RTC as working; Metal is on their "Next" list. Reference only.
       - **Patch on the phone (in place):** dsc file `.05` offset 0x5b5b328 (VA
         0x19373f328) `tbz w0,#0,+0xc0` (00060036) -> `b +0xc0` (30000014): always the plain read. Image block 2301174,
         in-block 0x328; originals in `_tmp/efblk.orig`, list in `_tmp/dscpatch.txt`. To make lsd reseed without an HFS
