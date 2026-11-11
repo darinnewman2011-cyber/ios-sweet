@@ -234,8 +234,20 @@ main(int argc, char **argv)
 			CGRect whole = CGRectMake(0, 0, w, h);
 			int token = 0, r1 = swap_begin(fb, &token), r2 = swap_layer(fb, 0, surface, whole, whole, 0), r3 = swap_end(fb);
 
+			unsigned swaps = 1, bad = 0;
+
 			printf("metal_show: swap begin %d (id %d) layer %d end %d; on the screen for %u s\n", r1, token, r2, r3, seconds);
-			sleep(seconds);
+			/* run 36: one swap returned 0 and nobody saw the picture. The window server presents its own
+			 * frames in the same seconds, and the last swap is what the panel holds: so say it again, ten
+			 * times a second, for as long as the picture is meant to stay. */
+			for (unsigned i = 0; i < seconds * 10; i++) {
+				usleep(100000);
+				bad += swap_begin(fb, &token) != 0;
+				bad += swap_layer(fb, 0, surface, whole, whole, 0) != 0;
+				bad += swap_end(fb) != 0;
+				swaps++;
+			}
+			printf("metal_show: %u swaps, %u calls refused, last id %d\n", swaps, bad, token);
 		} else {
 			printf("metal_show: not shown (no display or no swap calls)\n");
 		}
