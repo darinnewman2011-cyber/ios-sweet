@@ -39,8 +39,7 @@ static const uint8_t bar_bgra[BARS][4] = {      /* B, G, R, A: white yellow cyan
 static const char *const bar_name[BARS] = { "white", "yellow", "cyan", "green", "magenta", "red", "blue", "grey" };
 
 /* run 35: it stopped somewhere after the pass was made, and said nothing: every step says when it is reached */
-#define STEP(...) (printf("metal_show: step: " __VA_ARGS__), printf("
-"))
+#define STEP(...) (printf("metal_show: step: " __VA_ARGS__), putchar(10))
 
 static void *
 sym(void *lib, const char *name)
