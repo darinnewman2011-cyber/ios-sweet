@@ -38,6 +38,10 @@ static const uint8_t bar_bgra[BARS][4] = {      /* B, G, R, A: white yellow cyan
 };
 static const char *const bar_name[BARS] = { "white", "yellow", "cyan", "green", "magenta", "red", "blue", "grey" };
 
+/* run 35: it stopped somewhere after the pass was made, and said nothing: every step says when it is reached */
+#define STEP(...) (printf("metal_show: step: " __VA_ARGS__), printf("
+"))
+
 static void *
 sym(void *lib, const char *name)
 {
@@ -132,7 +136,12 @@ main(int argc, char **argv)
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.25, 1.0);
-		[[cb renderCommandEncoderWithDescriptor:pass] endEncoding];
+		STEP("render pass (clear)");
+		id<MTLRenderCommandEncoder> clear_pass = [cb renderCommandEncoderWithDescriptor:pass];
+
+		STEP("endEncoding of %s", clear_pass ? "the pass" : "NO ENCODER");
+		[clear_pass endEncoding];
+		STEP("blit encoder");
 
 		/* 2: eight bars, each a texture filled from the processor and blitted in; and a ramp under them */
 		unsigned bw = (w - 80) / BARS, bh = h / 3;
@@ -147,6 +156,7 @@ main(int argc, char **argv)
 			MTLTextureDescriptor *td = b < BARS ? bd :
 			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 									       width:tw height:th mipmapped:NO];
+			STEP("patch %u: texture %u x %u", b, tw, th);
 			id<MTLTexture> t = [device newTextureWithDescriptor:td];
 
 			if (t == nil) {
@@ -168,15 +178,22 @@ main(int argc, char **argv)
 					}
 				}
 			}
+			STEP("patch %u: replaceRegion", b);
 			[t replaceRegion:MTLRegionMake2D(0, 0, tw, th) mipmapLevel:0 withBytes:texels bytesPerRow:tw * 4];
 			[keep addObject:t];
+			STEP("patch %u: blit", b);
 			[blit copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
 				   sourceSize:MTLSizeMake(tw, th, 1) toTexture:target destinationSlice:0 destinationLevel:0
 			    destinationOrigin:MTLOriginMake(40 + (b < BARS ? b * bw : 0), b < BARS ? h / 6 : h / 6 + bh + 40, 0)];
 		}
+		STEP("blit endEncoding");
 		[blit endEncoding];
+		STEP("commit");
 		[cb commit];
-		[cb waitUntilCompleted];
+		for (unsigned i = 0; i < 100 && [cb status] < MTLCommandBufferStatusCompleted; i++) {
+			usleep(100000);        /* not waitUntilCompleted: a buffer that never completes must not hide the rest */
+		}
+		STEP("after commit");
 		printf("metal_show: command buffer status %lu%s\n", (unsigned long)[cb status],
 		    [cb error] ? [[[cb error] description] UTF8String] : "");
 		free(texels);

@@ -19,7 +19,7 @@
 #include "m2m.h"
 
 #define RWT_PREFIX      "rwtrace_"
-#define RWT_FIRST       2       /* calls of one selector logged as they happen */
+static unsigned rwt_first = 2;  /* calls of one selector logged as they happen (AegirPoster: 6, it builds and drops renderers) */
 #define RWT_SELECTORS   1024
 #define RWT_LINES       700     /* of the kernel's 4000 m2m lines a boot */
 #define RWT_RING        24
@@ -114,7 +114,7 @@ rwt_forward(id self, SEL _cmd, NSInvocation *invocation)
 	}
 	unsigned n = rwt_count(cls, sel);
 
-	if (n >= 1 && n <= RWT_FIRST) {
+	if (n >= 1 && n <= rwt_first) {
 		rwt_say("%s -%s%s", class_getName(cls), sel_getName(sel), n == 1 ? "" : " (again)");
 	}
 	[invocation setSelector:alias];
@@ -257,6 +257,9 @@ rwt_start(void)
 	if ((strcmp(getprogname(), "backboardd") != 0 && strcmp(getprogname(), "AegirPoster") != 0) ||
 	    (off != NULL && off[0] == '0')) {
 		return;
+	}
+	if (strcmp(getprogname(), "backboardd") != 0) {
+		rwt_first = 6;
 	}
 	for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
 		rwt_hook(classes[i]);
