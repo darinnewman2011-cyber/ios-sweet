@@ -129,7 +129,7 @@ m3 sweet-dmesg -o out/sweet-dmesg src/sweet_dmesg.c          # the kernel messag
 m3 sweet-settime -o out/sweet-settime src/sweet_settime.c     # the clock (no RTC: every boot starts in 1970)
 m3 sweet-ext -fobjc-arc -framework Foundation -o out/sweet-ext src/sweet_ext.m   # which registry knows an extension point
 [ -f out/sweet-ext ] && codesign -s - -f --entitlements src/sweet_ext.entitlements out/sweet-ext >> "$M3LOG" 2>&1
-m3 metal_show -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics -framework IOSurface 	-framework Metal -o out/metal_show src/metal_show.m     # a Metal-drawn picture on the panel at boot, and checked
+m3 metal_show -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics -framework IOSurface \n	-framework Metal -o out/metal_show src/metal_show.m     # a Metal-drawn picture on the panel at boot, checked
 m3 metal_test -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
 	-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES -lMobileGestalt \
 	-o out/metal_test src/metal_test.m
