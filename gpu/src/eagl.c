@@ -3647,12 +3647,44 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 			    half[1020], half[1021], half[1022], half[1023]);
 		}
 	}
+	/*
+	 * A gradient's table of a grey colour comes as red (run 43): every entry red = opacity, green and
+	 * blue zero -- a grey (white fading out) turned into red, green, blue with only the first filled
+	 * in. Over the wallpaper previews that is a red haze from the top. Such a table is made grey again.
+	 */
+	uint16_t *greyed = NULL;
+
+	if (pixels != NULL && type == 0x140b && format == GL_RGBA && level == 0 && width > 0 && height > 0 && width * height <= 1 << 18) {
+		const uint16_t *half = pixels;
+		size_t n = (size_t)width * (size_t)height;
+		bool red = false;
+
+		for (size_t i = 0; i < n; i++) {
+			if (half[4 * i + 1] != 0 || half[4 * i + 2] != 0 || half[4 * i] != half[4 * i + 3]) {
+				red = false;
+				break;
+			}
+			red = red || half[4 * i] != 0;
+		}
+		if (red && (greyed = malloc(n * 8)) != NULL) {
+			static unsigned told;
+
+			for (size_t i = 0; i < n; i++) {
+				greyed[4 * i] = greyed[4 * i + 1] = greyed[4 * i + 2] = greyed[4 * i + 3] = half[4 * i];
+			}
+			pixels = greyed;
+			if (told++ < 4) {
+				say("redwood-gl: a %d x %d half-float table that is red = opacity only: made grey\n", width, height);
+			}
+		}
+	}
 	clear_now(e);
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		group_forget(e, e->bound[e->unit]);
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	free(greyed);
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
 		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
