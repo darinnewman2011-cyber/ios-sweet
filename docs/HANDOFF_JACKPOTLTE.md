@@ -917,6 +917,28 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
     - 95b3bca (tracer) logs calls of 100 ms or more, `new...` calls that return nil, and every texture descriptor
       asked for. **Next: install that build and read it.**
   - The gallery shows category icons but black previews (the black-snapshot problem, unchanged).
+  - **Runs 38/39 (gpu28, 95b3bca tracer):**
+    - AegirPoster asks for one texture, BGRA8 (80) 4x4. No driver call took 100 ms or more, and none returned
+      nil. Over its whole life it made 252 driver calls: device queries, 2 queue/library setups, 4 buffers,
+      1 texture. It made **no `commandBuffer`, no encoder, no draw**.
+    - Its unified log (`_tmp/uli10.sh`, `uli10c.py`, pid 267) shows the gallery cycle: scene connect →
+      "Finished setting up renderer" → `didUpdate isSnapshot: true` → invalidate. Each takes 30-50 ms and repeats
+      for every Earth/Moon/Orrery preview.
+    - So the previews are snapshotted without Aegir ever rendering a frame. The earlier "4 s stall" idea was
+      wrong: our driver is not slow there.
+    - Next suspects: CLKUIMetalQuadView only draws from its display link or `nextDrawable` (not traced, it is
+      CAMetalLayer/redwooddrawable). Or PosterKit's snapshot is the render-server snapshot in backboardd, which
+      is black for every poster, the GL path included.
+    - EXC_RESOURCE: AegirPoster exceeded ActiveSoft 15 MB (non-fatal), so its corpse report is that, not a crash.
+  - **Always-on log (e42d784, CI run 43274313483, `_tmp/gpu29`):**
+    - `sweet-dmesg -f 2` follows the kernel log (new lines by their `[stamp]`).
+    - sweet-run fsyncs run.log and runs.log every 2 s.
+    - `_tmp/w40.cmd`: buffer 1 MiB, metal_show 8, then `timeout 86400` + `sweet-dmesg -f 2`.
+    - Installed by `_tmp/g9-w40.sh` with `%TEMP%/edit20.sh`, which also replaces sweet-dmesg and sweet-run.
+    - The 1 MiB runs.log slot still caps one boot's log: long boots lose their end.
+  - The PC's C: drive filled up (2026-11-11) and crashed WSL mid-install twice. Deleted `_tmp/a8art8,11,13-41`,
+    `gpu21-25` and the big `/opt/sweet/uli/*.jsonl`. Keep `a8art12` (mkios.sh uses its ADT) and `a8art42/43`.
+    uli scripts should delete their `new*.jsonl` (19 GB each) when done; uli10.sh does.
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
