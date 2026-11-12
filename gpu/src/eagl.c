@@ -893,11 +893,30 @@ target_to_surface(struct eagl *e, struct image *image)
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
 		if (image->w30r) {
 			uint8_t *line = malloc((size_t)image->width * 4);
+			static unsigned sampled;
+			char said[400];
+			size_t used = 0;
 
 			glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 			for (GLsizei y = 0; line != NULL && y < image->height; y++) {
+				uint8_t *to = base + row * (size_t)(image->invert ? image->height - 1 - y : y);
+
 				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, line);
-				bgra_to_w30r(line, base + row * (size_t)(image->invert ? image->height - 1 - y : y), image->width);
+				bgra_to_w30r(line, to, image->width);
+				/* (where the red comes from, run 42: what was drawn, as B G R A, and what went into the surface) */
+				if (sampled < 12 && y % (image->height / 8) == image->height / 16 && used < sizeof(said) - 60) {
+					const uint8_t *p = line + 4 * (image->width / 2);
+					uint32_t w;
+
+					memcpy(&w, to + 4 * (image->width / 2), 4);
+					used += (size_t)snprintf(said + used, sizeof(said) - used, " y%d %u/%u/%u/%u=%08x", y, p[0], p[1], p[2],
+					    p[3], w);
+				}
+			}
+			if (sampled < 12 && line != NULL) {
+				sampled++;
+				say("redwood-gl: w30r surface %u copied out%s (middle column, B/G/R/A drawn = word stored):%s\n",
+				    IOSurfaceGetID(surface), image->invert ? ", inverted" : "", said);
 			}
 			free(line);
 		} else if (!image->invert) {
