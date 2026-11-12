@@ -7,11 +7,16 @@
  *   sweet-dmesg TEXT ...  only the lines that contain one of the TEXTs
  *   sweet-dmesg -s BYTES  make the buffer that big (kern.msgbuf, root), say what it was and is, print nothing else:
  *                         the boot's default is small and memorystatus fills it in under a minute
+ *   sweet-dmesg -f N [TEXT ...]  follow: print the buffer, then every N seconds only the lines that are new since,
+ *                         until killed. A line is new when its "[ seconds.micro]" stamp is later than the last one
+ *                         printed (lines without a stamp go with the stamped line before them). Under sweet-run
+ *                         this keeps the whole boot's kernel log on disk however the boot ends.
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/sysctl.h>
 
 /* libproc's, in libSystem on iOS too; the iOS SDK has no libproc.h */
@@ -39,31 +44,72 @@ main(int argc, char **argv)
 		printf("sweet-dmesg: kernel message buffer %d bytes, asked %d, now %d\n", size, want, now);
 		return 0;
 	}
-	buf = calloc(1, (size_t)size + 1);
-	if (buf == NULL) {
-		return 1;
-	}
-	n = proc_kmsgbuf(buf, (uint32_t)size);
-	if (n <= 0) {
-		perror("sweet-dmesg: proc_kmsgbuf");
-		return 1;
-	}
-	buf[n < size ? n : size] = '\0';
-	for (line = buf; *line != '\0'; line = next) {
-		int show = argc < 2;
 
-		next = strchr(line, '\n');
-		if (next != NULL) {
-			*next++ = '\0';
-		} else {
-			next = line + strlen(line);
+	int follow = 0, first = 1;
+	double last = -1;
+
+	if (argc >= 3 && strcmp(argv[1], "-f") == 0) {
+		follow = atoi(argv[2]) > 0 ? atoi(argv[2]) : 2;
+		argv += 2;
+		argc -= 2;
+		setvbuf(stdout, NULL, _IOLBF, 0);
+	}
+	for (;;) {
+		/* the buffer may have been made bigger (-s) since the last round */
+		len = sizeof(size);
+		if (sysctlbyname("kern.msgbuf", &size, &len, NULL, 0) != 0 || size <= 0) {
+			size = 1 << 20;
 		}
-		for (int i = 1; i < argc && !show; i++) {
-			show = strstr(line, argv[i]) != NULL;
+		buf = calloc(1, (size_t)size + 1);
+		if (buf == NULL) {
+			return 1;
 		}
-		if (show && *line != '\0') {
-			puts(line);
+		n = proc_kmsgbuf(buf, (uint32_t)size);
+		if (n <= 0) {
+			perror("sweet-dmesg: proc_kmsgbuf");
+			return 1;
 		}
+		buf[n < size ? n : size] = '\0';
+
+		double newest = last;
+		int fresh = first;
+
+		for (line = buf; *line != '\0'; line = next) {
+			int show = argc < 2;
+			double stamp;
+
+			next = strchr(line, '\n');
+			if (next != NULL) {
+				*next++ = '\0';
+			} else {
+				next = line + strlen(line);
+			}
+			if (follow) {
+				if (sscanf(line, "[%lf]", &stamp) == 1) {
+					fresh = first || stamp > last;
+					if (stamp > newest) {
+						newest = stamp;
+					}
+				}
+				if (!fresh) {
+					continue;
+				}
+			}
+			for (int i = 1; i < argc && !show; i++) {
+				show = strstr(line, argv[i]) != NULL;
+			}
+			if (show && *line != '\0') {
+				puts(line);
+			}
+		}
+		free(buf);
+		if (!follow) {
+			break;
+		}
+		last = newest;
+		first = 0;
+		fflush(stdout);
+		sleep((unsigned)follow);
 	}
 	return 0;
 }

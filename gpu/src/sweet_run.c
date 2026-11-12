@@ -66,6 +66,22 @@ out(const char *buf, size_t n)
 		pwrite(runsfd, buf, m, runsbase + runspos);
 		runspos += m;
 	}
+
+	/* to the disk every 2 s, not only after each command: a long one (sweet-dmesg -f) runs until the boot ends,
+	 * and a forced restart would take everything still in the cache with it */
+	static struct timespec synced;
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	if (t.tv_sec - synced.tv_sec >= 2) {
+		synced = t;
+		if (logfd >= 0) {
+			fsync(logfd);
+		}
+		if (runsfd >= 0) {
+			fsync(runsfd);
+		}
+	}
 }
 
 static void
