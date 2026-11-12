@@ -277,6 +277,7 @@ struct image {
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
+	bool w30r;                      /* the surface is 'w30r' (10 bits a colour, extended range): converted both ways, see w30r_from() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
@@ -644,7 +645,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 	GLint bound = 0;
 
-	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
+	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first || image->w30r ||
 	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
 	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
 		return false;
@@ -672,7 +673,8 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
+	if (!share_surfaces || image->invert || image->alpha_first || image->w30r || image->format != GL_BGRA ||
+	    image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
@@ -717,6 +719,43 @@ surface_changed(struct eagl *e, struct image *image)
 	return true;
 }
 
+/*
+ * 'w30r' (kCVPixelFormatType_30RGBLEPackedWideGamut): four bytes a pixel, little-endian, blue in
+ * bits 0-9, green 10-19, red 20-29, the top two zero; extended range, 384 is black and 894 white.
+ * PosterBoard's wallpaper snapshots are drawn into such surfaces (seen, run 41: -attachImage
+ * refused them, the framebuffer had no picture, every draw failed 0x506 and the previews stayed
+ * black). The texture here is plain blue-first 8 bits a colour; these two convert a row.
+ */
+static void
+w30r_to_bgra(const uint8_t *from, uint8_t *to, GLsizei width)
+{
+	for (GLsizei x = 0; x < width; x++) {
+		uint32_t p;
+		int c[3];
+
+		memcpy(&p, from + 4 * x, 4);
+		for (int i = 0; i < 3; i++) {
+			c[i] = ((int)((p >> (10 * i)) & 0x3ff) - 384) / 2;
+			c[i] = c[i] < 0 ? 0 : c[i] > 255 ? 255 : c[i];
+		}
+		to[4 * x] = (uint8_t)c[0];
+		to[4 * x + 1] = (uint8_t)c[1];
+		to[4 * x + 2] = (uint8_t)c[2];
+		to[4 * x + 3] = 255;
+	}
+}
+
+static void
+bgra_to_w30r(const uint8_t *from, uint8_t *to, GLsizei width)
+{
+	for (GLsizei x = 0; x < width; x++) {
+		uint32_t p = (uint32_t)(384 + 2 * from[4 * x]) | (uint32_t)(384 + 2 * from[4 * x + 1]) << 10 |
+		    (uint32_t)(384 + 2 * from[4 * x + 2]) << 20;
+
+		memcpy(to + 4 * x, &p, 4);
+	}
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -737,12 +776,16 @@ surface_to_texture(struct eagl *e, struct image *image)
 		return;
 	}
 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
-	if ((image->invert || alpha_first) && (flipped = calloc(row, (size_t)image->height)) != NULL) {
+	if ((image->invert || alpha_first || image->w30r) && (flipped = calloc(row, (size_t)image->height)) != NULL) {
 		for (GLsizei y = 0; y < image->height; y++) {
 			const uint8_t *from = base + row * (size_t)(image->invert ? image->height - 1 - y : y);
 			uint8_t *to = flipped + row * (size_t)y;
 			size_t used = (size_t)image->width * pixel;     /* (the last row may end where its pixels do) */
 
+			if (image->w30r) {
+				w30r_to_bgra(from, to, (GLsizei)((used < row ? used : row) / 4));
+				continue;
+			}
 			if (!alpha_first) {
 				memcpy(to, from, used < row ? used : row);
 				continue;
@@ -848,7 +891,16 @@ target_to_surface(struct eagl *e, struct image *image)
 		base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, 0) : IOSurfaceGetBaseAddress(surface);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
-		if (!image->invert) {
+		if (image->w30r) {
+			uint8_t *line = malloc((size_t)image->width * 4);
+
+			glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+			for (GLsizei y = 0; line != NULL && y < image->height; y++) {
+				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, line);
+				bgra_to_w30r(line, base + row * (size_t)(image->invert ? image->height - 1 - y : y), image->width);
+			}
+			free(line);
+		} else if (!image->invert) {
 			glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, base);
 		} else {
 			for (GLsizei y = 0; y < image->height; y++) {
@@ -4168,6 +4220,12 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	image->invert = invert;
 	image->width = width;
 	image->height = height;
+	if (IOSurfaceGetPixelFormat(surface) == 'w30r' && IOSurfaceGetPlaneCount(surface) == 0 && plane == 0) {
+		/* (a wallpaper snapshot, shown: whatever was asked, a plain picture converted from it, as drawn) */
+		image->w30r = true;
+		image->internal = image->format = GL_BGRA;
+		image->type = GL_UNSIGNED_BYTE;
+	}
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
 	if (shown++ < 24) {
@@ -4216,7 +4274,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	    IOSurfaceGetBytesPerElementOfPlane(surface, 0) == 4 &&
 	    IOSurfaceGetWidthOfPlane(surface, 0) == IOSurfaceGetWidth(surface) &&
 	    IOSurfaceGetHeightOfPlane(surface, 0) == IOSurfaceGetHeight(surface);
-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0 && !b3a8) ||
+	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0 && pixels != 'w30r' && !b3a8) ||
 	    IOSurfaceGetBytesPerElement(surface) != 4 || (IOSurfaceGetPlaneCount(surface) != 0 && !b3a8) ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
@@ -4242,6 +4300,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * there being no pixel format.
 	 */
 	image->wrapped = image->alpha_first = pixels == 0;
+	image->w30r = pixels == 'w30r';
 	note_format("IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width, image->height);
 	/*
 	 * What is attached is as often read as drawn into (a picture CoreAnimation has made a surface
