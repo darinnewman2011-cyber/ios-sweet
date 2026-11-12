@@ -118,7 +118,30 @@ rwt_forward(id self, SEL _cmd, NSInvocation *invocation)
 		rwt_say("%s -%s%s", class_getName(cls), sel_getName(sel), n == 1 ? "" : " (again)");
 	}
 	[invocation setSelector:alias];
+
+	/* How long the driver took, and whether a new... came back empty: a renderer that waits on a slow upload
+	 * or is handed nil stops without a word of its own, and neither shows in a list of selectors. */
+	static unsigned slow_lines, nil_lines;
+	uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
 	[invocation invokeWithTarget:self];
+
+	uint64_t ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000000;
+	const char *name = sel_getName(sel);
+
+	if (ms >= 100 && slow_lines < 60) {
+		slow_lines++;
+		rwt_say("%s -%s took %llu ms", class_getName(cls), name, (unsigned long long)ms);
+	}
+	if (strncmp(name, "new", 3) == 0 && [[invocation methodSignature] methodReturnType][0] == '@' && nil_lines < 40) {
+		void *made = NULL;
+
+		[invocation getReturnValue:&made];
+		if (made == NULL) {
+			nil_lines++;
+			rwt_say("%s -%s returned nil", class_getName(cls), name);
+		}
+	}
 }
 
 static BOOL
