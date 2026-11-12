@@ -138,6 +138,8 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_FRAMEBUFFER                  0x8d40
 #define GL_SYNC_GPU_COMMANDS_COMPLETE   0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT      0x00000001
+#define GL_ALREADY_SIGNALED             0x911A
+#define GL_CONDITION_SATISFIED          0x911C
 
 #define VBLUR_LEVELS    8               /* levels of a blur whose radius varies, the picture itself included */
 #define VBLUR_CHAINS    6               /* ... such blurs kept track of at a time */
@@ -175,6 +177,43 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+
+	/* backboardd's stderr goes nowhere: the kernel log too, through RedwoodMali's request 0x79 (xnu 0129, as
+	 * m2m.h does), so sweet-dmesg -f keeps these lines with the rest of the boot. At most 480 bytes a line. */
+	static io_connect_t kernel_log;
+	static int kernel_log_tried;
+
+	if (!kernel_log_tried) {
+		io_service_t mali = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RedwoodMali"));
+
+		kernel_log_tried = 1;
+		if (mali != IO_OBJECT_NULL) {
+			if (IOServiceOpen(mali, mach_task_self(), 0, &kernel_log) != KERN_SUCCESS) {
+				kernel_log = IO_OBJECT_NULL;
+			}
+			IOObjectRelease(mali);
+		}
+	}
+	if (kernel_log != IO_OBJECT_NULL && n > 0) {
+		char rec[480];
+		int m = n;
+
+		if (m > (int)sizeof(rec)) {
+			m = sizeof(rec);
+		}
+		memcpy(rec, line, (size_t)m);
+		while (m > 0 && rec[m - 1] == '\n') {
+			m--;
+		}
+		for (int i = 0; i < m; i++) {
+			if (rec[i] == '\n') {
+				rec[i] = ' ';
+			}
+		}
+		if (m > 0) {
+			(void)IOConnectCallStructMethod(kernel_log, 0x79, rec, (size_t)m, NULL, NULL);
+		}
+	}
 }
 
 static void
@@ -3393,6 +3432,40 @@ my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0xeb8);
+}
+
+/*
+ * glClientWaitSync: CoreAnimation calls it (the '*' in eagl_slots.txt). A frame drawn into an IOSurface that is not
+ * the texture's own memory reaches the surface only in frame_end() (target_to_surface), which glFlush/glFinish
+ * run. A render server snapshot (a poster's gallery picture) can end with a fence and a wait instead; then the
+ * surface would keep what it held before, black. So a wait that saw its fence signalled also ends the frame.
+ */
+static GLenum
+my_glClientWaitSync(void *context, GLsync sync, GLbitfield flags, GLuint64 timeout)
+{
+	struct eagl *e = context;
+	static unsigned told;
+	GLenum r;
+
+	EAGL_ENTER(e, 0x1878);
+	clear_now(e);
+	r = glClientWaitSync(sync, flags, timeout);
+	if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
+		unsigned drawn = 0;
+
+		for (unsigned i = 0; i < e->image_count; i++) {
+			drawn += e->images[i].target && e->images[i].drawn && !e->images[i].shared;
+		}
+		if (drawn != 0) {
+			if (told < 8) {
+				told++;
+				say("redwood-gl: glClientWaitSync ends a frame: %u drawn IOSurface(s) to copy out\n", drawn);
+			}
+			frame_end(e, true);
+		}
+	}
+	EAGL_LEAVE(e, 0x1878);
+	return r;
 }
 
 static void
