@@ -11,6 +11,7 @@
  * which is fine for a window server that draws nothing. Not in any other process.
  */
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <pthread.h>
@@ -121,7 +122,20 @@ rwt_forward(id self, SEL _cmd, NSInvocation *invocation)
 
 	/* How long the driver took, and whether a new... came back empty: a renderer that waits on a slow upload
 	 * or is handed nil stops without a word of its own, and neither shows in a list of selectors. */
-	static unsigned slow_lines, nil_lines;
+	static unsigned slow_lines, nil_lines, tex_lines;
+
+	if (sel == @selector(newTextureWithDescriptor:) && tex_lines < 40) {
+		MTLTextureDescriptor *d = nil;
+
+		[invocation getArgument:&d atIndex:2];
+		if (d != nil && [d respondsToSelector:@selector(pixelFormat)]) {
+			tex_lines++;
+			rwt_say("texture asked for: format %lu, %lu x %lu x %lu, %lu levels, type %lu, usage 0x%lx, storage %lu",
+			        (unsigned long)[d pixelFormat], (unsigned long)[d width], (unsigned long)[d height],
+			        (unsigned long)[d depth], (unsigned long)[d mipmapLevelCount], (unsigned long)[d textureType],
+			        (unsigned long)[d usage], (unsigned long)[d storageMode]);
+		}
+	}
 	uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
 	[invocation invokeWithTarget:self];
