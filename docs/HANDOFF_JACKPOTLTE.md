@@ -889,6 +889,34 @@ from TWRP). Treat third-party forks as untrusted reading material; do not run th
         with noop.
       - A forced power-off leaves the HFS+ journal dirty. Before editing the root again, boot ios42 once and
         shut down from Settings.
+- **2026-11-11, runs 34-37 (metal_show, the Astronomy wallpaper):**
+  - **On the phone now:**
+    - BOOT `a8-ios58m-boot.img` (a8647f6a...): ios55m plus `,metal_show` on `sweetmetalfor`, `sweetreboot=0`.
+      Its cmdline is in `_tmp/ios58.cmdline`.
+    - gpu27 userland (d7a0950, CI run 43073160758). Root 06c9a8e9...
+  - **CI:** gpu.yml runs on `macos-15-intel` (8173d9b), because the arm64 hosted runners were never acquired.
+  - **`gpu/src/metal_show.m` (Metal self-test, run at boot from `w37.cmd`):**
+    - It clears an IOSurface of display size, blits 8 colour bars and a ramp into it, reads them back
+      (PASS/FAIL) and hands it to IOMobileFramebuffer.
+    - **Run 36:** everything PASSED and the swap returned 0, but the user saw nothing. It swapped only once.
+    - **Run 37:** re-swapping every 100 ms for 8 s (81 swaps, 0 refused). **The user saw the bars correctly.**
+      So the Metal driver's pixels, IOSurface sharing and the display path all work. backboardd's own swaps simply
+      overwrite a single swap.
+    - The first blit into the IOSurface takes 630 ms, GPU wait 0.3 ms: CPU-side, probably the one-time blit shader
+      compile.
+    - (Correction: the run 35 "hang" was about 18 s of slow work plus the sleep, over a 25 s runner timeout.)
+  - **Astronomy wallpaper (AegirPoster), from the unified log (`_tmp/uli9.sh`, `uli9b.py`, `uli9c.py`):**
+    - Older boots: `CAMetalLayerInvalid 'unsupported extended range format'` (fixed by `supportsExtendedXR10Formats`).
+    - Then: `-[__NSArrayM insertObject:atIndex:]: object cannot be nil` in
+      `-[NUNIAegirRenderer getOrCreateUniformBufferforFrameBufferIndex:]`. It is `newBufferWithLength:432
+      options:1` returning nil while it snapshots a gallery preview (`CLKUIMetalQuadView snapshotInRect`).
+      Not seen on the current driver.
+    - **Now (gpu24 onward):** no crash. The trace is newDefaultLibrary, 2 buffers, newTextureWithDescriptor,
+      replaceRegion, then **4 s with no driver calls**, then a teardown (releaseCacheEntry / _purgeDevice), repeated.
+    - Guess, not proven: the replaceRegion (an ASTC Earth/Moon map) is slow, and PosterKit drops the scene.
+    - 95b3bca (tracer) logs calls of 100 ms or more, `new...` calls that return nil, and every texture descriptor
+      asked for. **Next: install that build and read it.**
+  - The gallery shows category icons but black previews (the black-snapshot problem, unchanged).
 - **Nested panics:** the caller `0xfffffff007a2f754` is `_panic_with_options` itself, i.e. the panic path
   re-entering this early in boot. They're a side effect of the first panic, not a separate bug.
 - **User's storage plan (2026-11-01, not started):** dual boot, Android keeps ~8 GB of USERDATA and the rest
