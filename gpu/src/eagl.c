@@ -3636,6 +3636,17 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 			    half[4 * (width - 1)], half[4 * (width - 1) + 1], half[4 * (width - 1) + 2], half[4 * (width - 1) + 3]);
 		}
 	}
+	if (pixels != NULL && type == 0x140b && format == GL_RGBA && width == 256 && level == 0) {
+		/* (a gradient's colours, run 42: the red cast over the wallpaper previews; the first, middle and last entry) */
+		static unsigned told;
+		const uint16_t *half = pixels;
+
+		if (told++ < 10) {
+			say("redwood-gl: a 256-wide half-float table (%d high), as RGBA halves: %04x %04x %04x %04x | %04x %04x %04x %04x | "
+			    "%04x %04x %04x %04x\n", height, half[0], half[1], half[2], half[3], half[512], half[513], half[514], half[515],
+			    half[1020], half[1021], half[1022], half[1023]);
+		}
+	}
 	clear_now(e);
 	if (target == GL_TEXTURE_2D && e->unit < 8) {
 		group_forget(e, e->bound[e->unit]);
@@ -4254,6 +4265,20 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 		    height, plane, invert ? ", inverted" : "");
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
+	if (image->wrapped && height == 1 && IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) == 0) {
+		/* (a table in somebody's memory, run 42: what it holds, first and last eight bytes, for the red cast) */
+		static unsigned told;
+		const uint8_t *b = IOSurfaceGetBaseAddress(surface);
+		size_t n = IOSurfaceGetBytesPerRow(surface);
+
+		if (b != NULL && n >= 16 && told++ < 8) {
+			say("redwood-gl: a table surface %u, %zu bytes an element, %zu a row: %02x%02x%02x%02x %02x%02x%02x%02x ... "
+			    "%02x%02x%02x%02x %02x%02x%02x%02x\n", IOSurfaceGetID(surface), IOSurfaceGetBytesPerElement(surface), n,
+			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[n - 8], b[n - 7], b[n - 6], b[n - 5], b[n - 4], b[n - 3],
+			    b[n - 2], b[n - 1]);
+		}
+		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	}
 	began = now_us();
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
