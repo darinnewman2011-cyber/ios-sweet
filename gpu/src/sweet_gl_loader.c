@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * libsweet-gl-loader.dylib: GPU step 7 (docs/GPU_JACKPOTLTE.md). backboardd's launchd job inserts it
  * (DYLD_INSERT_LIBRARIES; dyld honours that because of the kernel's "AMFI" dyld policy, patch 0119).

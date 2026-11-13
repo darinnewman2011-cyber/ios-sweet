@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * The OpenGL ES library behind src/eagl.c when that library is Mesa as tools/mk-mesa.sh builds
  * it: any of its drivers that draws into memory, reached through its off-screen interface

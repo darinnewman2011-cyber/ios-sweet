@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * sweet-dmesg: print the kernel's message buffer, as macOS' dmesg does (the iOS image has none). The console
  * window in ramoops holds 16 KB; this is the whole buffer, so a sweet-run test list ends with it and the daemons'

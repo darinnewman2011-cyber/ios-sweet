@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * gl_test: one triangle through the OpenGL ES library of the image (lib/libOSMesa.8.dylib: Mesa,
  * with its Adreno driver when the kernel has kept the GPU on -- boot-arg adreno_keep=1 -- and its

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * mali_test: the GPU through the interface programs have (iokit/Kernel/RedwoodMali.cpp, Linux's
  * panfrost), as Mesa will use it through tools/mesa/redwood-drm: parameters, a buffer made and

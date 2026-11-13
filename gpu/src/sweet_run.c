@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * sweet-run: run the commands in /sweet/run.cmd once per boot (launchd job com.sweet.run) and keep their output in
  * /sweet/run.log as well as on the console. Both files have a fixed size and are only ever overwritten in place, so

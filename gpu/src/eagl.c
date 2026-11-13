@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * libredwood-gl.dylib: an OpenGL ES implementation behind iOS's EAGLContext, inside the window
  * server (backboardd; libredwood.dylib loads this when the image has it: build.sh GL=1).

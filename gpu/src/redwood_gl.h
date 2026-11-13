@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * What src/eagl.c asks of the OpenGL ES library behind it besides the gl* functions: see
  * src/gl_osmesa.c, the one implementation there is.

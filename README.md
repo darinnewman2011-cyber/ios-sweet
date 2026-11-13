@@ -200,4 +200,13 @@ More in [`NOTES.md`](NOTES.md).
 
 ## Credits
 
+- **ios-sweet** (the Xiaomi Redmi Note 10 Pro port this started from): dipa-studio.
+- **Galaxy A8 2018 (`jackpotlte`) port, the redwood GPU layer** (the Mali kernel driver, OpenGL ES for CoreAnimation
+  over Mesa/Panfrost, the Metal driver) **and the boot and logging tools**: Darin, who directed and tested every step
+  on the phone, and Claude (Anthropic's AI model, through Claude Code), which wrote the code and did the
+  reverse-engineering. Reusing this work is welcome under the MIT License; keep the copyright notice and credit.
+- [Mesa](https://mesa3d.org) / Panfrost for the Mali GPU driver the graphics layer runs on.
+- [Scion](https://github.com/Scion-Project) for showing ABOX audio can be driven without its firmware (reference
+  for the A8 audio work; their kernel code is APSL 2.0).
+
 Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.

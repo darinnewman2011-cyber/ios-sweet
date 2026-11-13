@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 /*
  * mali2metal's channel from user space (the kernel's side: bsd/dev/redwood_m2m.c; the record format
  * and the categories: PLANS/10-mali2metal.md).
