@@ -3649,8 +3649,9 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	}
 	/*
 	 * A gradient's table of a grey colour comes as red (run 43): every entry red = opacity, green and
-	 * blue zero -- a grey (white fading out) turned into red, green, blue with only the first filled
-	 * in. Over the wallpaper previews that is a red haze from the top. Such a table is made grey again.
+	 * blue zero. Over the wallpaper previews that is a red haze from the top. Made white (run 44) it
+	 * was a white glow; it is the lock screen's dimming, black fading out, so it is made black: the
+	 * colours zero, the opacity kept (the table is premultiplied).
 	 */
 	uint16_t *greyed = NULL;
 
@@ -3670,11 +3671,12 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 			static unsigned told;
 
 			for (size_t i = 0; i < n; i++) {
-				greyed[4 * i] = greyed[4 * i + 1] = greyed[4 * i + 2] = greyed[4 * i + 3] = half[4 * i];
+				greyed[4 * i] = greyed[4 * i + 1] = greyed[4 * i + 2] = 0;
+				greyed[4 * i + 3] = half[4 * i + 3];
 			}
 			pixels = greyed;
 			if (told++ < 4) {
-				say("redwood-gl: a %d x %d half-float table that is red = opacity only: made grey\n", width, height);
+				say("redwood-gl: a %d x %d half-float table that is red = opacity only: made black\n", width, height);
 			}
 		}
 	}
@@ -4290,6 +4292,18 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	}
 	note_format(invert ? "IOSurface shown, inverted" : "IOSurface shown", image->internal, image->format, image->type, width,
 	    height);
+	static unsigned odd;
+	/* (run 44, the Astronomy globe drawn twice side by side: a picture read with the wrong width or pixel size) */
+	bool mismatch = (size_t)width != IOSurfaceGetWidth(surface) || (size_t)height != IOSurfaceGetHeight(surface) ||
+	    (IOSurfaceGetPlaneCount(surface) == 0 && IOSurfaceGetBytesPerElement(surface) != bytes_a_pixel(image->format, image->type));
+
+	if (mismatch && odd++ < 40) {
+		say("redwood-gl: -texImageIOSurface mismatch: surface %u ('%.4s' %zu x %zu, %zu bytes an element, %zu a row) asked as %d x %d, "
+		    "internal %#x format %#x type %#x (%u bytes a pixel), plane %u\n", IOSurfaceGetID(surface),
+		    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetWidth(surface),
+		    IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerElement(surface), IOSurfaceGetBytesPerRow(surface), width, height,
+		    image->internal, image->format, image->type, bytes_a_pixel(image->format, image->type), plane);
+	}
 	if (shown++ < 24) {
 		say("redwood-gl: -texImageIOSurface: surface %u ('%.4s' %zu x %zu, %zu planes) as texture %d: %d x %d, plane %u%s\n",
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) },
