@@ -1,0 +1,434 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_a8input.c			standard
+ bsd/dev/sweet_a8gpu.c			standard
++bsd/dev/sweet_a8power.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8power.c b/bsd/dev/sweet_a8power.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a8power.c
+@@ -0,0 +1,285 @@
++/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
++/*
++ * Galaxy A8 (2018, jackpotlte) power: the S2MU004's fuel gauge and charger, read for iOS's battery
++ * (iokit/Kernel/arm/SweetBattery.cpp), and its haptic driver for the vibration motor.
++ *
++ * Facts (stock BOOT.img device tree; Samsung's SM-A530F kernel, GPL-2.0, read for facts only:
++ * drivers/battery_v2/s2mu004_fuelgauge.c, s2mu004_charger.c, drivers/motor/s2mu004_haptic.c,
++ * cal-if/exynos7885/cmucal-sfr.c, pinctrl-exynos.c):
++ *   I2C0 0x13830000 (S3C2440 type, as the touch screen's I2C4), pins gpp1-0/1 function 2, clock gate
++ *        CMU_PERI 0x10010000 + 0x2038: fuel gauge at 0x3B, haptic driver at 0x3A.
++ *   I2C1 0x13840000, pins gpp1-2/3 function 2, gate + 0x203C: the S2MU004 itself (charger) at 0x3D.
++ *   Fuel gauge: RVBAT 0x04 (mV = raw * 1000 >> 13), RCUR_CC 0x06 (two's complement, bit 15 set =
++ *        charging; mA = |raw| * 1000 >> 12), RSOC 0x08 (signed; 0.01 % = raw * 10000 / 2^14).
++ *   Charger: STATUS0 0x0A bits 7:5 = CHGIN (3 or 5: input good and charging, 2: over-voltage),
++ *        STATUS1 0x0B (bit 7 self-discharge, bit 1 top-off, bit 0 done).
++ *   Motor: haptic MODE 0x0E = 0x20 (external PWM), bit 0 = motor on; the PWM is timer 0 of the
++ *        PWM block 0x13970000 (S3C6400 type) on pin gpg0-1 function 2, gate + 0x2058; Samsung's
++ *        period 4.8 ms (208 Hz) at half duty.
++ *
++ * The battery side only reads the chips. The only writes outside the SoC's own clock gates and
++ * pins are the motor's, and only with the boot-arg a8motor=MS (a buzz of MS milliseconds, at most
++ * 1000, once, when the battery service starts): a test that the motor answers.
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_a8_power_init(void);
++int sweet_a8_power_read(unsigned *centipercent, unsigned *mv, int *ma, uint8_t *chg0, uint8_t *chg1);
++
++#define TOP_PA          0x139b0000u
++#define PERI_PA         0x10010000u
++#define I2C0_PA         0x13830000u
++#define I2C1_PA         0x13840000u
++#define PWM_PA          0x13970000u
++#define GPG0            0x20u
++#define GPP1            0x40u
++#define GPIO_CON        0x0u
++#define GATE_I2C0       0x2038u
++#define GATE_I2C1       0x203cu
++#define GATE_PWM        0x2058u
++#define GATE_ON         ((1u << 20) | (1u << 21))       /* manual, clock on (as the touch driver's I2C4) */
++
++#define IICCON          0x00u
++#define IICSTAT         0x04u
++#define IICDS           0x0cu
++#define CON_ACK         (1u << 7)
++#define CON_DIV512      (1u << 6)
++#define CON_IRQEN       (1u << 5)
++#define CON_PEND        (1u << 4)
++#define CON_BASE        (CON_ACK | CON_DIV512 | CON_IRQEN | 3u)
++#define STAT_MRX        0x80u
++#define STAT_MTX        0xc0u
++#define STAT_START      (1u << 5)
++#define STAT_TXRX       (1u << 4)
++#define STAT_NACK       (1u << 0)
++
++#define FG_ADDR         0x3bu
++#define HAPTIC_ADDR     0x3au
++#define CHG_ADDR        0x3du
++
++#define TCFG0           0x00u
++#define TCFG1           0x04u
++#define TCON            0x08u
++#define TCNTB0          0x0cu
++#define TCMPB0          0x10u
++
++static vm_offset_t top, peri, i2c0, i2c1, pwm;
++static int ready;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* ---- S3C2440 I2C, polled (as sweet_a8input.c's, for any controller and address) ---- */
++
++static int
++i2c_wait(vm_offset_t b)
++{
++	for (int i = 0; i < 20000; ++i) {
++		if (rd(b, IICCON) & CON_PEND) {
++			return 0;
++		}
++		delay(5);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++i2c_next(vm_offset_t b)
++{
++	wr(b, IICCON, rd(b, IICCON) & ~CON_PEND);
++}
++
++static void
++i2c_stop(vm_offset_t b, uint32_t mode)
++{
++	wr(b, IICSTAT, mode | STAT_TXRX);
++	i2c_next(b);
++	for (int i = 0; i < 2000 && (rd(b, IICSTAT) & STAT_START); ++i) {
++		delay(5);
++	}
++}
++
++static int
++i2c_xfer(vm_offset_t b, uint8_t addr, bool rdx, uint8_t *buf, uint32_t len)
++{
++	uint32_t mode = rdx ? STAT_MRX : STAT_MTX;
++	int error;
++
++	wr(b, IICCON, CON_BASE);
++	wr(b, IICSTAT, mode | STAT_TXRX);
++	wr(b, IICDS, (uint32_t)(addr << 1) | (rdx ? 1u : 0u));
++	wr(b, IICSTAT, mode | STAT_TXRX | STAT_START);
++	if ((error = i2c_wait(b))) {
++		goto out;
++	}
++	if (rd(b, IICSTAT) & STAT_NACK) {
++		error = ENXIO;
++		goto out;
++	}
++	for (uint32_t i = 0; i < len; ++i) {
++		if (rdx) {
++			if (i == len - 1) {
++				wr(b, IICCON, rd(b, IICCON) & ~CON_ACK);
++			}
++			i2c_next(b);
++			if ((error = i2c_wait(b))) {
++				goto out;
++			}
++			buf[i] = (uint8_t)rd(b, IICDS);
++		} else {
++			wr(b, IICDS, buf[i]);
++			i2c_next(b);
++			if ((error = i2c_wait(b))) {
++				goto out;
++			}
++			if (rd(b, IICSTAT) & STAT_NACK) {
++				error = EIO;
++				goto out;
++			}
++		}
++	}
++out:
++	i2c_stop(b, mode);
++	return error;
++}
++
++static int
++reg_read(vm_offset_t b, uint8_t addr, uint8_t reg, uint8_t *buf, uint32_t len)
++{
++	int error = i2c_xfer(b, addr, false, &reg, 1);
++	return error ? error : i2c_xfer(b, addr, true, buf, len);
++}
++
++static int
++reg_write(vm_offset_t b, uint8_t addr, uint8_t reg, uint8_t value)
++{
++	uint8_t two[2] = { reg, value };
++	return i2c_xfer(b, addr, false, two, 2);
++}
++
++/* ---- the motor ---- */
++
++static void
++motor_buzz(unsigned ms)
++{
++	uint8_t mode = 0, after = 0;
++	uint32_t gcon;
++	int error;
++
++	if ((error = reg_read(i2c0, HAPTIC_ADDR, 0x0e, &mode, 1))) {
++		printf("SWEET A8 POWER: motor: the haptic driver does not answer (%d)\n", error);
++		return;
++	}
++	wr(peri, GATE_PWM, rd(peri, GATE_PWM) | GATE_ON);
++	gcon = rd(top, GPG0 + GPIO_CON);
++	wr(top, GPG0 + GPIO_CON, (gcon & ~0xf0u) | 0x20u);     /* gpg0-1: TOUT0 */
++	/* timer 0: prescaler 99, divider 1; 4808 ticks a period (208 Hz from a 100 MHz PCLK), half of them high */
++	wr(pwm, TCFG0, (rd(pwm, TCFG0) & ~0xffu) | 99u);
++	wr(pwm, TCFG1, rd(pwm, TCFG1) & ~0xfu);
++	wr(pwm, TCNTB0, 4808);
++	wr(pwm, TCMPB0, 2404);
++	wr(pwm, TCON, (rd(pwm, TCON) & ~0x1fu) | 0x2u);         /* manual update */
++	wr(pwm, TCON, (rd(pwm, TCON) & ~0x1fu) | 0x9u);         /* auto-reload, start */
++	(void)reg_write(i2c0, HAPTIC_ADDR, 0x0e, 0x20);         /* external PWM */
++	(void)reg_write(i2c0, HAPTIC_ADDR, 0x0e, 0x21);         /* motor on */
++	(void)reg_read(i2c0, HAPTIC_ADDR, 0x0e, &after, 1);
++	printf("SWEET A8 POWER: motor: on for %u ms (MODE %#x -> %#x, gpg0 con %#x, PWM TCON %#x TCNTO0 %u)\n", ms, mode,
++	    after, gcon, rd(pwm, TCON), rd(pwm, 0x14));
++	delay(ms * 1000);
++	(void)reg_write(i2c0, HAPTIC_ADDR, 0x0e, 0x20);         /* motor off */
++	wr(pwm, TCON, rd(pwm, TCON) & ~0x1fu);
++	wr(top, GPG0 + GPIO_CON, gcon);
++	printf("SWEET A8 POWER: motor: off\n");
++}
++
++/* ---- the battery ---- */
++
++int
++sweet_a8_power_read(unsigned *centipercent, unsigned *mv, int *ma, uint8_t *chg0, uint8_t *chg1)
++{
++	uint8_t soc[2], vbat[2], cur[2];
++	uint16_t raw;
++	int error;
++
++	if (!ready) {
++		return ENXIO;
++	}
++	if ((error = reg_read(i2c0, FG_ADDR, 0x08, soc, 2)) || (error = reg_read(i2c0, FG_ADDR, 0x04, vbat, 2)) ||
++	    (error = reg_read(i2c0, FG_ADDR, 0x06, cur, 2)) || (error = reg_read(i2c1, CHG_ADDR, 0x0a, chg0, 1)) ||
++	    (error = reg_read(i2c1, CHG_ADDR, 0x0b, chg1, 1))) {
++		return error;
++	}
++	raw = (uint16_t)(soc[0] | soc[1] << 8);
++	*centipercent = (raw & 0x8000u) ? 0 : (unsigned)(((uint32_t)raw * 10000u) >> 14);
++	*mv = (unsigned)(((uint32_t)(vbat[0] | vbat[1] << 8) * 1000u) >> 13);
++	raw = (uint16_t)(cur[0] | cur[1] << 8);
++	if (raw & 0x8000u) {
++		*ma = (int)(((((uint32_t)~raw) & 0xffffu) + 1u) * 1000u >> 12);         /* charging: positive, as IOPMPowerSource */
++	} else {
++		*ma = -(int)((((uint32_t)raw & 0x7fffu) * 1000u) >> 12);
++	}
++	return 0;
++}
++
++int
++sweet_a8_power_init(void)
++{
++	uint32_t g0, g1, pcon;
++	uint8_t probe = 0;
++	unsigned buzz = 0;
++	int e0, e1;
++
++	if (ready) {
++		return 0;
++	}
++	top = ml_io_map(TOP_PA, 0x1000);
++	peri = ml_io_map(PERI_PA, 0x4000);
++	i2c0 = ml_io_map(I2C0_PA, 0x100);
++	i2c1 = ml_io_map(I2C1_PA, 0x100);
++	pwm = ml_io_map(PWM_PA, 0x100);
++	if (!top || !peri || !i2c0 || !i2c1 || !pwm) {
++		printf("SWEET A8 POWER: cannot map the registers\n");
++		return ENOMEM;
++	}
++	g0 = rd(peri, GATE_I2C0);
++	g1 = rd(peri, GATE_I2C1);
++	pcon = rd(top, GPP1 + GPIO_CON);
++	printf("SWEET A8 POWER: before: i2c0 gate %#x i2c1 gate %#x gpp1 con %#x\n", g0, g1, pcon);
++	wr(peri, GATE_I2C0, g0 | GATE_ON);
++	wr(peri, GATE_I2C1, g1 | GATE_ON);
++	if ((pcon & 0xffffu) != 0x2222u) {
++		wr(top, GPP1 + GPIO_CON, (pcon & ~0xffffu) | 0x2222u);  /* gpp1-0..3: I2C0 and I2C1 */
++	}
++	e0 = reg_read(i2c0, FG_ADDR, 0x00, &probe, 1);
++	e1 = reg_read(i2c1, CHG_ADDR, 0x0a, &probe, 1);
++	printf("SWEET A8 POWER: fuel gauge %s (%d), charger %s (%d)\n", e0 ? "silent" : "answers", e0, e1 ? "silent" : "answers", e1);
++	if (e0 || e1) {
++		return ENXIO;
++	}
++	ready = 1;
++	if (PE_parse_boot_argn("a8motor", &buzz, sizeof(buzz)) && buzz > 0) {
++		motor_buzz(buzz > 1000 ? 1000 : buzz);
++	}
++	return 0;
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,19 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * Galaxy A8: the S2MU004's fuel gauge and charger (bsd/dev/sweet_a8power.c), read every 10 s
++ * unless a8battery=0. Its 3000 mAh (the device tree's capacity_full) is the capacity.
++ */
++extern "C" int sweet_a8_power_init(void);
++extern "C" int sweet_a8_power_read(unsigned *centipercent, unsigned *mv, int *ma, uint8_t *chg0, uint8_t *chg1);
++#define SWEET_BATTERY_MAH 3000u
++#define SWEET_BATTERY_POLL_MS 10000
++#else
++#define SWEET_BATTERY_MAH 5020u
++#define SWEET_BATTERY_POLL_MS 30000
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -102,10 +115,10 @@
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+ 	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	const unsigned capacity = (SWEET_BATTERY_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(SWEET_BATTERY_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +132,8 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_MAH);
++	putNumber("DesignCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +150,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, SWEET_BATTERY_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -206,6 +219,34 @@
+ void
+ SweetBattery::poll(void)
+ {
++#if defined(SWEET_JACKPOTLTE)
++	static unsigned told;
++	static bool lastExternal, lastCharging;
++	unsigned centi = 0, a8mv = 0;
++	int a8ma = 0;
++	uint8_t chg0 = 0, chg1 = 0;
++	int a8error = fReal ? sweet_a8_power_read(&centi, &a8mv, &a8ma, &chg0, &chg1) : -1;
++	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
++	if (a8error || a8mv < 2800 || a8mv > 4600 || centi > 10500) {
++		if (fReal && told++ < 6) {
++			IOLog("SWEET BATTERY: A8 sample refused: error %d, %u mV, %u.%02u %%\n", a8error, a8mv, centi / 100, centi % 100);
++		}
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned chgin = (chg0 >> 5) & 7u;
++	bool a8external = chgin == 3 || chgin == 5;
++	bool a8full = a8external && (chg1 & 1u) != 0;
++	bool a8charging = a8external && !a8full && !(chg1 & 0x80u);
++	unsigned a8percent = centi >= 10000 ? 100 : (centi + 50) / 100;
++	if (told++ < 6 || a8external != lastExternal || a8charging != lastCharging) {
++		IOLog("SWEET BATTERY: A8 %u.%02u %% %u mV %d mA, charger STATUS0 %#x STATUS1 %#x: external %d charging %d full %d\n",
++		    centi / 100, centi % 100, a8mv, a8ma, chg0, chg1, a8external, a8charging, a8full);
++		lastExternal = a8external;
++		lastCharging = a8charging;
++	}
++	publish(a8full ? 100 : a8percent, a8mv, a8ma, a8external, a8external, a8charging, a8full, true, true);
++#else
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -244,6 +285,7 @@
+ 	}
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
++#endif
+ }
+ 
+ void
+@@ -252,7 +294,7 @@
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(SWEET_BATTERY_POLL_MS);
+ 	}
+ }
+ 
+@@ -262,9 +304,15 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++#if defined(SWEET_JACKPOTLTE)
++	int real = 1;
++	(void)PE_parse_boot_argn("a8battery", &real, sizeof(real));
++	fReal = real != 0 && sweet_a8_power_init() == 0;
++#else
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++#endif
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -273,7 +321,7 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(SWEET_BATTERY_POLL_MS);
+ 		} else {
+ 			fReal = false;
+ 			poll();
