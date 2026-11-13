@@ -1,0 +1,299 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_a8input.c			standard
+ bsd/dev/sweet_a8gpu.c			standard
+ bsd/dev/sweet_a8power.c			standard
++bsd/dev/sweet_a8wlbt.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -0,0 +1,264 @@
++/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
++/*
++ * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
++ * firmware runs. Boot-arg a8wlbt=1; nothing happens without it.
++ *
++ * Facts (stock BOOT.img device tree; Samsung's SM-A530F kernel, GPL-2.0, read for facts only:
++ * drivers/misc/samsung/scsc/platform_mif.c, mif_reg_S5E7885.h, mxman.c, fwhdr.c, mx140_file.c):
++ *   shared memory 0xE9000000, 4 MB (reserved-memory wifibt_if): the firmware runs from it, R4-relative address 0
++ *   mailbox 0x120C0000 (MAILBOX_WLBT): ISSR(n) = 0x80 + 4n are the mailboxes; INTMR0/1, INTCR0/1 masks and clears
++ *   PMU 0x11C80000: WIFI_CTRL_NS 0x140 (PWRON bit 1, RESET_SET bit 2), WIFI_CTRL_S 0x144 (START bit 3),
++ *        WIFI_STAT 0x148, WIFI2AP_MEM_CONFIG0 0x7300 (size >> 12) / CONFIG1 0x7304 (base >> 12),
++ *        WLBT_BOOT_TEST_RST_CFG 0x7330 (0: boot from DRAM), EXT_REGULATOR_SHARED_OPTION 0x3648 bit 2
++ *   SMC 0x82000710 (WLBT_TZASC = 0, base, size): lets the core reach the shared memory through TrustZone
++ *   start: firmware image copied to offset 0; mailbox 0 = entry point (header +40), 1 = the configuration's
++ *        address (0 here: there is none yet), 2 = 0xbcdeedcb, 3 = start flags (0); then PWRON, RESET_SET off, START.
++ *   firmware: /sweet/fw/mx140.bin (from the phone's /vendor/etc/wifi; not in git). Header "smxf" at +8, runtime
++ *        length +36, entry +40, build id +48, R4 panic record offset +176.
++ *
++ * With no configuration the firmware is expected to stop early, ideally writing its panic record: any change in the
++ * shared memory after the image, in the mailboxes or in WIFI_STAT is the sign that the core ran. Logged as
++ * "SWEET A8 WLBT:". The core is left as it ends; a reboot resets it.
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_a8_wlbt_init(void);
++
++#define SHM_PA          0xe9000000u
++#define SHM_SIZE        0x400000u
++#define MBOX_PA         0x120c0000u
++#define PMU_PA          0x11c80000u
++#define INTMR0          0x010u
++#define INTCR0          0x00cu
++#define INTSR0          0x014u
++#define INTMR1          0x024u
++#define INTCR1          0x020u
++#define INTSR1          0x028u
++#define IS_VERSION      0x050u
++#define ISSR(n)         (0x080u + 4u * (n))
++#define WIFI_CTRL_NS    0x140u
++#define WIFI_CTRL_S     0x144u
++#define WIFI_STAT       0x148u
++#define CENTRAL_SEQ_ST  0x384u
++#define MEM_CONFIG0     0x7300u
++#define MEM_CONFIG1     0x7304u
++#define BOOT_RST_CFG    0x7330u
++#define EXT_REG_OPTION  0x3648u
++#define EXT_REG_STATUS  0x3644u
++#define FW_PATH         "/sweet/fw/mx140.bin"
++
++static vm_offset_t shm, mbox, pmu;
++static int wlbt_chan;
++
++static uint32_t
++rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&wlbt_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++smc4(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) :: "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++/* The firmware file into the shared memory, a word at a time (it is device memory here). */
++static int
++load_firmware(uint32_t *size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULL;
++	uint8_t *buf;
++	off_t at = 0;
++	int error;
++
++	*size = 0;
++	if ((error = vnode_open(FW_PATH, FREAD, 0, 0, &vp, ctx))) {
++		return error;
++	}
++	buf = kalloc_data(65536, Z_WAITOK);
++	if (buf == NULL) {
++		vnode_close(vp, FREAD, ctx);
++		return ENOMEM;
++	}
++	for (;;) {
++		int resid = 0;
++
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, 65536, at, UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx));
++		if (error) {
++			break;
++		}
++		int got = 65536 - resid;
++		if (got <= 0) {
++			break;
++		}
++		if (at + got > (off_t)SHM_SIZE) {
++			error = EFBIG;
++			break;
++		}
++		for (int i = 0; i < got; i += 4) {
++			uint32_t w = 0;
++			memcpy(&w, buf + i, (size_t)(got - i < 4 ? got - i : 4));
++			wr(shm, (uint32_t)(at + i), w);
++		}
++		at += got;
++	}
++	kfree_data(buf, 65536);
++	vnode_close(vp, FREAD, ctx);
++	*size = (uint32_t)at;
++	return error;
++}
++
++static void
++report(const char *when, uint32_t runtime, uint32_t panic_off)
++{
++	unsigned changed = 0;
++
++	for (uint32_t off = runtime; off < runtime + 0x10000 && off < SHM_SIZE; off += 4) {
++		changed += rd(shm, off) != 0;
++	}
++	printf("SWEET A8 WLBT: %s: WIFI_CTRL_NS %#x CTRL_S %#x STAT %#x SEQ %#x | INTSR0 %#x INTSR1 %#x | mbox %#x %#x %#x %#x "
++	    "%#x %#x %#x %#x | heap words set %u | panic %08x %08x %08x %08x\n", when, rd(pmu, WIFI_CTRL_NS), rd(pmu, WIFI_CTRL_S),
++	    rd(pmu, WIFI_STAT), rd(pmu, CENTRAL_SEQ_ST), rd(mbox, INTSR0), rd(mbox, INTSR1), rd(mbox, ISSR(0)), rd(mbox, ISSR(1)),
++	    rd(mbox, ISSR(2)), rd(mbox, ISSR(3)), rd(mbox, ISSR(4)), rd(mbox, ISSR(5)), rd(mbox, ISSR(6)), rd(mbox, ISSR(7)),
++	    changed, rd(shm, panic_off), rd(shm, panic_off + 4), rd(shm, panic_off + 8), rd(shm, panic_off + 12));
++}
++
++static void
++wlbt_thread(void *arg, wait_result_t wr_)
++{
++	uint32_t size = 0, runtime, entry, panic_off, magic;
++	char build[80];
++	int error;
++
++	(void)arg;
++	(void)wr_;
++	sleep_ms(60000);                /* the root file system is mounted and the boot is past its busiest */
++	shm = ml_io_map(SHM_PA, SHM_SIZE);
++	mbox = ml_io_map(MBOX_PA, 0x1000);
++	pmu = ml_io_map(PMU_PA, 0x8000);
++	if (!shm || !mbox || !pmu) {
++		printf("SWEET A8 WLBT: cannot map the registers\n");
++		goto out;
++	}
++	printf("SWEET A8 WLBT: 1 look: mailbox IS_VERSION %#x, WIFI_CTRL_NS %#x CTRL_S %#x STAT %#x, MEM_CONFIG0 %#x CONFIG1 %#x, "
++	    "ext regulator option %#x status %#x\n", rd(mbox, IS_VERSION), rd(pmu, WIFI_CTRL_NS), rd(pmu, WIFI_CTRL_S),
++	    rd(pmu, WIFI_STAT), rd(pmu, MEM_CONFIG0), rd(pmu, MEM_CONFIG1), rd(pmu, EXT_REG_OPTION), rd(pmu, EXT_REG_STATUS));
++
++	for (uint32_t off = 0; off < SHM_SIZE; off += 4) {
++		wr(shm, off, 0);
++	}
++	if ((error = load_firmware(&size))) {
++		printf("SWEET A8 WLBT: 2 load: %s: error %d (put the phone's /vendor/etc/wifi/mx140.bin there)\n", FW_PATH, error);
++		goto out;
++	}
++	magic = rd(shm, 8);
++	runtime = rd(shm, 36);
++	entry = rd(shm, 40);
++	panic_off = rd(shm, 176);
++	for (int i = 0; i < (int)sizeof(build) - 1; i += 4) {
++		uint32_t w = rd(shm, 48 + (uint32_t)i);
++		memcpy(build + i, &w, 4);
++	}
++	build[sizeof(build) - 1] = '\0';
++	printf("SWEET A8 WLBT: 2 load: %u bytes, magic %.4s, runtime length %#x, entry %#x, panic record at %#x, build %s\n",
++	    size, (const char *)&magic, runtime, entry, panic_off, build);
++	if (memcmp(&magic, "smxf", 4) != 0 || runtime >= SHM_SIZE || runtime < size || panic_off >= runtime) {
++		printf("SWEET A8 WLBT: 2 load: not a firmware this probe understands; stopping\n");
++		goto out;
++	}
++
++	uint64_t tz = smc4(0x82000710u, 0, SHM_PA, SHM_SIZE);
++	printf("SWEET A8 WLBT: 3 TrustZone window for the shared memory: SMC returns %#llx\n", tz);
++
++	wr(pmu, MEM_CONFIG1, (SHM_PA & 0xfffffc000u) >> 12);
++	wr(pmu, MEM_CONFIG0, SHM_SIZE >> 12);
++	wr(pmu, BOOT_RST_CFG, 0);
++	for (int i = 0; i < 64; i++) {
++		wr(mbox, ISSR(i), 0);
++	}
++	wr(mbox, INTMR0, 0xffff0000u);
++	wr(mbox, INTMR1, 0x0000ffffu);
++	wr(mbox, INTCR0, 0xffff0000u);
++	wr(mbox, INTCR1, 0x0000ffffu);
++	wr(mbox, ISSR(0), entry);
++	wr(mbox, ISSR(1), 0);
++	wr(mbox, ISSR(2), 0xbcdeedcbu);
++	wr(mbox, ISSR(3), 0);
++	printf("SWEET A8 WLBT: 4 set up: MEM_CONFIG0 %#x CONFIG1 %#x, mailboxes %#x %#x %#x %#x\n", rd(pmu, MEM_CONFIG0),
++	    rd(pmu, MEM_CONFIG1), rd(mbox, ISSR(0)), rd(mbox, ISSR(1)), rd(mbox, ISSR(2)), rd(mbox, ISSR(3)));
++	report("before start", runtime, panic_off);
++
++	wr(pmu, EXT_REG_OPTION, rd(pmu, EXT_REG_OPTION) | 0x4u);
++	wr(pmu, WIFI_CTRL_NS, rd(pmu, WIFI_CTRL_NS) | (1u << 1));
++	wr(pmu, WIFI_CTRL_NS, rd(pmu, WIFI_CTRL_NS) & ~(1u << 2));
++	wr(pmu, WIFI_CTRL_S, rd(pmu, WIFI_CTRL_S) | (1u << 3));
++	printf("SWEET A8 WLBT: 5 started (PWRON, reset released, START)\n");
++	for (int t = 1; t <= 10; t++) {
++		char when[24];
++
++		sleep_ms(t <= 4 ? 250 : 1000);
++		snprintf(when, sizeof(when), "watch %d", t);
++		report(when, runtime, panic_off);
++	}
++	wr(pmu, EXT_REG_OPTION, rd(pmu, EXT_REG_OPTION) & ~0x4u);
++	printf("SWEET A8 WLBT: done; the core is left as it is until the next boot\n");
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_a8_wlbt_init(void)
++{
++	int on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("a8wlbt", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	if (kernel_thread_start(wlbt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET A8 WLBT: probe armed (a8wlbt=1): it runs 60 s from now\n");
++	}
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/bsd/dev/sweet_a8power.c b/bsd/dev/sweet_a8power.c
+--- a/bsd/dev/sweet_a8power.c
++++ b/bsd/dev/sweet_a8power.c
+@@ -32,6 +32,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_a8_power_init(void);
+ int sweet_a8_power_read(unsigned *centipercent, unsigned *mv, int *ma, uint8_t *chg0, uint8_t *chg1);
++extern void sweet_a8_wlbt_init(void);       /* sweet_a8wlbt.c: the Wi-Fi/Bluetooth probe, a8wlbt=1 */
+ 
+ #define TOP_PA          0x139b0000u
+ #define PERI_PA         0x10010000u
+@@ -252,6 +253,7 @@
+ 	if (ready) {
+ 		return 0;
+ 	}
++	sweet_a8_wlbt_init();
+ 	top = ml_io_map(TOP_PA, 0x1000);
+ 	peri = ml_io_map(PERI_PA, 0x4000);
+ 	i2c0 = ml_io_map(I2C0_PA, 0x100);
