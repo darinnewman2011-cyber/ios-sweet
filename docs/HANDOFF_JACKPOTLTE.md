@@ -1065,3 +1065,17 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
   then ZTE K88 (SD617, unlocked, 2 GB) as the second device.
 - **Credits:** LICENSE has Darin's copyright line; GPU sources carry a header; README credits Darin, Claude,
   dipa-studio, Mesa, Scion (c0425c9).
+- **Wi-Fi stage 2 (xnu patch 0132, commit c93cc91, xnu #57 run 43505634311, kernel `_tmp/a8art45`):** `bsd/dev/sweet_a8wlbt.c`,
+  boot-arg `a8wlbt=1`, loads `/sweet/fw/mx140.bin` (the phone's lassen_s612 firmware, build S612_E788X_C1_Y20W47A, not in
+  git) into the WLBT shared memory 0xE9000000 and starts the core 60 s after boot. Boot `a8-ios60n-boot.img`
+  (`ac944419...`, ios59m line minus `sweetgputrace=4` and `,metal_show`, plus `a8wlbt=1 msgbuf=1048576`).
+  - **Boot-args limit:** ios59m's line was 609 chars; mkpayload keeps 607, so `a8motor=300` became `a8motor=3` (why no buzz
+    was felt). Always check the length. `msgbuf=1048576` keeps early kernel lines (the 128 KB default had lost them by 94 s).
+  - **Motor verified (user felt it, ios60m/n):** `motor: on for 300 ms (MODE 0x20 -> 0x21 ... TCNTO0 4020)`.
+  - **Observed (ios60n):** header check OK, TZASC SMC returns 0, MEM_CONFIG1 0xe9000. After START: WIFI_STAT 0 -> 0x10,
+    WIFI_CTRL_S reads 0 (the START bit does not read back), no mailbox/interrupt activity, heap untouched, but the
+    **R4 panic record at +0x160804 changed from zeros to `2, 0xd4, 0x74811, 0x40`**: the firmware ran and wrote a
+    panic record (guess: it panics because mailbox 1, the mxconf address, is 0). Next (stage 3): dump the whole
+    212-byte record, then provide an mxconf.
+  - **Gestalt spoof:** no `com.apple.MobileGestalt.plist` exists anywhere on this root (iOS never wrote the cache), so
+    `_tmp/wsl/gestalt.py` skipped. Plan instead: an MGCopyAnswer hook for the island/AOD keys.
