@@ -1038,3 +1038,30 @@ values removed), `iomem.txt`, `partitions.txt`, `byname.txt`, `dmesg_filtered.tx
 without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the image's hash, writes BOOT, reads it back
 (restores the Android backup on a mismatch) and does not reboot. `flash-ios42.zip` (the daily GL build, image
 115841d8…) is on the phone's /sdcard. Images and zips stay out of git.
+
+## 2026-11-12/13: wallpaper previews, battery, motor (runs 41-46)
+
+- **Wallpaper previews (redwood-gl, gpu.yml):** gallery/switcher snapshots were black because PosterBoard renders them
+  into **'w30r'** IOSurfaces (10-bit extended range, B bits 0-9, G 10-19, R 20-29, 384 = black, 894 = white), which
+  -attachImage refused, so every draw hit 0x506 (cfb7a6c: converted to/from 8-bit BGRA both ways). Then a red haze:
+  CoreAnimation hands a 256x1 half-float gradient table as (a,0,0,a); made black (0,0,0,a) = the lock screen's dimming
+  (af2cd99 tried white = "heavenly glow", 11ca1dd black). User (run 45): previews right, stripe wallpaper applies,
+  blur works. Still open: **Astronomy** shows a doubled globe and no editor options; AegirPoster never commits a Metal
+  command buffer and its first newBufferWithLength took 6.9 s (Metal work, not GL; no texImageIOSurface size mismatch).
+  Diagnostic lines kept: `w30r surface N copied out`, `half-float table`, `table surface`, `-texImageIOSurface mismatch`.
+  The 7bd770d fence copy-out never fired (no `glClientWaitSync ends a frame` lines).
+- **Battery + motor (xnu patch 0131, xnu #56 on macos-15-intel, kernel `_tmp/a8art44`, boot `a8-ios59m-boot.img`
+  1a5973c7..., = ios58m + `a8motor=300`, flashed, readback OK):** `bsd/dev/sweet_a8power.c` reads the S2MU004 fuel gauge
+  (I2C0 0x13830000 addr 0x3B: RSOC 0x08, RVBAT 0x04, RCUR_CC 0x06) and charger (I2C1 0x13840000 addr 0x3D: STATUS0 0x0A
+  CHGIN bits 7:5 = 3/5 input good, STATUS1 0x0B bit 0 done) for SweetBattery every 10 s, read only, 3000 mAh;
+  `a8battery=0` = old static 100 %. `a8motor=MS` buzzes once: haptic 0x3A MODE 0x0E = 0x20 then 0x21, PWM timer 0
+  (0x13970000, prescaler 99, TCNTB 4808, assumes 100 MHz PCLK) on gpg0-1. Log lines: `SWEET A8 POWER:`,
+  `SWEET BATTERY: A8 ...`. Not yet tested on the phone. iOS vibration on Taptic iPhones goes through the audio HAL,
+  so iOS-driven haptics come with audio.
+- **CI:** macos-14 runners were retired; xnu.yml now runs on macos-15-intel and built fine with its oldest Xcode.
+  Dispatch from the browser (Run workflow, branch jackpotlte, board jackpotlte); `gh` is not installed.
+- **Plans:** `docs/AUDIO_JACKPOTLTE.md` (ABOX bypass after Scion, COD3035 headphones first, TFA98xx speaker later).
+  User's order: battery/charging + haptics -> audio -> Metal -> always-on display; flashlight/Windows-on-ARM maybe;
+  then ZTE K88 (SD617, unlocked, 2 GB) as the second device.
+- **Credits:** LICENSE has Darin's copyright line; GPU sources carry a header; README credits Darin, Claude,
+  dipa-studio, Mesa, Scion (c0425c9).
