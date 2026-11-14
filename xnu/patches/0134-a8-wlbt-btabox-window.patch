@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -68,6 +68,10 @@
+ #define CENTRAL_SEQ_ST  0x384u
+ #define MEM_CONFIG0     0x7300u
+ #define MEM_CONFIG1     0x7304u
++#define MEM_CONFIG2     0x7308u         /* BAAW1 size >> 12 (BT-ABOX shared memory) */
++#define MEM_CONFIG3     0x730cu         /* BAAW1 base >> 12 */
++#define BTABOX_PA       0xa0000000u     /* low-bank RAM XNU never uses (it runs from 0x880000000) */
++#define BTABOX_SIZE     0x400000u       /* the DT's btabox_rmem size */
+ #define BOOT_RST_CFG    0x7330u
+ #define EXT_REG_OPTION  0x3648u
+ #define EXT_REG_STATUS  0x3644u
+@@ -342,6 +346,21 @@
+ 
+ 	wr(pmu, MEM_CONFIG1, (SHM_PA & 0xfffffc000u) >> 12);
+ 	wr(pmu, MEM_CONFIG0, SHM_SIZE >> 12);
++	{
++		/* Stage 3b: the second window (BAAW1, BT-ABOX shared memory) Samsung's platform_mif_reset sets up next to the
++		 * main one; ios61's panic record shows the core in abort mode 250 ms after start without it. */
++		vm_offset_t bt = ml_io_map(BTABOX_PA, BTABOX_SIZE);
++
++		printf("SWEET A8 WLBT: 3b BT-ABOX window was CONFIG2 %#x CONFIG3 %#x; now %#x at %#x\n", rd(pmu, MEM_CONFIG2),
++		    rd(pmu, MEM_CONFIG3), BTABOX_SIZE, BTABOX_PA);
++		if (bt) {
++			for (uint32_t off = 0; off < BTABOX_SIZE; off += 4) {
++				wr(bt, off, 0);
++			}
++		}
++		wr(pmu, MEM_CONFIG3, (BTABOX_PA & 0xfffffc000u) >> 12);
++		wr(pmu, MEM_CONFIG2, BTABOX_SIZE >> 12);
++	}
+ 	wr(pmu, BOOT_RST_CFG, 0);
+ 	for (int i = 0; i < 64; i++) {
+ 		wr(mbox, ISSR(i), 0);
