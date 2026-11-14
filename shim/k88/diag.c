@@ -669,6 +669,189 @@ static void test_mmc(void)
 	con_hex2(" ", "blksz=", sec[10], "blocks=", sec[11]);
 }
 
+/*
+ * Milestone 5: keys and touch. TLMM (0x1000000): GPIO n config at n * 0x1000
+ * (pull [1:0], function [5:2], drive [8:6], output enable 9), in/out at +4.
+ * Volume up/down: GPIO 85/90, active low, pull-up. Goodix at 0x5d on BLSP1
+ * QUP3 I2C (0x78b7000, GPIOs 10/11 function 3), reset GPIO 64, int GPIO 65.
+ * The QUP is driven like Linux i2c-qup (v1 tags, FIFO mode), polled.
+ */
+#define TLMM_BASE	0x01000000UL
+#define TLMM_CFG(n)	(TLMM_BASE + (n) * 0x1000UL)
+#define TLMM_IO(n)	(TLMM_BASE + (n) * 0x1000UL + 4)
+#define QUP		0x078b7000UL
+#define GCC_BASE	0x01800000UL
+#define GCC_BLSP1_AHB_VOTE	(GCC_BASE + 0x45004)	/* APCS clock branch enable vote, bit 10 */
+#define GCC_BLSP1_AHB_CBCR	(GCC_BASE + 0x01008)
+#define GCC_QUP3_I2C_CBCR	(GCC_BASE + 0x04020)
+
+static void gpio_cfg(unsigned n, unsigned func, unsigned pull, unsigned drive_ma, int out)
+{
+	wr32(TLMM_CFG(n), pull | (func << 2) | (((drive_ma / 2) - 1) << 6) | (out ? (1U << 9) : 0));
+}
+
+static void gpio_set(unsigned n, int v)
+{
+	wr32(TLMM_IO(n), v ? 2 : 0);
+}
+
+static int gpio_get(unsigned n)
+{
+	return mmio32(TLMM_IO(n)) & 1;
+}
+
+static int qup_state(uint32_t st)
+{
+	for (int i = 0; i < 100; i++) {
+		if (mmio32(QUP + 0x004) & 4)
+			break;
+		delay_ms(1);
+	}
+	wr32(QUP + 0x004, st);
+	for (int i = 0; i < 100; i++) {
+		uint32_t s = mmio32(QUP + 0x004);
+		if ((s & 4) && (s & 3) == st)
+			return 0;
+		delay_ms(1);
+	}
+	return -1;
+}
+
+static uint32_t qup_status;
+
+static int qup_init(void)
+{
+	wr32(GCC_BLSP1_AHB_VOTE, mmio32(GCC_BLSP1_AHB_VOTE) | (1U << 10));
+	wr32(GCC_QUP3_I2C_CBCR, mmio32(GCC_QUP3_I2C_CBCR) | 1);
+	delay_ms(2);
+	con_hex2("QUP clk", "ahb=", mmio32(GCC_BLSP1_AHB_CBCR), "i2c=", mmio32(GCC_QUP3_I2C_CBCR));
+	gpio_cfg(10, 3, 0, 2, 0);
+	gpio_cfg(11, 3, 0, 2, 0);
+	wr32(QUP + 0x00c, 1);			/* SW reset */
+	delay_ms(2);
+	if (qup_state(0))
+		return -1;
+	con_hex2(" qup", "ver=", mmio32(QUP + 0x030), "st=", mmio32(QUP + 0x004));
+	wr32(QUP + 0x000, (2U << 8) | 0xf);	/* I2C mini core, 16-bit words */
+	wr32(QUP + 0x008, (mmio32(QUP + 0x008) & ~0x3c00U) | (3U << 14));	/* FIFO mode, repack */
+	wr32(QUP + 0x020, 0);			/* no error interrupts */
+	wr32(QUP + 0x400, (3U << 8) | (19200000 / 400000 / 2 - 3));	/* 400 kHz from 19.2 MHz */
+	return 0;
+}
+
+/* wait until the output FIFO drained / input FIFO has data, or an I2C error */
+static int qup_wait(uint32_t opbit)
+{
+	for (int i = 0; i < 200; i++) {
+		uint32_t op = mmio32(QUP + 0x018), st = mmio32(QUP + 0x404);
+		if (st & 0x1c) {		/* bus error, NACK, arbitration lost */
+			qup_status = st;
+			return -1;
+		}
+		if (op & opbit)
+			return 0;
+		delay_ms(1);
+	}
+	qup_status = 0xdead;
+	return -2;
+}
+
+/* write len bytes (STOP after the last) */
+static int qup_write(uint8_t addr, const uint8_t *buf, unsigned len)
+{
+	uint32_t val = 0, words = len + 1;
+	unsigned w = 0;
+
+	if (qup_state(0))
+		return -3;
+	wr32(QUP + 0x150, words);		/* MX_WRITE_CNT */
+	wr32(QUP + 0x208, 0);			/* MX_READ_CNT */
+	if (qup_state(1))
+		return -3;
+	for (unsigned i = 0; i <= len; i++) {
+		uint32_t t = i == 0 ? (0x100U | (uint32_t)(addr << 1)) :
+		    ((i == len ? 0x300U : 0x200U) | buf[i - 1]);
+		if (w & 1) {
+			val |= t << 16;
+			wr32(QUP + 0x110, val);
+		} else {
+			val = t;
+		}
+		w++;
+	}
+	if (w & 1)
+		wr32(QUP + 0x110, val);
+	int r = qup_wait(1U << 10);		/* MAX_OUTPUT_DONE */
+	wr32(QUP + 0x018, mmio32(QUP + 0x018));
+	return r;
+}
+
+static int qup_read(uint8_t addr, uint8_t *buf, unsigned len)
+{
+	if (qup_state(0))
+		return -3;
+	wr32(QUP + 0x150, 2);
+	wr32(QUP + 0x208, len);
+	if (qup_state(1))
+		return -3;
+	wr32(QUP + 0x110, ((0x400U | len) << 16) | 0x100U | (uint32_t)((addr << 1) | 1));
+	for (unsigned i = 0; i < len; ) {
+		if (qup_wait(1U << 5))		/* IN_FIFO_NOT_EMPTY */
+			return -1;
+		uint32_t v = mmio32(QUP + 0x218);
+		buf[i++] = v & 0xff;
+		if (i < len)
+			buf[i++] = (v >> 16) & 0xff;
+	}
+	wr32(QUP + 0x018, mmio32(QUP + 0x018));
+	return 0;
+}
+
+static int gt_read(uint16_t reg, uint8_t *buf, unsigned len)
+{
+	uint8_t a[2] = { reg >> 8, reg & 0xff };
+	int r = qup_write(0x5d, a, 2);
+	return r ? r : qup_read(0x5d, buf, len);
+}
+
+static void test_input(void)
+{
+	uint8_t id[8] = { 0 };
+	int r;
+
+	gpio_cfg(85, 0, 3, 2, 0);
+	gpio_cfg(90, 0, 3, 2, 0);
+	delay_ms(1);
+	con_hex2("KEYS", "up=", gpio_get(85), "down=", gpio_get(90));
+	if (qup_init()) {
+		con_hex2("QUP", "init failed st=", mmio32(QUP + 0x004), 0, 0);
+		return;
+	}
+	r = gt_read(0x8140, id, 6);
+	con_hex2("GT", "r=", r, "st=", qup_status);
+	if (r) {
+		/* Goodix reset: INT low, RST low 10 ms, RST high, INT low 60 ms (address 0x5d), INT input */
+		gpio_cfg(65, 0, 0, 8, 1);
+		gpio_set(65, 0);
+		gpio_cfg(64, 0, 0, 8, 1);
+		gpio_set(64, 0);
+		delay_ms(12);
+		gpio_set(64, 1);
+		delay_ms(60);
+		gpio_cfg(65, 0, 3, 8, 0);
+		delay_ms(60);
+		qup_init();
+		r = gt_read(0x8140, id, 6);
+		con_hex2("GT rst", "r=", r, "st=", qup_status);
+	}
+	con_hex2(" id", "w0=", id[0] | id[1] << 8 | id[2] << 16 | id[3] << 24, "fw=", id[4] | id[5] << 8);
+	r = gt_read(0x8048, id, 4);		/* config: x max, y max (little endian) */
+	con_hex2(" res", "x=", id[0] | id[1] << 8, "y=", id[2] | id[3] << 8);
+	r = gt_read(0x814e, id, 1);
+	con_hex2(" stat", "r=", r, "814e=", id[0]);
+	con_hex2("KEYS", "up=", gpio_get(85), "down=", gpio_get(90));
+}
+
 static uint32_t be32(uintptr_t a)
 {
 	return __builtin_bswap32(*(volatile uint32_t *)a);
@@ -758,6 +941,8 @@ void k88_main(uintptr_t dtb)
 	con_hex2("SDCORE", "mode=", mmio32(SDCORE_BASE + 0x78), "ver=", mmio32(SDCORE_BASE + 0x50));
 	k88_present();
 	test_mmc();
+	k88_present();
+	test_input();
 	k88_present();
 	finish();
 }

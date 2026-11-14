@@ -1,8 +1,392 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 21f2701..904d63e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_a8input.c			standard
++bsd/dev/sweet_k88input.c			standard
+ bsd/dev/sweet_a8gpu.c			standard
+ bsd/dev/sweet_a8power.c			standard
+ bsd/dev/sweet_a8wlbt.c			standard
+diff --git a/bsd/dev/sweet_k88input.c b/bsd/dev/sweet_k88input.c
+new file mode 100644
+index 0000000..fdbd54e
+--- /dev/null
++++ b/bsd/dev/sweet_k88input.c
+@@ -0,0 +1,358 @@
++/*
++ * ZTE K88 (MSM8952) input, polled: volume keys on TLMM GPIOs and the Goodix
++ * GT928 touch controller on BLSP1 QUP3 I2C. Both feed the HID services in
++ * iokit/Kernel/arm/hid/SweetHID.cpp, as sweet_a8input.c does on the A8.
++ * Verified with shim/k88 diag12 (2026-11-14): the GT928 answers at 0x5d
++ * without a reset or regulator work after LK, product "928", firmware
++ * 0x1081, touch space 800x1280 = the panel.
++ *
++ * Keys: volume up GPIO 85, volume down GPIO 90, active low with pull-ups.
++ * Both volume keys together = Home. Power is on the PMIC (PON), not here yet.
++ *
++ * The QUP is driven like Linux i2c-qup's v1 path (facts only): 16-bit tag
++ * words (START | address, DATA, STOP, REC | count), FIFO mode, a write
++ * message ends with STOP, then a read message. Polled, no interrupt.
++ */
++#if defined(SWEET_K88)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_k88_input_init(void);
++
++#define TLMM_PA         0x01000000u
++#define TLMM_SIZE       0x00100000u     /* GPIOs 0-...: one 4 KiB page each, up to GPIO 90 needed */
++#define QUP_PA          0x078b7000u
++#define GCC_PA          0x01800000u
++#define GCC_BLSP1_AHB_VOTE      0x45004u        /* APCS clock branch vote, bit 10 */
++#define GCC_QUP3_I2C_CBCR       0x04020u
++
++#define GPIO_VOLUP      85
++#define GPIO_VOLDOWN    90
++#define GT_ADDR         0x5du
++#define GT_STATUS       0x814eu
++#define GT_POINTS       0x814fu
++#define GT_MAX          10
++
++static vm_offset_t tlmm, qup, gcc;
++static int k88_sleep_chan;
++
++static uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&k88_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* TLMM config: pull [1:0] (3 = up), function [5:2], drive [8:6] (mA / 2 - 1), output enable 9 */
++static void
++gpio_cfg(unsigned n, unsigned func, unsigned pull, unsigned ma)
++{
++	wr(tlmm, n * 0x1000u, pull | (func << 2) | (((ma / 2) - 1) << 6));
++}
++
++static int
++gpio_get(unsigned n)
++{
++	return rd(tlmm, n * 0x1000u + 4) & 1;
++}
++
++/* ---- QUP I2C ---- */
++
++#define QUP_CONFIG      0x000u
++#define QUP_STATE       0x004u
++#define QUP_IO_MODE     0x008u
++#define QUP_SW_RESET    0x00cu
++#define QUP_OPERATIONAL 0x018u
++#define QUP_ERR_EN      0x020u
++#define QUP_OUT_FIFO    0x110u
++#define QUP_MX_WRITE    0x150u
++#define QUP_MX_READ     0x208u
++#define QUP_IN_FIFO     0x218u
++#define QUP_I2C_CLK     0x400u
++#define QUP_I2C_STATUS  0x404u
++#define OP_IN_NOT_EMPTY         (1u << 5)
++#define OP_MAX_OUTPUT_DONE      (1u << 10)
++#define I2C_ERRORS              0x1cu   /* bus error, NACK, arbitration lost */
++
++static uint32_t qup_err;
++
++static int
++qup_state(uint32_t st)
++{
++	for (int i = 0; i < 1000 && !(rd(qup, QUP_STATE) & 4); i++) {
++		delay(10);
++	}
++	wr(qup, QUP_STATE, st);
++	for (int i = 0; i < 1000; i++) {
++		uint32_t s = rd(qup, QUP_STATE);
++		if ((s & 4) && (s & 3) == st) {
++			return 0;
++		}
++		delay(10);
++	}
++	return EIO;
++}
++
++static int
++qup_init(void)
++{
++	wr(gcc, GCC_BLSP1_AHB_VOTE, rd(gcc, GCC_BLSP1_AHB_VOTE) | (1u << 10));
++	wr(gcc, GCC_QUP3_I2C_CBCR, rd(gcc, GCC_QUP3_I2C_CBCR) | 1);
++	delay(2000);
++	gpio_cfg(10, 3, 0, 2);          /* BLSP1 I2C3 SDA/SCL */
++	gpio_cfg(11, 3, 0, 2);
++	wr(qup, QUP_SW_RESET, 1);
++	delay(2000);
++	if (qup_state(0)) {
++		return EIO;
++	}
++	wr(qup, QUP_CONFIG, (2u << 8) | 0xf);                   /* I2C mini core, 16-bit words */
++	wr(qup, QUP_IO_MODE, (rd(qup, QUP_IO_MODE) & ~0x3c00u) | (3u << 14)); /* FIFO, repack */
++	wr(qup, QUP_ERR_EN, 0);
++	wr(qup, QUP_I2C_CLK, (3u << 8) | (19200000 / 400000 / 2 - 3));       /* 400 kHz */
++	return 0;
++}
++
++static int
++qup_wait(uint32_t opbit)
++{
++	for (int i = 0; i < 2000; i++) {
++		uint32_t op = rd(qup, QUP_OPERATIONAL), st = rd(qup, QUP_I2C_STATUS);
++		if (st & I2C_ERRORS) {
++			qup_err = st;
++			return EIO;
++		}
++		if (op & opbit) {
++			return 0;
++		}
++		delay(10);
++	}
++	qup_err = 0xdead;
++	return ETIMEDOUT;
++}
++
++static int
++qup_write(uint8_t addr, const uint8_t *buf, unsigned len)
++{
++	uint32_t val = 0;
++	unsigned w = 0;
++
++	if (qup_state(0)) {
++		return EIO;
++	}
++	wr(qup, QUP_MX_WRITE, len + 1);
++	wr(qup, QUP_MX_READ, 0);
++	if (qup_state(1)) {
++		return EIO;
++	}
++	for (unsigned i = 0; i <= len; i++) {
++		uint32_t t = i == 0 ? (0x100u | (uint32_t)(addr << 1)) :
++		    ((i == len ? 0x300u : 0x200u) | buf[i - 1]);
++		if (w & 1) {
++			wr(qup, QUP_OUT_FIFO, val | (t << 16));
++		} else {
++			val = t;
++		}
++		w++;
++	}
++	if (w & 1) {
++		wr(qup, QUP_OUT_FIFO, val);
++	}
++	int r = qup_wait(OP_MAX_OUTPUT_DONE);
++	wr(qup, QUP_OPERATIONAL, rd(qup, QUP_OPERATIONAL));
++	return r;
++}
++
++static int
++qup_read(uint8_t addr, uint8_t *buf, unsigned len)
++{
++	if (qup_state(0)) {
++		return EIO;
++	}
++	wr(qup, QUP_MX_WRITE, 2);
++	wr(qup, QUP_MX_READ, len);
++	if (qup_state(1)) {
++		return EIO;
++	}
++	wr(qup, QUP_OUT_FIFO, ((0x400u | len) << 16) | 0x100u | (uint32_t)((addr << 1) | 1));
++	for (unsigned i = 0; i < len;) {
++		int r = qup_wait(OP_IN_NOT_EMPTY);
++		if (r) {
++			return r;
++		}
++		uint32_t v = rd(qup, QUP_IN_FIFO);
++		buf[i++] = v & 0xff;
++		if (i < len) {
++			buf[i++] = (v >> 16) & 0xff;
++		}
++	}
++	wr(qup, QUP_OPERATIONAL, rd(qup, QUP_OPERATIONAL));
++	return 0;
++}
++
++static int
++gt_read(uint16_t reg, uint8_t *buf, unsigned len)
++{
++	uint8_t a[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	int r = qup_write(GT_ADDR, a, 2);
++	return r ? r : qup_read(GT_ADDR, buf, len);
++}
++
++static int
++gt_write8(uint16_t reg, uint8_t v)
++{
++	uint8_t a[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, v };
++	return qup_write(GT_ADDR, a, 3);
++}
++
++/* ---- polling ---- */
++
++enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_VOLDOWN = 2, KEY_HOME = 3 };
++
++static void
++keys_poll(int state[4])
++{
++	int now[3] = { 0, !gpio_get(GPIO_VOLUP), !gpio_get(GPIO_VOLDOWN) };
++
++	for (int k = 1; k < 3; k++) {
++		if (now[k] != state[k]) {
++			state[k] = now[k];
++			printf("SWEET K88 KEYS: key=%d down=%d\n", k, now[k]);
++			sweet_hid_key(k, now[k]);
++		}
++	}
++	int home = state[KEY_VOLUP] && state[KEY_VOLDOWN];
++	if (home != state[KEY_HOME]) {
++		state[KEY_HOME] = home;
++		printf("SWEET K88 KEYS: home down=%d\n", home);
++		sweet_hid_key(KEY_HOME, home);
++	}
++}
++
++static uint32_t touch_errors;
++
++static void
++touch_poll(uint32_t *down_mask)
++{
++	uint8_t st = 0, pts[GT_MAX * 8];
++	uint32_t now = 0;
++
++	int r = gt_read(GT_STATUS, &st, 1);
++	if (r == 0 && !(st & 0x80)) {
++		return;                         /* no new data */
++	}
++	unsigned n = st & 0xf;
++	if (r == 0 && n > GT_MAX) {
++		n = 0;
++	}
++	if (r == 0 && n) {
++		r = gt_read(GT_POINTS, pts, n * 8);
++	}
++	if (r == 0) {
++		for (unsigned i = 0; i < n; i++) {
++			const uint8_t *p = pts + i * 8;
++			int id = p[0] & 0xf;
++			int x = p[1] | p[2] << 8, y = p[3] | p[4] << 8;
++			if (id >= GT_MAX) {
++				continue;
++			}
++			now |= 1u << id;
++			sweet_hid_touch(id, 1, x, y);
++		}
++		for (int id = 0; id < GT_MAX; id++) {
++			if ((*down_mask & ~now) & (1u << id)) {
++				sweet_hid_touch(id, 0, 0, 0);
++			}
++		}
++		*down_mask = now;
++	}
++	(void)gt_write8(GT_STATUS, 0);
++	if (r && (touch_errors++ % 200u) == 0) {
++		printf("SWEET K88 TOUCH: read error %d (i2c status %#x)\n", r, qup_err);
++		(void)qup_init();
++	}
++}
++
++static void
++k88_input_thread(void *arg, wait_result_t result)
++{
++	int keys[4] = { 0, 0, 0, 0 };
++	uint32_t fingers = 0;
++	int touch = 1;
++	uint8_t id[6] = { 0 }, res[4] = { 0 };
++	(void)arg;
++	(void)result;
++
++	gpio_cfg(GPIO_VOLUP, 0, 3, 2);
++	gpio_cfg(GPIO_VOLDOWN, 0, 3, 2);
++	(void)PE_parse_boot_argn("sweettouch", &touch, sizeof(touch));
++	bool ts_ok = false;
++	if (touch && qup_init() == 0 && gt_read(0x8140, id, 6) == 0 && gt_read(0x8048, res, 4) == 0) {
++		ts_ok = true;
++		printf("SWEET K88 TOUCH: Goodix %c%c%c%c firmware %#x, %ux%u\n", id[0], id[1], id[2],
++		    id[3] ? id[3] : ' ', id[4] | id[5] << 8, res[0] | res[1] << 8, res[2] | res[3] << 8);
++	} else {
++		printf("SWEET K88 TOUCH: off (sweettouch=%d, i2c status %#x)\n", touch, qup_err);
++	}
++	printf("SWEET K88 KEYS: volume up %d, volume down %d (1 = released)\n",
++	    gpio_get(GPIO_VOLUP), gpio_get(GPIO_VOLDOWN));
++	for (;;) {
++		keys_poll(keys);
++		if (ts_ok) {
++			touch_poll(&fingers);
++		}
++		sleep_ms(10);
++	}
++}
++
++void
++sweet_k88_input_init(void)
++{
++	int keys = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("sweetkeys", &keys, sizeof(keys));
++	if (!keys) {
++		printf("SWEET K88 KEYS: input disabled (sweetkeys=0)\n");
++		return;
++	}
++	tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
++	qup = ml_io_map(QUP_PA, 0x1000);
++	gcc = ml_io_map(GCC_PA, 0x80000);
++	if (!tlmm || !qup || !gcc) {
++		printf("SWEET K88 KEYS: MMIO mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(k88_input_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* SWEET_K88 */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b320302..1907c37 100644
+index b320302..09ba744 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -361,8 +361,8 @@ ufs_sync_cache(void)
+@@ -54,6 +54,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_a8_input_init(void);
++extern void sweet_k88_input_init(void);
+ extern void sweet_a8_gpu_init(void);
+ extern void sweet_mali_status(void);            /* sweet_a8gpu.c: one GPU line for wst_thread() */
+ extern void sweet_usb_probe(void);
+@@ -361,8 +362,8 @@ ufs_sync_cache(void)
  #define MMC_CMD_NS      (100ull * NSEC_PER_MSEC)
  #define MMC_DATA_NS     (500ull * NSEC_PER_MSEC)
  
@@ -13,7 +397,7 @@ index b320302..1907c37 100644
  static uint64_t mmc_wr_lo, mmc_wr_hi;           /* writable sectors [lo, hi): USERDATA, 0 = none */
  
  /*
-@@ -411,6 +411,7 @@ mmc_wait(uint32_t r, uint32_t mask, uint32_t want, uint64_t ns)
+@@ -411,6 +412,7 @@ mmc_wait(uint32_t r, uint32_t mask, uint32_t want, uint64_t ns)
  	return true;
  }
  
@@ -21,7 +405,7 @@ index b320302..1907c37 100644
  /* One command; returns RINTSTS, or UINT32_MAX if the CIU never took it. */
  static uint32_t
  mmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
-@@ -723,6 +724,455 @@ ufs_sync_cache(void)
+@@ -723,6 +725,455 @@ ufs_sync_cache(void)
  	return 0;
  }
  
@@ -477,7 +861,7 @@ index b320302..1907c37 100644
  /*
   * File-backed root (boot-arg sweetrootino=N): the iOS root is a plain file in
   * Android's ext4 USERDATA (/data/sweet/root.img, created from TWRP outside the
-@@ -1380,6 +1830,47 @@ ufs_find_partition(const char *want)
+@@ -1380,6 +1831,47 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
@@ -525,7 +909,7 @@ index b320302..1907c37 100644
  #if !defined(SWEET_JACKPOTLTE)
  static int
  ufs_take_over_host(void)
-@@ -1414,7 +1905,7 @@ ufs_take_over_host(void)
+@@ -1414,7 +1906,7 @@ ufs_take_over_host(void)
  	}
  	return 0;
  }
@@ -534,7 +918,7 @@ index b320302..1907c37 100644
  static int
  ufs_take_over_host(void)
  {
-@@ -1658,7 +2149,11 @@ sweet_ufs_init(void)
+@@ -1658,7 +2150,11 @@ sweet_ufs_init(void)
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
  #if defined(SWEET_JACKPOTLTE)
@@ -546,7 +930,7 @@ index b320302..1907c37 100644
  	const char *node_path = "/sweet-mmc";
  #else
  	char want[64] = "userdata";
-@@ -1708,6 +2203,11 @@ sweet_ufs_init(void)
+@@ -1708,6 +2204,11 @@ sweet_ufs_init(void)
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -558,14 +942,99 @@ index b320302..1907c37 100644
  #if defined(SWEET_JACKPOTLTE)
  	uint32_t rootino = 0;
  	uint64_t part_blocks = su.nblocks;      /* USERDATA's size, before su.nblocks becomes the file's */
-@@ -1783,8 +2283,10 @@ sweet_ufs_init(void)
+@@ -1783,8 +2284,12 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_usb_probe();
  #else
-+#if !defined(SWEET_K88)            /* Exynos GPIO/I2C and Mali: not on the K88 */
++#if defined(SWEET_K88)
++	sweet_k88_input_init();         /* volume keys, Goodix touch (sweet_k88input.c) */
++#else                             /* Exynos GPIO/I2C and Mali: not on the K88 */
  	sweet_a8_input_init();          /* GPIO keys and sec_ts touch (sweet_a8input.c) */
  	sweet_a8_gpu_init();            /* Mali-G71 probe, boot-arg sweetgpu (sweet_a8gpu.c) */
 +#endif
  #endif
  	return 0;
  }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 20e4161..7f05c86 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -355,11 +355,20 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
+  * app-switcher gesture.
+  */
++#if defined(SWEET_K88)
++#define SWEET_TOUCH_EDGE_PX 24        /* ~3 mm at 189 ppi */
++#else
+ #define SWEET_TOUCH_EDGE_PX 48
+-/* Panel height in pixels (the touch input space; width is 1080 on both). */
+-#if defined(SWEET_JACKPOTLTE)
++#endif
++/* Panel size in pixels (the touch input space). */
++#if defined(SWEET_K88)
++#define SWEET_TOUCH_PANEL_W 800       /* BOE JD9366; the GT928 reports the same 800x1280 */
++#define SWEET_TOUCH_PANEL_H 1280
++#elif defined(SWEET_JACKPOTLTE)
++#define SWEET_TOUCH_PANEL_W 1080
+ #define SWEET_TOUCH_PANEL_H 2220
+ #else
++#define SWEET_TOUCH_PANEL_W 1080
+ #define SWEET_TOUCH_PANEL_H 2400
+ #endif
+ class SweetHIDTouch : public IOHIDEventService {
+@@ -441,27 +450,32 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
++	fLogicalW = native ? SWEET_TOUCH_PANEL_W : 1125;
+ 	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
++	fOffX = (fLogicalW - SWEET_TOUCH_PANEL_W) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	int fit = 0;
+ 	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+ 	if (fit && !native) {
+-		if ((int64_t)1080 * fLogicalH >= (int64_t)SWEET_TOUCH_PANEL_H * fLogicalW) {
++		if ((int64_t)SWEET_TOUCH_PANEL_W * fLogicalH >= (int64_t)SWEET_TOUCH_PANEL_H * fLogicalW) {
+ 			fFitNum = SWEET_TOUCH_PANEL_H;
+ 			fFitDen = fLogicalH;
+ 		} else {
+-			fFitNum = 1080;
++			fFitNum = SWEET_TOUCH_PANEL_W;
+ 			fFitDen = fLogicalW;
+ 		}
+-		fFitX = (1080 - (int)((int64_t)fLogicalW * fFitNum / fFitDen)) / 2;
++		fFitX = (SWEET_TOUCH_PANEL_W - (int)((int64_t)fLogicalW * fFitNum / fFitDen)) / 2;
+ 		fFitY = (SWEET_TOUCH_PANEL_H - (int)((int64_t)fLogicalH * fFitNum / fFitDen)) / 2;
+ 	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
++#if defined(SWEET_K88)
++	setProperty("SurfaceWidth", (unsigned long long)(108 << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)(172 << 16), 32);
++#else
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++#endif
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -478,7 +492,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
++	x = x < 0 ? 0 : (x > (SWEET_TOUCH_PANEL_W - 1) ? (SWEET_TOUCH_PANEL_W - 1) : x);
+ 	y = y < 0 ? 0 : (y > SWEET_TOUCH_PANEL_H - 1 ? SWEET_TOUCH_PANEL_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+@@ -500,7 +514,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > (SWEET_TOUCH_PANEL_W - 1) - SWEET_TOUCH_EDGE_PX ||
+ 		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_TOUCH_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
