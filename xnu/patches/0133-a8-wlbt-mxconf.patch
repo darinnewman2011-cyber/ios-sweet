@@ -1,0 +1,207 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -16,9 +16,21 @@
+  *   firmware: /sweet/fw/mx140.bin (from the phone's /vendor/etc/wifi; not in git). Header "smxf" at +8, runtime
+  *        length +36, entry +40, build id +48, R4 panic record offset +176.
+  *
+- * With no configuration the firmware is expected to stop early, ideally writing its panic record: any change in the
+- * shared memory after the image, in the mailboxes or in WIFI_STAT is the sign that the core ran. Logged as
+- * "SWEET A8 WLBT:". The core is left as it ends; a reboot resets it.
++ * Stage 2 result (ios60n): the core ran and wrote its panic record (version 2, 0xd4 bytes) with mailbox 1 = 0.
++ *
++ * Stage 3 (this file): mailbox 1 now points at a configuration block in the heap right after the firmware's runtime
++ * length, laid out as Samsung's mxconf (facts from mxconf.h, mifstream.c, cpacket_buffer.c, mifintrbit.c, mxman.c,
++ * mxmgmt_transport.c, gdb_transport.c, mxlog_transport.c; packed little-endian):
++ *   u32 magic 0x79828486; u16 major 0, minor 1; then four stream pairs/streams. A stream = buffer offset, packet
++ *   count, packet size, read-index offset, write-index offset (u32 each, offsets relative to the shared memory),
++ *   u8 read interrupt bit, u8 write interrupt bit. Pairs are (to AP, from AP).
++ *   management (8-byte packets, 64), gdb R4 and gdb M4 (4-byte packets, 512 each), mxlog (to AP only, 4-byte, 4096).
++ *   Interrupt bits in the order Linux allocates them (to-host bits count up from 0; from-host R4/M4 from 1, bit 0
++ *   reserved for the gdb out streams): mgmt in r1 w0, mgmt out r1 w2, gdb R4 in r3 w2, out r3 w0, gdb M4 in r1 w4,
++ *   out r5 w0, mxlog in r4 w6. To-AP buffers start filled with 0xff.
++ * The probe polls (no interrupt handler): it reports the to-AP write indices and, at the end, the management packets
++ * (MM_START_IND = channel 0 payload 0 is what Linux waits for), the first mxlog words and the whole panic record.
++ * Logged as "SWEET A8 WLBT:". The core is left as it ends; a reboot resets it.
+  */
+ #if defined(SWEET_JACKPOTLTE)
+ #include <sys/param.h>
+@@ -63,6 +75,15 @@
+ 
+ static vm_offset_t shm, mbox, pmu;
+ static int wlbt_chan;
++static uint32_t heap_next;
++static uint8_t conf[200];
++static uint32_t conf_len;
++
++struct stream {
++	uint32_t buf, num, size, ridx, widx;
++	uint8_t rbit, wbit;
++};
++static struct stream mgmt_in, mgmt_out, gdb4_in, gdb4_out, gdbm_in, gdbm_out, log_in;
+ 
+ static uint32_t
+ rd(vm_offset_t b, uint32_t off)
+@@ -149,19 +170,127 @@
+ 	return error;
+ }
+ 
++/* A bump allocator in the heap after the firmware (Linux's miframman: 4-byte aligned, here 16). */
++static uint32_t
++heap_alloc(uint32_t len)
++{
++	uint32_t at = heap_next;
++
++	heap_next = (heap_next + len + 15u) & ~15u;
++	return at;
++}
++
++static void
++stream_make(struct stream *s, uint32_t num, uint32_t size, uint8_t rbit, uint8_t wbit, int to_ap)
++{
++	s->num = num;
++	s->size = size;
++	s->buf = heap_alloc(num * size);
++	s->ridx = heap_alloc(4);
++	s->widx = heap_alloc(4);
++	s->rbit = rbit;
++	s->wbit = wbit;
++	for (uint32_t off = 0; off < num * size; off += 4) {
++		wr(shm, s->buf + off, to_ap ? 0xffffffffu : 0);
++	}
++	wr(shm, s->ridx, 0);
++	wr(shm, s->widx, 0);
++}
++
++static void
++put32(uint32_t v)
++{
++	memcpy(conf + conf_len, &v, 4);
++	conf_len += 4;
++}
++
++static void
++put_stream(const struct stream *s)
++{
++	put32(s->buf);
++	put32(s->num);
++	put32(s->size);
++	put32(s->ridx);
++	put32(s->widx);
++	conf[conf_len++] = s->rbit;
++	conf[conf_len++] = s->wbit;
++}
++
++/* Builds the configuration in the heap and returns its offset (mailbox 1). */
++static uint32_t
++mxconf_build(uint32_t runtime)
++{
++	uint32_t at;
++
++	heap_next = (runtime + 15u) & ~15u;
++	at = heap_alloc(sizeof(conf));
++	stream_make(&mgmt_in, 64, 8, 1, 0, 1);
++	stream_make(&mgmt_out, 64, 8, 1, 2, 0);
++	stream_make(&gdb4_in, 512, 4, 3, 2, 1);
++	stream_make(&gdb4_out, 512, 4, 3, 0, 0);
++	stream_make(&gdbm_in, 512, 4, 1, 4, 1);
++	stream_make(&gdbm_out, 512, 4, 5, 0, 0);
++	stream_make(&log_in, 4096, 4, 4, 6, 1);
++	memset(conf, 0, sizeof(conf));
++	conf_len = 0;
++	put32(0x79828486u);
++	put32(0u | (1u << 16));         /* major 0, minor 1 */
++	put_stream(&mgmt_in);
++	put_stream(&mgmt_out);
++	put_stream(&gdb4_in);
++	put_stream(&gdb4_out);
++	put_stream(&gdbm_in);
++	put_stream(&gdbm_out);
++	put_stream(&log_in);
++	for (uint32_t i = 0; i < sizeof(conf); i += 4) {
++		uint32_t w;
++
++		memcpy(&w, conf + i, 4);
++		wr(shm, at + i, w);
++	}
++	return at;
++}
++
+ static void
+ report(const char *when, uint32_t runtime, uint32_t panic_off)
+ {
+ 	unsigned changed = 0;
+ 
+-	for (uint32_t off = runtime; off < runtime + 0x10000 && off < SHM_SIZE; off += 4) {
++	for (uint32_t off = heap_next; off < heap_next + 0x10000 && off < SHM_SIZE; off += 4) {
+ 		changed += rd(shm, off) != 0;
+ 	}
+-	printf("SWEET A8 WLBT: %s: WIFI_CTRL_NS %#x CTRL_S %#x STAT %#x SEQ %#x | INTSR0 %#x INTSR1 %#x | mbox %#x %#x %#x %#x "
+-	    "%#x %#x %#x %#x | heap words set %u | panic %08x %08x %08x %08x\n", when, rd(pmu, WIFI_CTRL_NS), rd(pmu, WIFI_CTRL_S),
+-	    rd(pmu, WIFI_STAT), rd(pmu, CENTRAL_SEQ_ST), rd(mbox, INTSR0), rd(mbox, INTSR1), rd(mbox, ISSR(0)), rd(mbox, ISSR(1)),
+-	    rd(mbox, ISSR(2)), rd(mbox, ISSR(3)), rd(mbox, ISSR(4)), rd(mbox, ISSR(5)), rd(mbox, ISSR(6)), rd(mbox, ISSR(7)),
+-	    changed, rd(shm, panic_off), rd(shm, panic_off + 4), rd(shm, panic_off + 8), rd(shm, panic_off + 12));
++	(void)runtime;
++	printf("SWEET A8 WLBT: %s: CTRL_NS %#x STAT %#x | INTSR0 %#x INTSR1 %#x | mbox %#x %#x %#x %#x | mgmt in w%u r%u, out "
++	    "w%u r%u, log w%u r%u, gdb4 w%u | heap words set %u | panic %08x %08x %08x %08x\n", when, rd(pmu, WIFI_CTRL_NS),
++	    rd(pmu, WIFI_STAT), rd(mbox, INTSR0), rd(mbox, INTSR1), rd(mbox, ISSR(0)), rd(mbox, ISSR(1)), rd(mbox, ISSR(2)),
++	    rd(mbox, ISSR(3)), rd(shm, mgmt_in.widx), rd(shm, mgmt_in.ridx), rd(shm, mgmt_out.widx), rd(shm, mgmt_out.ridx),
++	    rd(shm, log_in.widx), rd(shm, log_in.ridx), rd(shm, gdb4_in.widx), changed, rd(shm, panic_off), rd(shm, panic_off + 4),
++	    rd(shm, panic_off + 8), rd(shm, panic_off + 12));
++}
++
++static void
++dump_words(const char *what, uint32_t off, uint32_t words)
++{
++	for (uint32_t i = 0; i < words; i += 8) {
++		printf("SWEET A8 WLBT: %s +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", what, i * 4, rd(shm, off + i * 4),
++		    rd(shm, off + i * 4 + 4), rd(shm, off + i * 4 + 8), rd(shm, off + i * 4 + 12), rd(shm, off + i * 4 + 16),
++		    rd(shm, off + i * 4 + 20), rd(shm, off + i * 4 + 24), rd(shm, off + i * 4 + 28));
++	}
++}
++
++static void
++final_dump(uint32_t panic_off)
++{
++	uint32_t w = rd(shm, mgmt_in.widx) % mgmt_in.num;
++	uint32_t lw = rd(shm, log_in.widx);
++
++	printf("SWEET A8 WLBT: management packets from the core: %u (MM_START_IND is channel 0, payload 0)\n", w);
++	for (uint32_t i = 0; i < w && i < 8; i++) {
++		printf("SWEET A8 WLBT: mgmt %u: %08x %08x\n", i, rd(shm, mgmt_in.buf + i * 8), rd(shm, mgmt_in.buf + i * 8 + 4));
++	}
++	printf("SWEET A8 WLBT: mxlog write index %u\n", lw);
++	dump_words("mxlog", log_in.buf, lw > 0 && lw < 64 ? ((lw + 7u) & ~7u) : 64);
++	dump_words("panic record", panic_off, 56);
+ }
+ 
+ static void
+@@ -221,8 +350,11 @@
+ 	wr(mbox, INTMR1, 0x0000ffffu);
+ 	wr(mbox, INTCR0, 0xffff0000u);
+ 	wr(mbox, INTCR1, 0x0000ffffu);
++	uint32_t conf_at = mxconf_build(runtime);
++	printf("SWEET A8 WLBT: 4 configuration at %#x (%u bytes), mgmt in buf %#x idx %#x/%#x, log buf %#x, heap end %#x\n",
++	    conf_at, conf_len, mgmt_in.buf, mgmt_in.ridx, mgmt_in.widx, log_in.buf, heap_next);
+ 	wr(mbox, ISSR(0), entry);
+-	wr(mbox, ISSR(1), 0);
++	wr(mbox, ISSR(1), conf_at);
+ 	wr(mbox, ISSR(2), 0xbcdeedcbu);
+ 	wr(mbox, ISSR(3), 0);
+ 	printf("SWEET A8 WLBT: 4 set up: MEM_CONFIG0 %#x CONFIG1 %#x, mailboxes %#x %#x %#x %#x\n", rd(pmu, MEM_CONFIG0),
+@@ -234,13 +366,14 @@
+ 	wr(pmu, WIFI_CTRL_NS, rd(pmu, WIFI_CTRL_NS) & ~(1u << 2));
+ 	wr(pmu, WIFI_CTRL_S, rd(pmu, WIFI_CTRL_S) | (1u << 3));
+ 	printf("SWEET A8 WLBT: 5 started (PWRON, reset released, START)\n");
+-	for (int t = 1; t <= 10; t++) {
++	for (int t = 1; t <= 20; t++) {
+ 		char when[24];
+ 
+ 		sleep_ms(t <= 4 ? 250 : 1000);
+ 		snprintf(when, sizeof(when), "watch %d", t);
+ 		report(when, runtime, panic_off);
+ 	}
++	final_dump(panic_off);
+ 	wr(pmu, EXT_REG_OPTION, rd(pmu, EXT_REG_OPTION) & ~0x4u);
+ 	printf("SWEET A8 WLBT: done; the core is left as it is until the next boot\n");
+ out:
