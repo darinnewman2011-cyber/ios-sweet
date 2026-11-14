@@ -1,0 +1,176 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b0b8907..b320302 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1961,9 +1961,28 @@ sweet_ufs_rootdev(dev_t *dev)
+  * SEC_POWER_RESET, INFORM3 SEC_RESET_REASON_RECOVERY) and resets the SoC,
+  * so S-Boot starts TWRP (verified with the shim on 2026-11-02).
+  */
++#if defined(SWEET_K88)
++/*
++ * ZTE K88 (verified with shim/k88 on 2026-11-13): TWRP's ramoops console zone
++ * is at 0x9FDFE000 (1 MiB, ecc 0) and shows up as console-ramoops-0. LK writes
++ * its own log over the first few KiB of that zone on every boot, so the text
++ * starts K88_OOPS_SKIP bytes in, after newlines; console records need no
++ * "====" header. Reboot: LK's RECOVERY_MODE cookie in the IMEM restart reason,
++ * then PS_HOLD low (warm reset, DRAM kept).
++ */
++#define A8_OOPS_PA              0x9FDFE000ull
++#define K88_OOPS_SKIP           0x4000u
++#define A8_OOPS_SIZE            0x20000u        /* mapped: the skip + 112 KiB of text */
++#define A8_OOPS_SIG             0x43474244u
++#define K88_IMEM_PA             0x08600000ull
++#define K88_IMEM_RESTART        0x65C
++#define K88_RESTART_RECOVERY    0x77665502u
++#define K88_PSHOLD_PA           0x004AB000ull
++#else
+ #define A8_OOPS_PA              0x92400000ull
+ #define A8_OOPS_SIZE            0x4000u         /* ramoops record_size */
+ #define A8_OOPS_SIG             0x43474244u     /* PERSISTENT_RAM_SIG ^ 0 */
++#endif
+ #define A8_PMU_PA               0x11C80000ull
+ #define A8_PMU_SWRESET          0x0400
+ #define A8_PMU_INFORM2          0x0808
+@@ -1972,7 +1991,10 @@ sweet_ufs_rootdev(dev_t *dev)
+ #define A8_SEC_RESET_RECOVERY   0x12345674u
+ 
+ static volatile uint32_t *a8_oops;
+-static volatile uint32_t *a8_pmu;
++static volatile uint32_t *a8_pmu;               /* K88: the IMEM page */
++#if defined(SWEET_K88)
++static volatile uint32_t *k88_pshold;
++#endif
+ 
+ void sweet_a8_channel_init(void);
+ void sweet_a8_snapshot(void);
+@@ -1987,7 +2009,12 @@ sweet_a8_channel_init(void)
+ 		a8_oops = (volatile uint32_t *)ml_io_map(A8_OOPS_PA, A8_OOPS_SIZE);
+ 	}
+ 	if (!a8_pmu) {
++#if defined(SWEET_K88)
++		k88_pshold = (volatile uint32_t *)ml_io_map(K88_PSHOLD_PA, 0x1000);
++		a8_pmu = (volatile uint32_t *)ml_io_map(K88_IMEM_PA, 0x1000);
++#else
+ 		a8_pmu = (volatile uint32_t *)ml_io_map(A8_PMU_PA, 0x1000);
++#endif
+ 	}
+ }
+ 
+@@ -1999,8 +2026,14 @@ sweet_a8_channel_init(void)
+ void
+ sweet_a8_snapshot(void)
+ {
++#if defined(SWEET_K88)
++	/* console zone: newlines up to K88_OOPS_SKIP (LK overwrites the start), then the log tail */
++	static const char hdr[K88_OOPS_SKIP] = { [0 ... K88_OOPS_SKIP - 1] = '\n' };
++	const uint32_t hlen = K88_OOPS_SKIP;
++#else
+ 	static const char hdr[] = "====1.0-D\n";
+ 	const uint32_t hlen = sizeof(hdr) - 1;
++#endif
+ 	const uint32_t cap = A8_OOPS_SIZE - 12;          /* sig, start, size */
+ 	volatile uint32_t *w;
+ 
+@@ -2035,12 +2068,20 @@ void
+ sweet_a8_reboot_recovery(void)
+ {
+ 	sweet_a8_snapshot();
++#if defined(SWEET_K88)
++	if (a8_pmu && k88_pshold) {
++		a8_pmu[K88_IMEM_RESTART / 4] = K88_RESTART_RECOVERY;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		k88_pshold[0] = 0;
++	}
++#else
+ 	if (a8_pmu) {
+ 		a8_pmu[A8_PMU_INFORM2 / 4] = A8_SEC_POWER_RESET;
+ 		a8_pmu[A8_PMU_INFORM3 / 4] = A8_SEC_RESET_RECOVERY;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		a8_pmu[A8_PMU_SWRESET / 4] = 1;
+ 	}
++#endif
+ 	for (;;) {
+ 		__builtin_arm_wfe();
+ 	}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 3817f6a..ab6d6de 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -304,7 +304,9 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-#if defined(SWEET_JACKPOTLTE)
++#if defined(SWEET_K88)
++	fReal = false;          /* PMI8950 fuel gauge: no driver yet; the A8's S2MU004 is on Exynos I2C */
++#elif defined(SWEET_JACKPOTLTE)
+ 	int real = 1;
+ 	(void)PE_parse_boot_argn("a8battery", &real, sizeof(real));
+ 	fReal = real != 0 && sweet_a8_power_init() == 0;
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 217f968..0806dbb 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -67,6 +67,11 @@ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ # features (LSE etc.) despite -march.
+ ifeq ($(SWEET_BOARD),jackpotlte)
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET_JACKPOTLTE -mcpu=generic -march=armv8-a
++else ifeq ($(SWEET_BOARD),k88)
++# ZTE K88 (MSM8952, 8x Cortex-A53): the same 4K/ARMv8.0/GICv2 kernel as the A8
++# (SWEET_JACKPOTLTE), with SWEET_K88 swapping the board values and keeping the
++# Exynos-only drivers off.
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET_JACKPOTLTE -DSWEET_K88 -mcpu=generic -march=armv8-a
+ else
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+ endif
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 8ccd704..961b4be 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -25,7 +25,15 @@
+  */
+ #define SWEET_SMP_MAX_CPUS         8
+ 
+-#if defined(SWEET_JACKPOTLTE)
++#if defined(SWEET_K88)
++/*
++ * ZTE K88 (MSM8952): two clusters of four Cortex-A53, MPIDRs 0x100-0x103 and
++ * 0x0-0x3. LK enters on 0x100 (shim/k88, 2026-11-13), the ADT's cpu0.
++ */
++#define SWEET_BOOT_MPIDR          0x100
++#define SWEET_MPIDR_VALID(m)      ((m) <= 0x3 || ((m) >= 0x100 && (m) <= 0x103))
++#define SWEET_CPU_NAME            "MSM8952"
++#elif defined(SWEET_JACKPOTLTE)
+ /*
+  * Exynos 7885: A53 MPIDRs 0x100-0x103 and 0x200-0x201, A73 0x0/0x1 (Aff0 =
+  * core, Aff1 = cluster). S-Boot enters the kernel on 0x100, the ADT's cpu0.
+@@ -44,7 +52,17 @@
+  * Bootloader splash framebuffer used by the early console (sweet_early.c,
+  * start.s): a8r8g8b8, physical, L2-block aligned. Only the first buffer.
+  */
+-#if defined(SWEET_JACKPOTLTE)
++#if defined(SWEET_K88)
++/*
++ * DSI video-mode panel (BOE JD9366, 800x1280): the MDP scans continuously, no
++ * trigger. shim/k88 points the MDSS RGB0 pipe at this a8r8g8b8 buffer (LK's
++ * own splash is a 24 bpp BMP at an unaligned address) inside LK's 20 MiB
++ * splash carve-out.
++ */
++#define SWEET_FB_PA               0x83400000
++#define SWEET_FB_WIDTH            800
++#define SWEET_FB_HEIGHT           1280
++#elif defined(SWEET_JACKPOTLTE)
+ #define SWEET_FB_PA               0xEC000000      // S-Boot, 0x1400000 reserved
+ #define SWEET_FB_WIDTH            1080
+ #define SWEET_FB_HEIGHT           2220
+@@ -99,7 +117,9 @@
+  * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
+-#if defined(SWEET_JACKPOTLTE)
++#if defined(SWEET_K88)
++#define SWEET_VTIMER_INTID        20      // MSM8952 DT PPI 4 (shim/k88: verified)
++#elif defined(SWEET_JACKPOTLTE)
+ #define SWEET_VTIMER_INTID        27      // standard PPI 11 (Exynos 7885 DT)
+ #else
+ #define SWEET_VTIMER_INTID        19

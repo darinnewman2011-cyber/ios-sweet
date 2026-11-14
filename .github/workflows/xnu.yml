@@ -13,7 +13,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
       board:
-        description: SWEET board variant (sweet / jackpotlte = Galaxy A8 2018)
+        description: SWEET board variant (sweet / jackpotlte = Galaxy A8 2018 / k88 = ZTE K88 tablet)
         default: sweet
       keep_going:
         description: make -k (collect all compile errors in one run)
@@ -56,7 +56,7 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
-          if [ "$SWEET_BOARD" = jackpotlte ]; then
+          if [ "$SWEET_BOARD" = jackpotlte ] || [ "$SWEET_BOARD" = k88 ]; then
             # Apple clang's default arm64 CPU has LSE; Cortex-A53/A73 are ARMv8.0
             # (xcodebuild rejects [arch=...] conditionals on the command line)
             sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\"/& 'OTHER_CFLAGS=\$(inherited) \$(SWEET_ARCH_CFLAGS_\$(CURRENT_ARCH))' 'SWEET_ARCH_CFLAGS_arm64=-mcpu=generic -march=armv8-a'/" dxb/build.sh
@@ -128,7 +128,7 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - name: ISA check (instructions an ARMv8.0 core cannot execute)
-        if: always() && env.SWEET_BOARD == 'jackpotlte'
+        if: always() && (env.SWEET_BOARD == 'jackpotlte' || env.SWEET_BOARD == 'k88')
         run: |
           # Cortex-A53/A73 are ARMv8.0: LSE atomics (8.1), RDM (8.1), RCpc
           # loads (8.3) and non-hint pointer-auth instructions are UNDEFINED.
@@ -151,6 +151,17 @@ jobs:
           # rd=ufsroot0: root on the eMMC GPT partition USERDATA (0093, read-only)
           python3 -I tools/mkpayload.py "$k" out/jackpotlte.adt out/xnu-jackpotlte.payload --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0'
           ls -l out/jackpotlte.adt out/xnu-jackpotlte.payload
+
+      - name: K88 payload (mkadt + mkpayload)
+        if: always() && env.SWEET_BOARD == 'k88'
+        run: |
+          # Linked into the K88 shim on the PC: PAYLOAD=... shim/k88/build.sh, then tools/mkqcomboot.py
+          k=$(find out -maxdepth 1 -type f -name 'kernel.*' ! -name '*.txt' ! -name '*.a' | head -1)
+          python3 -I tools/mkadt.py out/k88.adt --device k88
+          # no root device yet (SDHCI driver to come): the boot waits for root;
+          # sweetreboot=120 comes back to TWRP with the console in ramoops
+          python3 -I tools/mkpayload.py "$k" out/k88.adt out/xnu-k88.payload --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetreboot=120'
+          ls -l out/k88.adt out/xnu-k88.payload
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -70,6 +70,27 @@ JP_CORES = ([(m, 'arm,cortex-a53', 1600000000) for m in (0x100, 0x101, 0x102, 0x
 JP_FB_W, JP_FB_H = 1080, 2220
 JP_FB_PHYS = 0xEC000000
 
+# --device k88: ZTE K88 tablet ("jasmine"), Snapdragon 617 / MSM8952. Facts from
+# docs/PORTING_K88.md: the boot.img DTB plus what shim/k88 measured on the tablet
+# (GICv2, vtimer INTID 20, boot MPIDR 0x100, PSCI CPU_ON for all eight).
+K88_GIC = [(0x0B000000, 0x1000),  # GICD (qcom,msm-qgic2)
+           (0x0B002000, 0x1000),  # GICC
+           (0x0B001000, 0x1000),  # GICH/GICV: none in the DT; placeholders, the
+           (0x0B004000, 0x1000)]  # GICv2 driver uses only GICD and GICC
+K88_TIMEBASE = 19200000           # CNTFRQ 0x124F800 (shim)
+K88_VTIMER_INTID = 20             # DT PPI 4; shim: 30 IRQs in 300 ms on INTID 0x14
+# The one large clean bank: System RAM 0x9FF00000-0xFFFFFFFF; 0xA0000000 up is
+# free once Linux is not running (its CMA pools there are its own choice).
+K88_PHYS_BASE, K88_MEM_SIZE = 0xA0000000, 0x60000000
+# Two clusters of four Cortex-A53; LK enters on 0x100 (shim), the first DT cpu node.
+K88_CORES = ([(m, 'arm,cortex-a53', 1497600000) for m in (0x100, 0x101, 0x102, 0x103)] +
+             [(m, 'arm,cortex-a53', 1209600000) for m in (0x0, 0x1, 0x2, 0x3)])
+# BOE JD9366, 800x1280 video mode. LK scans a 24 bpp BMP at 0x83200036; shim/k88
+# repoints the MDSS RGB0 pipe at a 32 bpp buffer here (2 MiB aligned, inside LK's
+# 20 MiB splash carve-out at 0x83000000).
+K88_FB_W, K88_FB_H = 800, 1280
+K88_FB_PHYS = 0x83400000
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -107,18 +128,19 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     device='jackpotlte': Galaxy A8 (2018) / Exynos 7885 (GICv2, eMMC, 26 MHz timer).
     fb=(phys, width, height) overrides the framebuffer ABL/S-Boot leaves (required for jackpotlte)."""
-    jp = device == 'jackpotlte'
+    k88 = device == 'k88'
+    jp = device == 'jackpotlte' or k88     # the 4K/GICv2 family; k88 then overrides the board values
     if jp and qemu:
-        raise SystemExit('--device jackpotlte has no QEMU variant')
+        raise SystemExit(f'--device {device} has no QEMU variant')
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     if jp:
-        phys_base, mem_size = JP_PHYS_BASE, (mem or JP_MEM_SIZE)
+        phys_base, mem_size = (K88_PHYS_BASE, (mem or K88_MEM_SIZE)) if k88 else (JP_PHYS_BASE, (mem or JP_MEM_SIZE))
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     if jp:
-        timebase = JP_TIMEBASE
+        timebase = K88_TIMEBASE if k88 else JP_TIMEBASE
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -172,9 +194,10 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(len(JP_CORES) if jp else (1 if qemu else 8)):
+    cores = K88_CORES if k88 else JP_CORES
+    for core in range(len(cores) if jp else (1 if qemu else 8)):
         if jp:
-            mpidr, cpu_compat, cpu_hz = JP_CORES[core]
+            mpidr, cpu_compat, cpu_hz = cores[core]
         else:
             mpidr, cpu_compat, cpu_hz = core << 8, 'qcom,kryo470', (2304000000 if core >= 6 else 1804800000)
         cpu_nodes.append(node(f'cpu{core}', [
@@ -205,10 +228,10 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         # driver for this (sweet's is GICv3 system-register based).
         gic = node('gic', [
             ph(),
-            ('compatible', cstr('arm,gic-400')),
+            ('compatible', cstr('qcom,msm-qgic2' if k88 else 'arm,gic-400')),
             ('interrupt-controller', b''),
-            ('virtual-timer-intid', u32(JP_VTIMER_INTID)),
-            ('reg', u64(*[v for base, size in JP_GIC for v in (base - SOC_BASE, size)])),
+            ('virtual-timer-intid', u32(K88_VTIMER_INTID if k88 else JP_VTIMER_INTID)),
+            ('reg', u64(*[v for base, size in (K88_GIC if k88 else JP_GIC) for v in (base - SOC_BASE, size)])),
         ])
     else:
         gic = node('gic', [
@@ -243,7 +266,7 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         ])])
 
     if jp:
-        fb_phys, fb_w, fb_h = fb if fb else (JP_FB_PHYS, JP_FB_W, JP_FB_H)
+        fb_phys, fb_w, fb_h = fb if fb else ((K88_FB_PHYS, K88_FB_W, K88_FB_H) if k88 else (JP_FB_PHYS, JP_FB_W, JP_FB_H))
         fb_stride = fb_w * 4
         fb_size = (fb_stride * fb_h + 0xfff) & ~0xfff
     else:
@@ -302,6 +325,11 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         # matches during bring-up; rename it together with the kernel patch.
         compat = (cstr('D22AP') + cstr('iPhone10,3') + cstr('samsung,jackpotlte') +
                   cstr('samsung,exynos7885') + cstr('xiaomi,sweet') + cstr('AppleARM'))
+    if k88:
+        compat = (cstr('D22AP') + cstr('iPhone10,3') + cstr('zte,k88') +
+                  cstr('qcom,msm8952') + cstr('xiaomi,sweet') + cstr('AppleARM'))
+    # k88: no storage node yet. Without /sweet-mmc, bsd/dev/sweet_ufs.c stops before
+    # touching any hardware (its A8 path drives a DW-MSHC; the K88 has an SDHCI).
     return node('device-tree', [
         ph(),
         ('compatible', compat),
@@ -311,7 +339,7 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or k88 else [ufs]))
 
 
 def _opt(name):
@@ -326,8 +354,8 @@ def _opt(name):
 
 if __name__ == '__main__':
     device = _opt('--device') or 'sweet'
-    if device not in ('sweet', 'jackpotlte'):
-        raise SystemExit(f'unknown --device {device!r} (sweet, jackpotlte)')
+    if device not in ('sweet', 'jackpotlte', 'k88'):
+        raise SystemExit(f'unknown --device {device!r} (sweet, jackpotlte, k88)')
     fb = None
     if _opt('--fb'):   # --fb 0x9d000000[,1080x2220]
         addr, _, dims = _opt('--fb').partition(',')

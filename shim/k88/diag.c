@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "../console.h"
 #include "../fdt.h"
+#include "../loader.h"
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" :: "r"((uint64_t)(v)))
@@ -54,19 +55,35 @@ static const uint32_t k88_mpidr[8] = { 0x100, 0x101, 0x102, 0x103, 0x000, 0x001,
 #define MPIDR_SLOT(m)	((((m) >> 8) & 0xff) * 4 + ((m) & 0xff))	/* same as start.S */
 
 /*
- * MDSS (qcom,mdss_mdp@1a00000). SSPP register layout of MDP5; whether the
- * pipe offsets count from 0x1a00000 or from 0x1a01000 (mdp-reg-offset) is
- * not settled, so both are probed and the plausible one wins.
+ * MDSS (qcom,mdss_mdp@1a00000). SSPP register layout of MDP5. diag3 showed
+ * the pipe offsets count from 0x1a00000 (RGB0 at 0x1a15000 scans LK's splash);
+ * the CTL offsets (DT qcom,mdss-ctl-off) count from the same base.
  */
 #define MDSS_BASE	0x01a00000UL
 #define SSPP_SRC_SIZE		0x00
+#define SSPP_SRC_XY		0x08
+#define SSPP_OUT_SIZE		0x0c
 #define SSPP_SRC0_ADDR		0x14
 #define SSPP_SRC_YSTRIDE0	0x24
 #define SSPP_SRC_FORMAT		0x30
 #define SSPP_SRC_UNPACK		0x34
+#define SSPP_SRC_OP_MODE	0x38
 static const uint32_t pipe_off[4] = { 0x15000, 0x17000, 0x25000, 0x05000 };	/* RGB0, RGB1, DMA0, VIG0 */
+static const uint32_t pipe_flush[4] = { 1u << 3, 1u << 4, 1u << 11, 1u << 0 };	/* CTL_FLUSH bits */
+static const uint32_t ctl_off[3] = { 0x2000, 0x2200, 0x2400 };
+#define CTL_LAYER0		0x00
+#define CTL_TOP			0x14
+#define CTL_FLUSH		0x18
+/*
+ * XRGB8888, bytes B,G,R,X in memory (= a8r8g8b8 little endian, what XNU's
+ * framebuffer console writes): Linux mdss_mdp_format_setup() packing with
+ * bits G/B/R/A = 8 (3), bpp 4, unpack count 4, tight; elements B,G,R,A.
+ */
+#define FMT_XRGB8888		0x000236ffu
+#define UNPACK_BGRA		0x03020001u
 #define SPLASH_PA	0x83000000UL	/* reserved-memory splash_region, 20 MiB */
-#define SHADOW_PA	0xa0000000UL	/* plain System RAM, far from LK's load addresses */
+#define FB32_PA		0x83400000UL	/* our 32 bpp scanout: 2 MiB aligned, in the splash carve-out (= SWEET_FB_PA) */
+#define SHADOW_PA	0x90000000UL	/* plain System RAM below the kernel's bank (0xA0000000 up) */
 
 /*
  * Log channel: the console text also goes into the console zone of Linux's
@@ -97,6 +114,7 @@ static volatile uint32_t irq_count, irq_other, irq_last, irq_src;
 static volatile uint64_t sec_mpidr[12];
 
 static uintptr_t fb_pa = SPLASH_PA;	/* scanned buffer */
+static int fb_pipe = -1;		/* index into pipes[] that scans it */
 static uint32_t fb_stride = FB_W * 3;	/* bytes */
 static int fb_direct;			/* 32 bpp scanout: drawn into directly */
 
@@ -266,9 +284,49 @@ static void find_scanout(void)
 	if (best >= 0) {
 		fb_pa = pipes[best].addr;
 		fb_stride = pipes[best].stride & 0xffff;
+		fb_pipe = best;
 	}
 	fb_direct = fb_stride == FB_W * 4;
 	con_fb = (volatile uint32_t *)(fb_direct ? fb_pa : SHADOW_PA);
+}
+
+/*
+ * Point the pipe that scans LK's splash at a 32 bpp buffer at FB32_PA (black,
+ * full panel size, same position and flip), then flush the CTL that drives it.
+ * Returns 1 if the pipe took the new address.
+ */
+static uint32_t fb32_ctl, fb32_before, fb32_after;
+
+static int scanout_32bpp(void)
+{
+	if (fb_pipe < 0 || fb_pipe >= 4)
+		return 0;	/* only the 0x1a00000-based pipes are real (diag3) */
+	uintptr_t p = MDSS_BASE + pipe_off[fb_pipe];
+	uintptr_t ctl = MDSS_BASE + ctl_off[0];
+
+	for (int i = 0; i < 3; i++)	/* the CTL with layers staged is the one in use */
+		if (mmio32(MDSS_BASE + ctl_off[i] + CTL_LAYER0)) {
+			ctl = MDSS_BASE + ctl_off[i];
+			break;
+		}
+	fb32_ctl = (uint32_t)ctl;
+	for (uintptr_t a = FB32_PA; a < FB32_PA + (uintptr_t)FB_H * FB_W * 4; a += 8)
+		*(volatile uint64_t *)a = 0xff000000ff000000ull;
+	__asm__ volatile("dsb sy" ::: "memory");
+	fb32_before = mmio32(p + SSPP_SRC0_ADDR);
+	wr32(p + SSPP_SRC_FORMAT, FMT_XRGB8888);
+	wr32(p + SSPP_SRC_UNPACK, UNPACK_BGRA);
+	wr32(p + SSPP_SRC_YSTRIDE0, FB_W * 4);
+	wr32(p + SSPP_SRC0_ADDR, (uint32_t)FB32_PA);
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(ctl + CTL_FLUSH, pipe_flush[fb_pipe]);
+	delay_ms(50);	/* a few frames at 60 Hz */
+	fb32_after = mmio32(p + SSPP_SRC0_ADDR);
+	fb_pa = FB32_PA;
+	fb_stride = FB_W * 4;
+	fb_direct = 1;
+	con_fb = (volatile uint32_t *)FB32_PA;
+	return fb32_after == (uint32_t)FB32_PA;
 }
 
 static void colour_bars(void)
@@ -395,14 +453,55 @@ static uint32_t be32(uintptr_t a)
 	return __builtin_bswap32(*(volatile uint32_t *)a);
 }
 
+/* ---- XNU loader (PAYLOAD=... build.sh) ---- */
+
+/* payload.S (build.sh): the SWEETXNU payload linked into this Image, or nothing. */
+extern const char k88_payload[];
+extern const uint64_t k88_payload_size;
+
+/* LK turns the caches off before the jump; clean+invalidate anyway, as on the A8. */
+void loader_hook_dst(uintptr_t pa, uint64_t len)
+{
+	uint64_t line = 4u << ((rsr("ctr_el0") >> 16) & 0xf);
+
+	for (uintptr_t a = pa & ~(line - 1); a < pa + len; a += line)
+		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void k88_boot_xnu(int fb32)
+{
+	con_str("K88 SHIM", "xnu loader");
+	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
+	con_hex2("FB32", "ok=", fb32, "pa=", fb_pa);
+	con_hex2("PAYLOAD", "at=", (uintptr_t)k88_payload, "size=", (uint32_t)k88_payload_size);
+	const char *why = loader_boot_payload((uintptr_t)k88_payload, (uintptr_t)k88_payload + k88_payload_size);
+	con_str("LOADER", why);
+	finish();
+}
+
 void k88_main(uintptr_t dtb)
 {
 	uint64_t s = 0;
+	int fb32;
 
 	log_init();
 	con_tee("K88 SHIM started\n");
 	find_scanout();
+	/* the scanout as LK left it, before we change it */
+	if (fb_pipe >= 0) {
+		uintptr_t p = MDSS_BASE + pipe_off[fb_pipe % 4];
+		char line[] = "LKPIPE n";
+
+		line[7] = '0' + fb_pipe;
+		con_tee(line);
+		con_hex2(" ", "size=", mmio32(p + SSPP_SRC_SIZE), "out=", mmio32(p + SSPP_OUT_SIZE));
+		con_hex2(" ", "xy=", mmio32(p + SSPP_SRC_XY), "op=", mmio32(p + SSPP_SRC_OP_MODE));
+	}
+	fb32 = scanout_32bpp();
 	con_clear(BLUE);
+	if (k88_payload_size)
+		k88_boot_xnu(fb32);
 	colour_bars();	/* expected left to right: red, green, blue, white */
 	con_str("K88 SHIM", "milestone 1+2");
 	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
@@ -414,6 +513,8 @@ void k88_main(uintptr_t dtb)
 	con_hex2("BOOT", "dtb=", dtb, "initrd=", s);
 	con_hex2("DTB", "magic=", dtb ? be32(dtb) : 0, "size=", dtb ? be32(dtb + 4) : 0);
 	con_hex2("FB", "pa=", fb_pa, "stride=", fb_stride);
+	con_hex2("FB32", "ok=", fb32, "ctl=", fb32_ctl);
+	con_hex2(" addr", "was=", fb32_before, "now=", fb32_after);
 	k88_present();
 	for (int i = 0; i < 8; i++) {
 		char label[] = "P0";
