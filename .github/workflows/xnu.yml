@@ -160,7 +160,7 @@ jobs:
           python3 -I tools/mkadt.py out/k88.adt --device k88
           # no root device yet (SDHCI driver to come): the boot waits for root;
           # sweetreboot=120 comes back to TWRP with the console in ramoops
-          python3 -I tools/mkpayload.py "$k" out/k88.adt out/xnu-k88.payload --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetreboot=120 sweetfb_fit=1'
+          python3 -I tools/mkpayload.py "$k" out/k88.adt out/xnu-k88.payload --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 sweetreboot=120 sweetfb_fit=1 rd=ufsroot0'
           ls -l out/k88.adt out/xnu-k88.payload
 
       - uses: actions/upload-artifact@v4

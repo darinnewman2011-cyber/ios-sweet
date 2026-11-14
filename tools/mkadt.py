@@ -90,6 +90,9 @@ K88_CORES = ([(m, 'arm,cortex-a53', 1497600000) for m in (0x100, 0x101, 0x102, 0
 # 20 MiB splash carve-out at 0x83000000).
 K88_FB_W, K88_FB_H = 800, 1280
 K88_FB_PHYS = 0x83400000
+# eMMC: Qualcomm SDHCI (sdhci-msm), standard registers at hc 0x07824900 (core 0x07824000);
+# shim/k88 read HOST_VERSION 0x4702 there. bsd/dev/sweet_ufs.c (0137) drives it by PIO.
+K88_MMC, K88_MMC_SIZE = 0x07824900, 0x100
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -293,6 +296,12 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
             ('compatible', cstr('samsung,exynos7885-dw-mshc-smu')),
             ('reg', u64(JP_MMC, JP_MMC_SIZE)),
         ])
+    if k88:
+        ufs = node('sweet-mmc', [
+            ph(),
+            ('compatible', cstr('qcom,sdhci-msm-v4')),
+            ('reg', u64(K88_MMC, K88_MMC_SIZE)),
+        ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -328,8 +337,6 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
     if k88:
         compat = (cstr('D22AP') + cstr('iPhone10,3') + cstr('zte,k88') +
                   cstr('qcom,msm8952') + cstr('xiaomi,sweet') + cstr('AppleARM'))
-    # k88: no storage node yet. Without /sweet-mmc, bsd/dev/sweet_ufs.c stops before
-    # touching any hardware (its A8 path drives a DW-MSHC; the K88 has an SDHCI).
     return node('device-tree', [
         ph(),
         ('compatible', compat),
@@ -339,7 +346,7 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or k88 else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
 
 
 def _opt(name):
