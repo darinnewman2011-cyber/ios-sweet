@@ -9,3 +9,4 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 shim/a8/out/
+shim/k88/out/
