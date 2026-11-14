@@ -108,7 +108,7 @@ index 3817f6a..ab6d6de 100644
  	(void)PE_parse_boot_argn("a8battery", &real, sizeof(real));
  	fReal = real != 0 && sweet_a8_power_init() == 0;
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 217f968..0806dbb 100644
+index 217f968..23ad0f6 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
 @@ -67,6 +67,11 @@ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
@@ -123,6 +123,17 @@ index 217f968..0806dbb 100644
  else
  MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
  endif
+@@ -348,7 +353,9 @@ endif
+ # SWEET_BOARD=jackpotlte: 4K pages and __ARM64_PMAP_SUBPAGE_L1__ give a 38-bit
+ # kernel VA (T1SZ_BOOT 26, TTBR1 from 0xffffffc000000000), which cannot reach
+ # the -2 TB ARM_LARGE_MEMORY layout: use the iOS 4K layout instead.
+-ifeq ($(SWEET_BOARD),jackpotlte)
++# (k88 too: same 4K kernel. Run 43559578563 missed this and linked k88 at
++# 0xfffffe0006000000, which faulted right after the shim's jump.)
++ifneq ($(filter $(SWEET_BOARD),jackpotlte k88),)
+ LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
+ ARM64_PLKSEG_ADDR  =0xfffffff004004000
+ ARM64_LINK_ADDR    =0xfffffff007004000
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index 8ccd704..961b4be 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
