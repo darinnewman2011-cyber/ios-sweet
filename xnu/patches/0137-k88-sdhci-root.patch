@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b320302..317d217 100644
+index b320302..97698b8 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -361,8 +361,8 @@ ufs_sync_cache(void)
@@ -21,7 +21,7 @@ index b320302..317d217 100644
  /* One command; returns RINTSTS, or UINT32_MAX if the CIU never took it. */
  static uint32_t
  mmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
-@@ -723,6 +724,449 @@ ufs_sync_cache(void)
+@@ -723,6 +724,456 @@ ufs_sync_cache(void)
  	return 0;
  }
  
@@ -399,10 +399,17 @@ index b320302..317d217 100644
 +{
 +	uint32_t resp = 0, st = mmc_cmd(idx, arg, CMDR_RESP_48B | CMDR_CRC | CMDR_INDEX, 0, &resp);
 +	if (st == UINT32_MAX || (st & INT_ERR) || (resp & R1_ERRORS)) {
++		printf("SWEET MMC: CMD%u 0x%x: int 0x%x r1 0x%x" "
++", idx, arg, st, resp);
 +		mmc_abort();
 +		return false;
 +	}
-+	(void)mmc_wait(HC_PRESENT, PRES_DAT0, PRES_DAT0, MMC_DATA_NS);
++	/*
++	 * The end of the card's busy period is transfer complete (as shim/k88
++	 * waits for it); DAT0 alone can still read high before busy starts.
++	 */
++	st = hc_wait_int(INT_XFER_COMPLETE, 4 * MMC_DATA_NS);
++	(void)mmc_wait(HC_PRESENT, PRES_DAT0 | PRES_DAT_INHIBIT, PRES_DAT0, MMC_DATA_NS);
 +	ufs_wr(HC_INT, 0xffffffff);
 +	return true;
 +}
@@ -471,7 +478,7 @@ index b320302..317d217 100644
  /*
   * File-backed root (boot-arg sweetrootino=N): the iOS root is a plain file in
   * Android's ext4 USERDATA (/data/sweet/root.img, created from TWRP outside the
-@@ -1380,6 +1824,47 @@ ufs_find_partition(const char *want)
+@@ -1380,6 +1831,47 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
@@ -519,7 +526,7 @@ index b320302..317d217 100644
  #if !defined(SWEET_JACKPOTLTE)
  static int
  ufs_take_over_host(void)
-@@ -1414,7 +1899,7 @@ ufs_take_over_host(void)
+@@ -1414,7 +1906,7 @@ ufs_take_over_host(void)
  	}
  	return 0;
  }
@@ -528,7 +535,7 @@ index b320302..317d217 100644
  static int
  ufs_take_over_host(void)
  {
-@@ -1658,7 +2143,11 @@ sweet_ufs_init(void)
+@@ -1658,7 +2150,11 @@ sweet_ufs_init(void)
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
  #if defined(SWEET_JACKPOTLTE)
@@ -540,7 +547,7 @@ index b320302..317d217 100644
  	const char *node_path = "/sweet-mmc";
  #else
  	char want[64] = "userdata";
-@@ -1708,6 +2197,11 @@ sweet_ufs_init(void)
+@@ -1708,6 +2204,11 @@ sweet_ufs_init(void)
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -552,7 +559,7 @@ index b320302..317d217 100644
  #if defined(SWEET_JACKPOTLTE)
  	uint32_t rootino = 0;
  	uint64_t part_blocks = su.nblocks;      /* USERDATA's size, before su.nblocks becomes the file's */
-@@ -1783,8 +2277,10 @@ sweet_ufs_init(void)
+@@ -1783,8 +2284,10 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_usb_probe();
  #else
