@@ -1,6 +1,6 @@
 # Porting ios-sweet to the ZTE K88 tablet (`jasmine`, MSM8952 / Snapdragon 617)
 
-Status (2026-11-13): **facts gathered; diagnostic shim runs on the tablet (diag3): EL1, GICv2 virtual-timer IRQs, PSCI
+Status (2026-11-13): **facts gathered; diagnostic shim runs on the tablet and shows text on the panel (diag3): EL1, GICv2 virtual-timer IRQs, PSCI
 CPU_ON for all 8 cores verified.** Test images are written to `boot` from TWRP; Android's boot image is backed up.
 
 The plan reuses the Galaxy A8 work (`docs/PORTING_JACKPOTLTE.md`, `docs/HANDOFF_JACKPOTLTE.md`): the 4K-page,
@@ -99,8 +99,8 @@ Runs (2026-11-13, images out of git; logs in `backup/k88/runs/`):
 - **diag3** (`b21167fc…e052`): byte stores when the scanout is unaligned, no nested faults, the log starts 16 KiB in.
   **All of the following ran without a fault**, back in TWRP after about 45 s, values in the table above:
   EL1 on `0x100`, 30 vtimer IRQs on INTID 20, SGI, PSCI `0x00010000`, CPU_ON returns 0 for all seven and the alive
-  mask is `0xEF` (= want; bit 4 is the boot CPU), SDHCI dump. Whether the text was readable on the panel: ask Darin
-  (BMP data is often stored bottom-up, so the picture may be upside down).
+  mask is `0xEF` (= want; bit 4 is the boot CPU), SDHCI dump. **Darin: the blue text screen was readable on the panel**
+  (so the orientation is right; the colour-bar order was not reported).
 
 ### Running it (needs Darin's OK: it writes the boot partition)
 
@@ -118,8 +118,8 @@ Runs (2026-11-13, images out of git; logs in `backup/k88/runs/`):
 
 1. ~~Facts over adb~~ (done, this file). Follow-up: dump the live FDT from booted Android (`/proc/device-tree` there)
    to see LK's memory/reserved-memory patches.
-2. ~~Run the diagnostic shim~~ (diag3: EL, boot MPIDR, scanout, vtimer, PSCI/SMP, SDHCI all settled). Open: whether the
-   picture is upside down (BMP rows) and the colour order.
+2. ~~Run the diagnostic shim~~ (diag3: EL, boot MPIDR, scanout, vtimer, PSCI/SMP, SDHCI all settled). Text readable on the
+   panel (Darin). Still open: the colour-bar order (red, green, blue, white expected).
 3. `tools/mkadt.py --device k88`: GICv2 at `0xB000000`, 8 CPUs, 19.2 MHz, vtimer 20, DRAM bank, framebuffer, `sweet-mmc`
    (SDHCI) node, `zte,k88`/`qcom,msm8952` compatibles.
 4. XNU: `board=k88` in `xnu.yml` (same 4K/ARMv8.0 paths as jackpotlte, new board constants: FB, MPIDRs, vtimer, RAM
