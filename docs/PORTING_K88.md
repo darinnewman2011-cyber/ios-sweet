@@ -126,6 +126,14 @@ Runs:
   `PHYS base=A0000000`, **`VIRT FFFFFE0006000000`**, JUMP `0xA1435488`. The kernel was linked with the macOS
   ARM_LARGE_MEMORY layout: 0087's iOS layout block in `MakeInc.def` tested `SWEET_BOARD == jackpotlte` only. Fixed in
   0136 (commit 85cf634, CI run 43567778533).
+- **xnu2** (CI run 43567778533, kernel `1e78d723…5d34`, ISA 0; boot image `f91f7c89…`): **XNU boots on the K88.** Darwin
+  banner, VM bootstrap, IOKit (platform expert, AKS, WDT, SURF, HID, static battery), `SWEET FB: AppleCLCD 800x1280 stride
+  3200 at 0x83400000 … presented as 1125x2436`, `SWEET CPU: cpu=0 mpidr=0x100 came alive; SGI1 OK`, all of bsd_init, then
+  `Waiting on … IOMedia … Apple_HFS` (no root device yet). Heartbeat every 5 s; back in TWRP by itself at 120 s
+  (sweetreboot), log in ramoops. Darin: text visible but "zoomed in" (the iPhone frame centre-cropped to 800x1280).
+- **xnu3** (same kernel, local payload with `sweetfb_fit=1` added; boot image `1bc9153e…255c`): `SWEET FB: fit: the
+  1125x2436 picture shown at 591x1280 from 104,0`; otherwise the same as xnu2. xnu.yml's K88 cmdline now carries
+  `sweetfb_fit=1`.
 - A forced power-off (power ~10 s) keeps most of DRAM: the RAM log survives with some bit errors.
 
 ### Running it (needs Darin's OK: it writes the boot partition)
@@ -148,7 +156,7 @@ Runs:
    panel (Darin). Still open: the colour-bar order (red, green, blue, white expected).
 3. `tools/mkadt.py --device k88`: GICv2 at `0xB000000`, 8 CPUs, 19.2 MHz, vtimer 20, DRAM bank, framebuffer, `sweet-mmc`
    (SDHCI) node, `zte,k88`/`qcom,msm8952` compatibles.
-4. XNU: `board=k88` in `xnu.yml` (same 4K/ARMv8.0 paths as jackpotlte, new board constants: FB, MPIDRs, vtimer, RAM
+4. ~~XNU boots to the root wait (xnu2/xnu3)~~. XNU: `board=k88` in `xnu.yml` (same 4K/ARMv8.0 paths as jackpotlte, new board constants: FB, MPIDRs, vtimer, RAM
    bank). Check the ISA count stays 0. The A53 here has the crypto extension, but the A8 settings (C SHA2) are safe.
 5. Shim milestone 3: SDHCI read-only PIO (CMD13/CMD17), find GPT `userdata`; then milestone 4, the XNU loader with
    the payload linked in (`boot` is 48 MiB, plenty).
