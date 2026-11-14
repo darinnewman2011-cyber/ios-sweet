@@ -92,7 +92,7 @@ K88_FB_W, K88_FB_H = 800, 1280
 K88_FB_PHYS = 0x83400000
 # eMMC: Qualcomm SDHCI (sdhci-msm), standard registers at hc 0x07824900 (core 0x07824000);
 # shim/k88 read HOST_VERSION 0x4702 there. bsd/dev/sweet_ufs.c (0137) drives it by PIO.
-K88_MMC, K88_MMC_SIZE = 0x07824900, 0x100
+K88_MMC, K88_MMC_SIZE = 0x07824900, 0x200   # hc_mem incl. the vendor registers at +0x10c/+0x11c
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from

@@ -6,7 +6,7 @@
  *      stride, format), colour bars;
  *   2. GICv2 (qcom,msm-qgic2) virtual-timer and SGI interrupts, PSCI version,
  *      PSCI CPU_ON for the other seven Cortex-A53s;
- *   3. read-only register dump of the eMMC host (sdhci-msm), no commands sent.
+ *   3. eMMC host (sdhci-msm): register dump, then SDHCI mode on, card found/woken, two sectors read.
  * Booted with `fastboot boot` (nothing is flashed). Any unexpected exception
  * paints a red screen with ESR/ELR/FAR.
  *
@@ -109,6 +109,7 @@ static const uint32_t ctl_off[3] = { 0x2000, 0x2200, 0x2400 };
 #define SDCORE_BASE	0x07824000UL
 
 extern char secondary_entry[];
+
 
 static volatile uint32_t irq_count, irq_other, irq_last, irq_src;
 static volatile uint64_t sec_mpidr[12];
@@ -448,6 +449,226 @@ static void test_smp(void)
 
 /* ---- main ---- */
 
+/*
+ * Milestone 3: eMMC read through sdhci-msm. LK's exit path leaves HC_MODE
+ * (core + 0x78) at 0, i.e. the controller in its legacy mode (diag3/4), and
+ * may have put the card to sleep (CMD7 deselect, CMD5). Enable SDHCI mode,
+ * find the card by CMD13, wake it with CMD5 + CMD7 if needed, read sectors.
+ */
+#define HC(o)		(SDHC_BASE + (o))
+#define R48		0x1aU	/* 48-bit response, CRC and index check */
+#define R48B		0x1bU	/* with busy */
+
+static uint32_t sd_wait(uint32_t mask, unsigned ms)
+{
+	uint64_t end = now() + ticks_per_sec() / 1000 * ms;
+	uint32_t st;
+
+	while (!((st = mmio32(HC(0x30))) & (mask | 0x8000U)))
+		if (now() > end)
+			return 0;
+	return st;
+}
+
+static void sd_reset(void)
+{
+	wr8(HC(0x2f), 6);
+	for (int i = 0; i < 1000 && (mmio32(HC(0x2c)) & 0x06000000U); i++)
+		delay_ms(1);
+	wr32(HC(0x30), 0xffffffffU);
+}
+
+/* returns the interrupt status (0 = no response), *r = RESP0 */
+static uint32_t sd_cmd(uint32_t idx, uint32_t arg, uint32_t cmdr, uint32_t xfer, uint32_t *r)
+{
+	uint32_t st;
+
+	for (int i = 0; i < 100 && (mmio32(HC(0x24)) & 3); i++)
+		delay_ms(1);
+	wr32(HC(0x30), 0xffffffffU);
+	wr32(HC(0x08), arg);
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(HC(0x0c), ((idx << 8 | cmdr) << 16) | xfer);
+	st = sd_wait(1, 100);
+	*r = mmio32(HC(0x10));
+	if (!st || (st & 0x8000U)) {
+		uint32_t e = st;
+		sd_reset();
+		return e ? e : 0;
+	}
+	if ((cmdr & 3) == 3) {	/* busy: wait for transfer complete (DAT0 released) */
+		sd_wait(2, 1000);
+	}
+	wr32(HC(0x30), 3);
+	return st;
+}
+
+/* one sector; returns 0 on success */
+static int sd_read(uint32_t lba, uint32_t *buf)
+{
+	uint32_t r, st;
+
+	wr32(HC(0x04), (1U << 16) | 512);
+	st = sd_cmd(17, lba, R48 | 0x20U, 0x10U, &r);
+	if (!(st & 1))
+		return 1;
+	st = sd_wait(0x20, 500);
+	if (!(st & 0x20) || (st & 0x8000U)) {
+		con_hex2(" rd", "int=", st, "pst=", mmio32(HC(0x24)));
+		sd_reset();
+		return 2;
+	}
+	wr32(HC(0x30), 0x20);
+	for (int i = 0; i < 128; i++)
+		buf[i] = mmio32(HC(0x20));
+	st = sd_wait(2, 500);
+	wr32(HC(0x30), 0xffffffffU);
+	return (st & 2) ? 0 : 3;
+}
+
+/*
+ * sdhci-msm ignores the SDHCI clock divider: the card clock is GCC's SDCC1
+ * apps clock (RCG at 0x1842004, MSM8916/8952 GCC layout). Rates as in the
+ * GCC frequency tables: 400 kHz = XO 19.2 MHz / 12 * 1/4 (M/N), 50 MHz =
+ * GPLL0 800 MHz / 16.
+ */
+#define GCC_SDCC1_CMD	0x01842004UL
+#define GCC_SDCC1_CFG	0x01842008UL
+#define GCC_SDCC1_M	0x0184200cUL
+#define GCC_SDCC1_N	0x01842010UL
+#define GCC_SDCC1_D	0x01842014UL
+#define GCC_SDCC1_CBCR	0x01842018UL
+
+static void sd_rate(int fast)
+{
+	wr32(HC(0x2c), mmio32(HC(0x2c)) & ~4U);		/* SD clock off while switching */
+	if (fast) {
+		wr32(GCC_SDCC1_CFG, (1U << 8) | 31);		/* GPLL0, /16, no M/N */
+	} else {
+		wr32(GCC_SDCC1_M, 1);
+		wr32(GCC_SDCC1_N, ~(4U - 1) & 0xff);
+		wr32(GCC_SDCC1_D, ~4U & 0xff);
+		wr32(GCC_SDCC1_CFG, (2U << 12) | (0U << 8) | 23);	/* dual edge M/N, XO, /12 */
+	}
+	wr32(GCC_SDCC1_CMD, mmio32(GCC_SDCC1_CMD) | 1);	/* UPDATE */
+	for (int i = 0; i < 100 && (mmio32(GCC_SDCC1_CMD) & 1); i++)
+		delay_ms(1);
+	wr32(HC(0x2c), mmio32(HC(0x2c)) | 4);
+	delay_ms(2);
+	con_hex2(" rate", "cmd=", mmio32(GCC_SDCC1_CMD), "cfg=", mmio32(GCC_SDCC1_CFG));
+}
+
+/* acknowledge sdhci-msm power-control requests (core PWRCTL status 0xdc, clear 0xe4, ctl 0xe8) */
+static void sd_pwrack(const char *what)
+{
+	uint32_t ps = 0;
+
+	for (int i = 0; i < 50 && !(ps = mmio32(SDCORE_BASE + 0xdc)); i++)
+		delay_ms(1);
+	if (ps) {
+		wr32(SDCORE_BASE + 0xe4, ps);
+		wr32(SDCORE_BASE + 0xe8, ((ps & 3) ? 1 : 0) | ((ps & 0xc) ? 4 : 0));
+	}
+	con_hex2(" pwrack", what, 0, "st=", ps);
+}
+
+static void test_mmc(void)
+{
+	static uint32_t sec[128];
+	uint32_t r = 0, st, rca = 0;
+
+	con_hex2("MMC", "mode=", mmio32(SDCORE_BASE + 0x78), "pst=", mmio32(HC(0x24)));
+	con_hex2(" vend", "spec=", mmio32(HC(0x10c)), "pwrst=", mmio32(SDCORE_BASE + 0xdc));
+	wr32(HC(0x10c), 0xa1c);			/* VENDOR_SPECIFIC_FUNC default, as LK's sdhci_msm_init */
+	/* as LK's sdhci_mode_enable + sdhci_init: HC mode, FF_CLK_SW_RST_DIS, power IRQs, reset all */
+	wr32(SDCORE_BASE + 0x78, mmio32(SDCORE_BASE + 0x78) | 1 | (1U << 13));
+	wr32(SDCORE_BASE + 0xe0, 0xf);
+	delay_ms(2);
+	wr8(HC(0x2f), 1);				/* SOFT_RESET_ALL */
+	for (int i = 0; i < 100 && (mmio32(HC(0x2c)) & 0x01000000U); i++)
+		delay_ms(1);
+	sd_pwrack("rst");
+	wr32(HC(0x11c), mmio32(HC(0x40)) | (1U << 26));	/* VENDOR_CAPABILITIES0: 1.8 V */
+	con_hex2(" caps", "cap=", mmio32(HC(0x40)), "spec=", mmio32(HC(0x10c)));
+	wr32(HC(0x38), 0);				/* polled */
+	wr32(HC(0x34), 0x03ff0033U);
+	wr32(HC(0x30), 0xffffffffU);
+	wr8(HC(0x29), 0x0b);				/* bus power on, 1.8 V */
+	sd_pwrack("on");
+	wr8(HC(0x28), 0);				/* 1-bit, normal speed, no DMA */
+	wr32(HC(0x3c), mmio32(HC(0x3c)) & 0x0000ffffU);	/* HOST_CTRL2 0 */
+	con_hex2(" gcc", "cfg=", mmio32(GCC_SDCC1_CFG), "cbcr=", mmio32(GCC_SDCC1_CBCR));
+	wr32(HC(0x2c), (0x0eU << 16) | 1);			/* internal clock, timeout */
+	for (int i = 0; i < 100 && !(mmio32(HC(0x2c)) & 2); i++)
+		delay_ms(1);
+	sd_rate(0);
+	con_hex2(" hc", "pwr=", mmio32(HC(0x28)), "clk=", mmio32(HC(0x2c)));
+	con_hex2(" pst", "pst=", mmio32(HC(0x24)), "ctl2=", mmio32(HC(0x3c)));
+	for (uint32_t a = 1; a <= 3 && !rca; a++) {
+		st = sd_cmd(13, a << 16, R48, 0, &r);
+		con_hex2(" CMD13", "int=", st, "r1=", r);
+		if ((st & 1) && !(st & 0x8000U) && ((r >> 9) & 15) == 4)
+			rca = a;
+	}
+	for (uint32_t a = 1; a <= 3 && !rca; a++) {
+		st = sd_cmd(5, a << 16, R48B, 0, &r);	/* awake: bit 15 = 0 */
+		con_hex2(" CMD5", "int=", st, "r1=", r);
+		if (!(st & 1) || (st & 0x8000U))
+			continue;
+		st = sd_cmd(7, a << 16, R48B, 0, &r);
+		con_hex2(" CMD7", "int=", st, "r1=", r);
+		st = sd_cmd(13, a << 16, R48, 0, &r);
+		con_hex2(" CMD13", "int=", st, "r1=", r);
+		if ((st & 1) && !(st & 0x8000U) && ((r >> 9) & 15) == 4)
+			rca = a;
+	}
+	if (!rca) {
+		/* full init: CMD0, CMD1 until ready, CMD2, CMD3 (RCA 1), CMD7 */
+		uint32_t ocr = 0;
+		wr8(HC(0x28), mmio32(HC(0x28)) & ~0x22U);	/* 1-bit bus */
+		st = sd_cmd(0, 0, 0, 0, &r);
+		con_hex2(" CMD0", "int=", st, 0, 0);
+		delay_ms(2);
+		for (int i = 0; i < 1000; i++) {
+			st = sd_cmd(1, 0x40ff8080U, 0x02, 0, &ocr);
+			if ((st & 1) && (ocr & 0x80000000U))
+				break;
+			delay_ms(1);
+		}
+		con_hex2(" CMD1", "int=", st, "ocr=", ocr);
+		st = sd_cmd(2, 0, 0x09, 0, &r);
+		con_hex2(" CMD2", "int=", st, "cid=", r);
+		st = sd_cmd(3, 1U << 16, R48, 0, &r);
+		con_hex2(" CMD3", "int=", st, "r1=", r);
+		st = sd_cmd(7, 1U << 16, R48B, 0, &r);
+		con_hex2(" CMD7", "int=", st, "r1=", r);
+		st = sd_cmd(13, 1U << 16, R48, 0, &r);
+		con_hex2(" CMD13", "int=", st, "r1=", r);
+		if ((st & 1) && !(st & 0x8000U) && ((r >> 9) & 15) == 4)
+			rca = 1;
+	}
+	if (rca) {
+		/* high speed (EXT_CSD[185] = 1) first: the card may still be in HS200; then 8-bit, 50 MHz */
+		st = sd_cmd(6, (3U << 24) | (185U << 16) | (1U << 8), R48B, 0, &r);
+		con_hex2(" HS", "int=", st, "r1=", r);
+		st = sd_cmd(6, (3U << 24) | (183U << 16) | (2U << 8), R48B, 0, &r);
+		con_hex2(" W8", "int=", st, "r1=", r);
+		wr8(HC(0x28), 0x24);			/* 8-bit, high speed */
+		sd_rate(1);
+		st = sd_cmd(13, rca << 16, R48, 0, &r);
+		con_hex2(" CMD13", "int=", st, "r1=", r);
+	}
+	con_hex2("MMC", "rca=", rca, "clk=", mmio32(HC(0x2c)));
+	if (!rca)
+		return;
+	st = sd_read(1, sec);
+	con_hex2(" LBA1", "err=", st, "w0=", sec[0]);
+	con_hex2(" ", "w1=", sec[1], "parts=", sec[20]);
+	st = sd_read(1179648 + 2, sec);	/* the iOS root's HFS+ volume header (k88push.py) */
+	con_hex2(" HFS", "err=", st, "sig=", sec[0]);
+	con_hex2(" ", "blksz=", sec[10], "blocks=", sec[11]);
+}
+
 static uint32_t be32(uintptr_t a)
 {
 	return __builtin_bswap32(*(volatile uint32_t *)a);
@@ -535,6 +756,9 @@ void k88_main(uintptr_t dtb)
 	con_hex2("SDHC2", "ctl=", mmio32(SDHC_BASE + 0x28), "clk=", mmio32(SDHC_BASE + 0x2c));
 	con_hex2("SDHC3", "ctl2=", mmio32(SDHC_BASE + 0x3c), "cap=", mmio32(SDHC_BASE + 0x40));
 	con_hex2("SDCORE", "mode=", mmio32(SDCORE_BASE + 0x78), "ver=", mmio32(SDCORE_BASE + 0x50));
+	k88_present();
+	test_mmc();
+	k88_present();
 	finish();
 }
 

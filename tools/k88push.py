@@ -54,7 +54,17 @@ with open(src, 'rb') as f:
     f.seek(start_mb * MB)
     pos = start_mb * MB
     while pos < size:
-        data = f.read(min(CHUNK, size - pos))
+        for attempt in range(5):
+            try:
+                f.seek(pos)
+                data = f.read(min(CHUNK, size - pos))
+                break
+            except OSError as e:        # the \wsl.localhost share sometimes fails a read
+                print(f'read at {pos // MB} MiB failed ({e}), retrying', flush=True)
+                f.close()
+                f = open(src, 'rb')
+        else:
+            raise SystemExit(f'cannot read the image at {pos // MB} MiB')
         mb, n = pos // MB, len(data) // MB
         seek = seek0 + mb
         if data == zero[:len(data)]:
