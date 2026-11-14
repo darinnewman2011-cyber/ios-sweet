@@ -134,6 +134,21 @@ Runs:
 - **xnu3** (same kernel, local payload with `sweetfb_fit=1` added; boot image `1bc9153e…255c`): `SWEET FB: fit: the
   1125x2436 picture shown at 591x1280 from 104,0`; otherwise the same as xnu2. xnu.yml's K88 cmdline now carries
   `sweetfb_fit=1`.
+- **Root disk (2026-11-14, Darin agreed to give cache, system and userdata to iOS):** the three partitions are back to back
+  (sectors 1179648..30535646, 14.0 GiB). The GPT is unchanged; xnu 0137 uses that range as the root device. The 13 GiB
+  `ios16-root-base.img` was written there with `tools/k88push.py` (64 MiB chunks, each read back and MD5-checked; `adb
+  exec-in` mangles binary data on this TWRP, so chunks go through `/tmp`). The system partition was saved first to WSL
+  `/opt/sweet/k88-system.img` (MD5 `0c4cead6…`). Android no longer boots; TWRP still does.
+- **eMMC hand-over (shim diag5-11):** LK's exit (`target_uninit`: `mmc_put_card_to_sleep`, `sdhci_mode_disable`) leaves
+  HC_MODE 0, its HS400 vendor setting (hc+0x10c `0x358B1C`), the GCC SDCC1 clock at the HS200 rate (cfg `0x205`) and the
+  card asleep at RCA 2. What works (diag11, then xnu 0137): vendor function `0xA1C`, HC_MODE_EN + FF_CLK_SW_RST_DIS,
+  reset all, PWRCTL requests acknowledged (core 0xdc/0xe4/0xe8), bus power `0x0B`, 400 kHz from GCC (the SDHCI divider
+  is ignored), CMD5 + CMD7 wake at RCA 2, CMD6 high speed + 8-bit, 50 MHz. Reads: GPT header, the root's HFSX header.
+- **ios1/ios2:** the old take-over (no HC_MODE) found no card; ios2 woke it but CMD6 was sent while the card was busy.
+- **ios3** (CI run 43628758157, kernel `ca0b1314…`, boot image `716c94f4…`, `rd=ufsroot0 sweetramrw=1 sweetreboot=240`):
+  **iOS 16 userland runs on the K88.** The root mounts from the eMMC, launchd runs all boot tasks, 284 `exec`s,
+  SpringBoard and backboardd start (backboardd looks for Pearl/SEP, opens AppleKeyStore). No panic in 240 s, then back
+  to TWRP. Writes stay in RAM (sweetramrw), so nothing on the eMMC changed.
 - A forced power-off (power ~10 s) keeps most of DRAM: the RAM log survives with some bit errors.
 
 ### Running it (needs Darin's OK: it writes the boot partition)
