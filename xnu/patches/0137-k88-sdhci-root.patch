@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b320302..68a136f 100644
+index b320302..715edb3 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -361,8 +361,8 @@ ufs_sync_cache(void)
@@ -349,7 +349,7 @@ index b320302..68a136f 100644
  /*
   * File-backed root (boot-arg sweetrootino=N): the iOS root is a plain file in
   * Android's ext4 USERDATA (/data/sweet/root.img, created from TWRP outside the
-@@ -1380,6 +1702,49 @@ ufs_find_partition(const char *want)
+@@ -1380,6 +1702,47 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
@@ -376,8 +376,7 @@ index b320302..68a136f 100644
 +	}
 +	uint64_t end = su.first_block + su.nblocks;
 +	if (su.first_block < first + cache_blocks) {
-+		printf("SWEET ROOT: userdata (0x%llx) is not after cache (0x%llx)
-+", su.first_block, first);
++		printf("SWEET ROOT: userdata (0x%llx) is not after cache (0x%llx)\n", su.first_block, first);
 +		return ENXIO;
 +	}
 +	su.first_block = first;
@@ -390,8 +389,7 @@ index b320302..68a136f 100644
 +	xf.run = &k88_run;
 +	xf.nrun = 1;
 +	su.nblocks = xf.size / UFS_BLOCK;
-+	printf("SWEET ROOT: cache..userdata, sectors 0x%llx-0x%llx, %llu MiB
-+", first, end - 1, xf.size >> 20);
++	printf("SWEET ROOT: cache..userdata, sectors 0x%llx-0x%llx, %llu MiB\n", first, end - 1, xf.size >> 20);
 +	return 0;
 +}
 +#endif
@@ -399,7 +397,7 @@ index b320302..68a136f 100644
  #if !defined(SWEET_JACKPOTLTE)
  static int
  ufs_take_over_host(void)
-@@ -1414,7 +1779,7 @@ ufs_take_over_host(void)
+@@ -1414,7 +1777,7 @@ ufs_take_over_host(void)
  	}
  	return 0;
  }
@@ -408,7 +406,7 @@ index b320302..68a136f 100644
  static int
  ufs_take_over_host(void)
  {
-@@ -1658,7 +2023,11 @@ sweet_ufs_init(void)
+@@ -1658,7 +2021,11 @@ sweet_ufs_init(void)
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
  #if defined(SWEET_JACKPOTLTE)
@@ -420,7 +418,7 @@ index b320302..68a136f 100644
  	const char *node_path = "/sweet-mmc";
  #else
  	char want[64] = "userdata";
-@@ -1708,6 +2077,11 @@ sweet_ufs_init(void)
+@@ -1708,6 +2075,11 @@ sweet_ufs_init(void)
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -432,7 +430,7 @@ index b320302..68a136f 100644
  #if defined(SWEET_JACKPOTLTE)
  	uint32_t rootino = 0;
  	uint64_t part_blocks = su.nblocks;      /* USERDATA's size, before su.nblocks becomes the file's */
-@@ -1783,8 +2157,10 @@ sweet_ufs_init(void)
+@@ -1783,8 +2155,10 @@ sweet_ufs_init(void)
  	sweet_touch_init();
  	sweet_usb_probe();
  #else
