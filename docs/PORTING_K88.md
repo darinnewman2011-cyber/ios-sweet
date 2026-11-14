@@ -102,6 +102,32 @@ Runs (2026-11-13, images out of git; logs in `backup/k88/runs/`):
   mask is `0xEF` (= want; bit 4 is the boot CPU), SDHCI dump. **Darin: the blue text screen was readable on the panel**
   (so the orientation is right; the colour-bar order was not reported).
 
+- **diag4** (`61a3f61f…d3d1`): the shim points the MDSS RGB0 pipe at a 32 bpp XRGB8888 buffer at `0x83400000`
+  (SRC_FORMAT `0x000236FF`, UNPACK `0x03020001`, stride 3200, CTL0 at `0x01A02000` FLUSH bit 3). The pipe took the
+  address (`0x83200036` → `0x83400000`) and Darin saw the text normally. LK's pipe: SRC_SIZE = OUT_SIZE `0x05000320`
+  (800 × 1280, full screen), SRC_XY 0, OP_MODE 0 (no flip). This is the buffer XNU's console uses (`SWEET_FB_PA`).
+
+## XNU on the K88 (board `k88`)
+
+- xnu patch `0136-k88-board.patch`: `SWEET_BOARD=k88` builds the A8's kernel (`SWEET_JACKPOTLTE`) plus `SWEET_K88`:
+  MPIDRs (boot `0x100`), `SWEET_FB_PA 0x83400000` 800 × 1280 without the DECON trigger, vtimer 20, battery driver off,
+  and the ramoops/TWRP channel on the K88's console zone with the IMEM + PS_HOLD reboot. Exynos drivers stay off
+  because `mkadt.py --device k88` has no `/sweet-mmc` node (sweet_ufs.c stops before touching hardware) and
+  `a8wlbt`/`sweetgpu` are not on the command line.
+- `mkadt.py --device k88`: DRAM `0xA0000000` + 1.5 GiB (minus the 1 MiB panic log), GICv2, 8 A53s, 19.2 MHz.
+- CI: pushes to the `k88` branch build `board=k88` (ISA check, `k88.adt`, `xnu-k88.payload`,
+  cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 sweetreboot=120`). Download the artifact through the signed-in browser.
+- Build: `PAYLOAD=<artifact>/xnu-k88.payload shim/k88/build.sh`, then `tools/mkqcomboot.py` (6.2 MB boot image for a
+  16.4 MB shim + kernel). Flash from TWRP with the same checks as the diag images.
+
+Runs:
+- **xnu1** (CI run 43559578563, kernel `334e7524…921b`, ISA 0; boot image `dca9da67…2889`): blank screen, never came back
+  to TWRP. After a forced power-off the ramoops zone still held the shim's log (a few flipped bits): payload loaded,
+  `PHYS base=A0000000`, **`VIRT FFFFFE0006000000`**, JUMP `0xA1435488`. The kernel was linked with the macOS
+  ARM_LARGE_MEMORY layout: 0087's iOS layout block in `MakeInc.def` tested `SWEET_BOARD == jackpotlte` only. Fixed in
+  0136 (commit 85cf634, CI run 43567778533).
+- A forced power-off (power ~10 s) keeps most of DRAM: the RAM log survives with some bit errors.
+
 ### Running it (needs Darin's OK: it writes the boot partition)
 
 0. Use the newest diag image (diag3 or later).
