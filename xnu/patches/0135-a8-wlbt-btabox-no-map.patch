@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -349,15 +349,10 @@
+ 	{
+ 		/* Stage 3b: the second window (BAAW1, BT-ABOX shared memory) Samsung's platform_mif_reset sets up next to the
+ 		 * main one; ios61's panic record shows the core in abort mode 250 ms after start without it. */
+-		vm_offset_t bt = ml_io_map(BTABOX_PA, BTABOX_SIZE);
+-
++		/* Not mapped or cleared: a second 4 MB ml_io_map panicked in kmem_alloc (ios62); the firmware does not
++		 * need the window zeroed. */
+ 		printf("SWEET A8 WLBT: 3b BT-ABOX window was CONFIG2 %#x CONFIG3 %#x; now %#x at %#x\n", rd(pmu, MEM_CONFIG2),
+ 		    rd(pmu, MEM_CONFIG3), BTABOX_SIZE, BTABOX_PA);
+-		if (bt) {
+-			for (uint32_t off = 0; off < BTABOX_SIZE; off += 4) {
+-				wr(bt, off, 0);
+-			}
+-		}
+ 		wr(pmu, MEM_CONFIG3, (BTABOX_PA & 0xfffffc000u) >> 12);
+ 		wr(pmu, MEM_CONFIG2, BTABOX_SIZE >> 12);
+ 	}
