@@ -68,6 +68,25 @@ static const uint32_t pipe_off[4] = { 0x15000, 0x17000, 0x25000, 0x05000 };	/* R
 #define SPLASH_PA	0x83000000UL	/* reserved-memory splash_region, 20 MiB */
 #define SHADOW_PA	0xa0000000UL	/* plain System RAM, far from LK's load addresses */
 
+/*
+ * Log channel: the console text also goes into the console zone of Linux's
+ * ramoops (cmdline ramoops.mem_address=0x9fd00000 mem_size=0x200000
+ * console_size=0x100000, record_size 4 KiB, ecc 0; TWRP's iomem shows the zone
+ * at 0x9fdfe000). After a reset that keeps DRAM, TWRP shows it as
+ * /sys/fs/pstore/console-ramoops. persistent_ram_buffer: sig, start, size, data.
+ */
+#define PSTORE_CON	0x9fdfe000UL
+#define PSTORE_SIZE	0x100000u
+#define PRZ_SIG		0x43474244u	/* "DBGC" */
+
+/* Reboot into TWRP: LK's RECOVERY_MODE cookie in IMEM restart_reason, then drop PS_HOLD. */
+#define IMEM_RESTART	0x0860065cUL
+#define RESTART_RECOVERY 0x77665502u
+#define PSHOLD		0x004ab000UL
+#ifndef K88_REBOOT_S
+#define K88_REBOOT_S	20	/* seconds after the last line; 0 = halt */
+#endif
+
 /* eMMC host, sdhci-msm (sdhci@7824000): hc_mem 0x7824900, core_mem 0x7824000 */
 #define SDHC_BASE	0x07824900UL
 #define SDCORE_BASE	0x07824000UL
@@ -120,12 +139,87 @@ static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 	return x0;
 }
 
+static void k88_present(void);
+
+/* ---- log ---- */
+
+/*
+ * LK writes its own log into this zone on the next boot, over the first few KB
+ * (seen 2026-11-13: diag2's first lines were replaced by LK's). Our text
+ * starts after LOG_SKIP bytes of newlines.
+ */
+#define LOG_SKIP	0x4000u
+static uint32_t log_n;
+
+static void log_init(void)
+{
+	wr32(PSTORE_CON + 0, PRZ_SIG);
+	wr32(PSTORE_CON + 4, 0);
+	for (log_n = 0; log_n < LOG_SKIP; log_n++)
+		wr8(PSTORE_CON + 12 + log_n, 10);	/* newline */
+	wr32(PSTORE_CON + 8, log_n);
+}
+
+void con_tee(const char *s)
+{
+	for (; *s && log_n < PSTORE_SIZE - 12; s++, log_n++)
+		wr8(PSTORE_CON + 12 + log_n, (uint8_t)*s);
+	wr32(PSTORE_CON + 8, log_n);	/* size; start stays 0 (no wrap) */
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void __attribute__((noreturn)) reboot_twrp(void)
+{
+	wr32(IMEM_RESTART, RESTART_RECOVERY);
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(PSHOLD, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+static void __attribute__((noreturn)) finish(void)
+{
+	if (K88_REBOOT_S) {
+		con_str("REBOOT", "to TWRP in a few s");
+		k88_present();
+		delay_ms(K88_REBOOT_S * 1000);
+		wr32(IMEM_RESTART, RESTART_RECOVERY);
+		__asm__ volatile("dsb sy" ::: "memory");
+		wr32(PSHOLD, 0);
+		delay_ms(2000);
+		con_str("REBOOT", "PS_HOLD did not reset");
+	} else {
+		con_str("DONE", "halted. hold power ~10 s");
+	}
+	k88_present();
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
 /* ---- display ---- */
 
 /* Pack the 32 bpp shadow into the 24 bpp scanout, 4 pixels = 3 words (bytes B,G,R per pixel). */
 static void k88_present(void)
 {
 	if (fb_direct) {
+		__asm__ volatile("dsb sy" ::: "memory");
+		return;
+	}
+	if ((fb_pa | fb_stride) & 3) {
+		/* LK may point the pipe at an unaligned offset (diag2: a word store at 0x83200036 took an
+		 * alignment fault; with the MMU off all of DRAM is Device memory): go byte by byte. */
+		for (int y = 0; y < FB_H; y++) {
+			volatile uint32_t *s = (volatile uint32_t *)(SHADOW_PA + (uintptr_t)y * FB_STRIDE);
+			uintptr_t d = fb_pa + (uintptr_t)y * fb_stride;
+
+			for (int x = 0; x < FB_W; x++, d += 3) {
+				uint32_t p = s[x];
+
+				wr8(d, (uint8_t)p);
+				wr8(d + 1, (uint8_t)(p >> 8));
+				wr8(d + 2, (uint8_t)(p >> 16));
+			}
+		}
 		__asm__ volatile("dsb sy" ::: "memory");
 		return;
 	}
@@ -305,6 +399,8 @@ void k88_main(uintptr_t dtb)
 {
 	uint64_t s = 0;
 
+	log_init();
+	con_tee("K88 SHIM started\n");
 	find_scanout();
 	con_clear(BLUE);
 	colour_bars();	/* expected left to right: red, green, blue, white */
@@ -338,15 +434,22 @@ void k88_main(uintptr_t dtb)
 	con_hex2("SDHC2", "ctl=", mmio32(SDHC_BASE + 0x28), "clk=", mmio32(SDHC_BASE + 0x2c));
 	con_hex2("SDHC3", "ctl2=", mmio32(SDHC_BASE + 0x3c), "cap=", mmio32(SDHC_BASE + 0x40));
 	con_hex2("SDCORE", "mode=", mmio32(SDCORE_BASE + 0x78), "ver=", mmio32(SDCORE_BASE + 0x50));
-	con_str("DONE", "halted. hold power ~10 s");
-	k88_present();
+	finish();
 }
 
 void k88_exc(uint64_t slot, uint64_t *regs)
 {
+	static int nested;
+
 	if (slot == 5) {	/* IRQ from current EL, SPx */
 		irq_handler();
 		return;
+	}
+	if (nested++) {
+		/* faulted again while reporting (e.g. in k88_present): log only, then reboot */
+		con_tee("EXC again while reporting: ");
+		con_hex("ELR", rsr("elr_el1"));
+		reboot_twrp();
 	}
 	con_clear(RED);
 	con_str("EXC", "unexpected exception");
@@ -357,7 +460,5 @@ void k88_exc(uint64_t slot, uint64_t *regs)
 	con_hex("SPSR", rsr("spsr_el1"));
 	con_hex("X0", regs[0]);
 	con_hex("X30", regs[31]);
-	k88_present();
-	for (;;)
-		__asm__ volatile("wfe");
+	finish();
 }
