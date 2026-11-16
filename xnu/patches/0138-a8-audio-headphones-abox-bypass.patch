@@ -1,0 +1,469 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_a8gpu.c			standard
+ bsd/dev/sweet_a8power.c			standard
+ bsd/dev/sweet_a8wlbt.c			standard
+ bsd/dev/sweet_a8acpm.c			standard
++bsd/dev/sweet_a8audio.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
+--- a/bsd/dev/sweet_a8acpm.c
++++ b/bsd/dev/sweet_a8acpm.c
+@@ -299,4 +299,25 @@
+ 	}
+ 	dvfs_report("after");
+ }
++
++/* xnu 0138: any SPEEDY device behind ACPM (type = its 4-bit address: codec 3, codec's analog part 7, PMIC 1) */
++int sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val);
++int
++sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
++{
++	uint32_t cmd[16] = { ((type & 0xfu) << 8) | reg, write ? (1u | ((uint32_t)*val << 8)) : 0u };
++	int e;
++
++	if (acpm_init()) {
++		return ENXIO;
++	}
++	e = acpm_send(CH_MFD, cmd);
++	if (e) {
++		return e;
++	}
++	if (!write) {
++		*val = (uint8_t)(cmd[1] >> 8);
++	}
++	return (cmd[1] >> 24) & 0xff ? EIO : 0;
++}
+ #endif /* SWEET_JACKPOTLTE */
+diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a8audio.c
+@@ -0,0 +1,413 @@
++/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
++/*
++ * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
++ * its own CPU off, no firmware ("bypass", the way Scion drives the S9's ABOX: github.com/Scion-Project/scion-kernel,
++ * drivers/audio/abox/hakios.exynos_abox.c, APSL-2.0, read for the method; nothing copied):
++ *
++ *   RDMA0 (a ring in memory) -> SPUS chain 0, no ASRC -> SIFS1 -> UAIF0 (I2S master, 48 kHz, 2 x 16 bits)
++ *        -> COD3035 codec (I2S slave) -> its headphone amplifier
++ *
++ * Facts (Samsung's SM-A530F kernel, GPL-2.0, read for facts only: sound/soc/samsung/abox/abox.[ch],
++ * sound/soc/codecs/cod3035x.[ch], drivers/base/regmap/regmap-i2c.c, cal-if/exynos7885/cmucal-{sfr,node}.c,
++ * pinctrl-exynos.c; vendor/etc/mixer_paths.xml; the live device tree):
++ *   - The codec is reached through ACPM, never directly: regmap "speedy" turns every register access into
++ *     exynos_acpm_{read,write}_reg(i2c address, reg). Main part = type 3, the analog/DNC part ("cod3035a") = type 7.
++ *     Its supply (LDO36) is always on.
++ *   - ABOX SFR 0x14A50000: SYSPOWER_CTRL 0x10, QCHANNEL_DISABLE 0x38, ROUTE_CTRL0 0x40 ([3:0] = UAIF0's source:
++ *     1 SIFS0, 2 SIFS1), SPUS_CTRL0 0x200 (chain n at 4n: bit 3 IN (0 RDMA), bits 2:1 OUT (0 SIFS1, 1 SIFS0,
++ *     2 SIFS2), bit 0 ASRC), SPUS_CTRL1 0x204 ([18:16] SIFS1's SPUS OUT), UAIF n at 0x500 + 0x10n (CTRL0: bit 0
++ *     SPK_ENABLE, 1 MIC_ENABLE, 2 MODE master; CTRL1: 28:24 FORMAT ((ch - 1) | 1 << 3 for 16 bit), 23 BCLK
++ *     polarity, 22 WS mode (0 I2S), 20:18 SLOT_MAX, 17:12 SBIT_MAX), RDMA n at 0x1000 + 0x100n (CTRL0 bit 0 ENABLE,
++ *     BUF_STR 0x08, BUF_END 0x0C, BUF_OFFSET 0x10 (period), STR_POINT 0x14, VOL_FACTOR 0x18, STATUS 0x30:
++ *     31 progress, 28:16 RBUF_OFFSET, 12:0 RBUF_CNT). The codec's MCLK is UAIF2 with only MIC_ENABLE set
++ *     (abox_enable_mclk: UAIF2 CTRL0 = 2).
++ *   - CMU_DISPAUD 0x14800000 (also the display's: only the audio entries below are touched): PLL_AUD CON0 0x160
++ *     (31 ENABLE, 29 STABLE, 25:16 M, 13:8 P, 2:0 S), CON3 0x16C (15:0 K), 1179.648 MHz = M 45 P 1 S 0 K 24319 from
++ *     26 MHz; DIV_AUDIF 0x1800 (24.576 MHz = /48), DIV_UAIF0 0x181C (1.536 MHz = 32 fs = /16), DIV_UAIF2 0x1820,
++ *     MUX_UAIF0 0x100C (0 = the divider); gates (bit 21 CG_VAL, bit 20 MANUAL): ABOX ACLK 0x200C, BCLK_UAIF0 0x2014,
++ *     BCLK_UAIF2 0x2018, RSTNSYNC UAIF0 0x20BC, UAIF2 0x20C0. pd-dispaud is on while the panel is.
++ *   - Pins: pinctrl 0x148F0000, gpb0 (CON 0x0, 4 bits a pin; PUD 0x8): gpb0-0 MCLK, gpb0-1..4 UAIF0, function 2.
++ *   - ABOX SysMMU 0x14A30000: CTRL 0x0, bit 2 = translating.
++ *   - abox_rmem 0xE9400000 (4 MB, below 4 GB, outside XNU's RAM): the ring.
++ *   - Codec: cod3035x_codec_initialize(), cod3035x_dai_set_fmt() (I2S, 16 bit, BCLK 32 fs), playback_hw_params() ->
++ *     cod3035x_lassenA_normal(), DAPM DAC (0x40 PDB_DACDIG bit 5, RSTB_DAT_DA bit 4), HP On (0x77 bit 4),
++ *     hpdrv_ev: cod3035x_hp_playback_init() then post_hpdrv_normal(); mute = DVOL 0x51/0x52 = 0xFF.
++ *
++ * Boot-arg a8audio=N runs the first N steps once (from the storage status thread, 30 s after boot):
++ *   1 look     ABOX/CMU/pins/SysMMU registers and the codec's first registers (both types), read only
++ *   2 clocks   PLL_AUD, AUDIF, UAIF0 (and UAIF2 for MCLK), the gates
++ *   3 pins     gpb0-0..4 to function 2; MCLK on (UAIF2 CTRL0 = 2)
++ *   4 codec    initialisation, I2S slave format, 48 kHz mode, DAC and headphone driver on, muted
++ *   5 UAIF0    route SPUS 0 -> SIFS1 -> UAIF0, UAIF0 master 2 x 16 bits on, SYSPOWER on, SysMMU passing
++ *   6 tone     RDMA0 on a ring of 1 kHz at -20 dBFS for a8audiosecs (default 3, 1..10), unmuted at a low headphone
++ *              volume; RDMA0's STATUS sampled; then muted and stopped
++ * a8audiovol=N  headphone digital volume register (0x51/0x52) for the tone (default 0x6C, quieter than Samsung's
++ *               0x54; larger = quieter).
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void delay(int usec);
++int sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val);  /* sweet_a8acpm.c (xnu 0138) */
++void sweet_a8_audio_run(void);
++
++#define ABOX_PA         0x14a50000u
++#define CMU_PA          0x14800000u
++#define GPIO_PA         0x148f0000u
++#define MMU_PA          0x14a30000u
++#define RMEM_PA         0xe9400000u
++
++#define SYSPOWER        0x10u
++#define QCH_DISABLE     0x38u
++#define ROUTE0          0x40u
++#define SPUS0           0x200u
++#define SPUS1           0x204u
++#define UAIF(n, r)      (0x500u + 0x10u * (n) + (r))
++#define RDMA0(r)        (0x1000u + (r))
++#define R_CTRL0         0x00u
++#define R_BUF_STR       0x08u
++#define R_BUF_END       0x0cu
++#define R_BUF_OFFSET    0x10u
++#define R_STR_POINT     0x14u
++#define R_VOL           0x18u
++#define R_STATUS        0x30u
++
++#define PLL_CON0        0x160u
++#define PLL_CON3        0x16cu
++#define DIV_AUDIF       0x1800u
++#define DIV_UAIF0       0x181cu
++#define DIV_UAIF2       0x1820u
++#define MUX_UAIF0       0x100cu
++#define GATE_ACLK       0x200cu
++#define GATE_BCLK0      0x2014u
++#define GATE_BCLK2      0x2018u
++#define GATE_RST0       0x20bcu
++#define GATE_RST2       0x20c0u
++#define GATE_ON         ((1u << 21) | (1u << 20))
++
++#define MAIN            3u      /* codec types on ACPM */
++#define ANALOG          7u
++
++#define RATE            48000u
++#define PERIOD          480u    /* frames: 10 ms */
++#define PERIODS         10u     /* the ring holds exactly 100 cycles of 1 kHz */
++#define RING_BYTES      (PERIOD * PERIODS * 4u)
++
++static vm_offset_t abox, cmu, gpio, mmu, ring;
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static uint32_t
++wr(vm_offset_t b, const char *name, uint32_t o, uint32_t v)
++{
++	uint32_t was = rd(b, o), now;
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	now = rd(b, o);
++	printf("SWEET AUDIO: %s %#x -> %#x (reads %#x)\n", name, was, v, now);
++	return now;
++}
++static uint32_t
++wr_bits(vm_offset_t b, const char *name, uint32_t o, uint32_t mask, uint32_t v)
++{
++	return wr(b, name, o, (rd(b, o) & ~mask) | (v & mask));
++}
++
++static int cerr;                /* first codec access error of the run */
++static uint8_t
++c_rd(unsigned type, uint8_t reg)
++{
++	uint8_t v = 0;
++	int e = sweet_a8_acpm_mfd(type, reg, 0, &v);
++	if (e && !cerr) {
++		cerr = e;
++		printf("SWEET AUDIO: codec type %u read %#x failed (%d)\n", type, reg, e);
++	}
++	return v;
++}
++static void
++c_wr(unsigned type, uint8_t reg, uint8_t v)
++{
++	uint8_t val = v;
++	int e = sweet_a8_acpm_mfd(type, reg, 1, &val);
++	if (e && !cerr) {
++		cerr = e;
++		printf("SWEET AUDIO: codec type %u write %#x = %#x failed (%d)\n", type, reg, v, e);
++	}
++}
++static void
++c_bits(uint8_t reg, uint8_t mask, uint8_t v)
++{
++	c_wr(MAIN, reg, (uint8_t)((c_rd(MAIN, reg) & ~mask) | (v & mask)));
++}
++
++static void
++codec_dump(unsigned type, uint8_t first)
++{
++	char line[100];
++	int n = 0;
++	for (unsigned r = first; r < first + 16u; r++) {
++		uint8_t v = 0;
++		int e = sweet_a8_acpm_mfd(type, (uint8_t)r, 0, &v);
++		n += snprintf(line + n, sizeof(line) - n, e ? " ??" : " %02x", v);
++	}
++	printf("SWEET AUDIO: codec type %u %#04x..:%s\n", type, first, line);
++}
++
++static void
++step_look(void)
++{
++	printf("SWEET AUDIO: 1 look: ABOX IP_INDEX %#x VERSION %#x SYSPOWER %#x/%#x QCH_DISABLE %#x ROUTE0 %#x SPUS0 %#x SPUS1 %#x\n",
++	    rd(abox, 0x0), rd(abox, 0x4), rd(abox, SYSPOWER), rd(abox, 0x14), rd(abox, QCH_DISABLE), rd(abox, ROUTE0),
++	    rd(abox, SPUS0), rd(abox, SPUS1));
++	printf("SWEET AUDIO: 1 look: UAIF0 %#x %#x st %#x, UAIF2 %#x %#x, RDMA0 ctrl %#x buf %#x..%#x status %#x vol %#x\n",
++	    rd(abox, UAIF(0, 0)), rd(abox, UAIF(0, 4)), rd(abox, UAIF(0, 0xc)), rd(abox, UAIF(2, 0)), rd(abox, UAIF(2, 4)),
++	    rd(abox, RDMA0(R_CTRL0)), rd(abox, RDMA0(R_BUF_STR)), rd(abox, RDMA0(R_BUF_END)), rd(abox, RDMA0(R_STATUS)),
++	    rd(abox, RDMA0(R_VOL)));
++	printf("SWEET AUDIO: 1 look: PLL_AUD %#x K %#x, DIV AUDIF %#x UAIF0 %#x UAIF2 %#x, MUX UAIF0 %#x, gates ACLK %#x BCLK0 %#x "
++	    "BCLK2 %#x RST0 %#x RST2 %#x\n", rd(cmu, PLL_CON0), rd(cmu, PLL_CON3), rd(cmu, DIV_AUDIF), rd(cmu, DIV_UAIF0),
++	    rd(cmu, DIV_UAIF2), rd(cmu, MUX_UAIF0), rd(cmu, GATE_ACLK), rd(cmu, GATE_BCLK0), rd(cmu, GATE_BCLK2),
++	    rd(cmu, GATE_RST0), rd(cmu, GATE_RST2));
++	printf("SWEET AUDIO: 1 look: gpb0 con %#x dat %#x pud %#x; SysMMU ctrl %#x\n", rd(gpio, 0x0), rd(gpio, 0x4), rd(gpio, 0x8),
++	    rd(mmu, 0x0));
++	codec_dump(MAIN, 0x00);
++	codec_dump(MAIN, 0x40);
++	codec_dump(ANALOG, 0x40);
++}
++
++static bool
++step_clocks(void)
++{
++	uint32_t c0 = rd(cmu, PLL_CON0);
++	bool right = (c0 & (1u << 31)) && (c0 & (1u << 29)) && ((c0 >> 16) & 0x3ff) == 45 && ((c0 >> 8) & 0x3f) == 1 &&
++	    (c0 & 7) == 0 && (rd(cmu, PLL_CON3) & 0xffff) == 24319;
++
++	printf("SWEET AUDIO: 2 clocks: PLL_AUD %s\n", right ? "already at 1179.648 MHz" : "to 1179.648 MHz");
++	if (!right) {
++		(void)wr_bits(cmu, "PLL_AUD CON0 (off)", PLL_CON0, 1u << 31, 0);
++		(void)wr_bits(cmu, "PLL_AUD CON3 (K 24319)", PLL_CON3, 0xffff, 24319);
++		(void)wr_bits(cmu, "PLL_AUD CON0 (M 45 P 1 S 0)", PLL_CON0, (0x3ffu << 16) | (0x3fu << 8) | 7u, (45u << 16) | (1u << 8));
++		(void)wr_bits(cmu, "PLL_AUD CON0 (on)", PLL_CON0, 1u << 31, 1u << 31);
++		for (int i = 0; i < 100 && !(rd(cmu, PLL_CON0) & (1u << 29)); i++) {
++			delay(100);
++		}
++		if (!(rd(cmu, PLL_CON0) & (1u << 29))) {
++			printf("SWEET AUDIO: 2 clocks: PLL_AUD did not lock (%#x)\n", rd(cmu, PLL_CON0));
++			return false;
++		}
++	}
++	(void)wr_bits(cmu, "DIV_AUDIF (/48: 24.576 MHz)", DIV_AUDIF, 0x1ff, 47);
++	(void)wr_bits(cmu, "DIV_UAIF0 (/16: 1.536 MHz)", DIV_UAIF0, 0x1f, 15);
++	(void)wr_bits(cmu, "MUX_UAIF0 (the divider)", MUX_UAIF0, 1, 0);
++	(void)wr_bits(cmu, "gate ABOX ACLK", GATE_ACLK, GATE_ON, GATE_ON);
++	(void)wr_bits(cmu, "gate BCLK_UAIF0", GATE_BCLK0, GATE_ON, GATE_ON);
++	(void)wr_bits(cmu, "gate BCLK_UAIF2", GATE_BCLK2, GATE_ON, GATE_ON);
++	(void)wr_bits(cmu, "gate RSTNSYNC UAIF0", GATE_RST0, GATE_ON, GATE_ON);
++	(void)wr_bits(cmu, "gate RSTNSYNC UAIF2", GATE_RST2, GATE_ON, GATE_ON);
++	printf("SWEET AUDIO: 2 clocks: DIV_UAIF2 (the codec's MCLK) left at %#x\n", rd(cmu, DIV_UAIF2));
++	return true;
++}
++
++static bool
++step_pins(void)
++{
++	(void)wr_bits(gpio, "gpb0 CON (0..4 function 2)", 0x0, 0xfffff, 0x22222);
++	(void)wr_bits(gpio, "gpb0 PUD (0..4 none)", 0x8, 0xfffff, 0);
++	(void)wr(abox, "UAIF2 CTRL0 (MCLK out)", UAIF(2, 0), 0x2);
++	return (rd(gpio, 0x0) & 0xfffff) == 0x22222;
++}
++
++static bool
++step_codec(void)
++{
++	static const uint8_t init[][2] = {
++		/* cod3035x_codec_initialize(), dis_ovp_det_mode off, no DTV antenna */
++		{ 0x05, 0x00 }, { 0x06, 0x00 }, { 0x07, 0x53 }, { 0x08, 0x53 }, { 0x3d, 0xd7 }, { 0x84, 0xbe },
++		{ 0xa6, 0x42 }, { 0x93, 0x00 }, { 0x94, 0x00 }, { 0x8e, 0xc0 }, { 0x8f, 0xc0 }, { 0x9a, 0x01 },
++		{ 0x44, 0xff }, { 0xb0, 0xa0 }, { 0xb4, 0x01 }, { 0xb5, 0xfc }, { 0xb6, 0xff }, { 0xb7, 0xb7 },
++		{ 0xb8, 0x55 }, { 0xba, 0x02 }, { 0xbb, 0x66 }, { 0xbe, 0x60 }, { 0x54, 0x8f }, { 0x55, 0x78 },
++		{ 0x57, 0x00 }, { 0xe1, 0xf1 }, { 0xe3, 0x00 }, { 0xe5, 0x00 }, { 0xe7, 0x00 }, { 0xe8, 0x00 },
++		{ 0xe9, 0x00 }, { 0xea, 0x01 }, { 0xf2, 0x03 }, { 0xf3, 0x1f }, { 0xf4, 0x55 }, { 0x5a, 0x44 },
++		{ 0xf5, 0x1a }, { 0xf6, 0xc6 }, { 0x1b, 0x01 },
++	};
++	cerr = 0;
++	printf("SWEET AUDIO: 4 codec: initialisation (%u registers)\n", (unsigned)(sizeof(init) / sizeof(init[0])));
++	for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++) {
++		c_wr(MAIN, init[i][0], init[i][1]);
++	}
++	c_wr(MAIN, 0x80, 0x02);                 /* PDB_ACC1, 100 ms, then 3 */
++	delay(100000);
++	c_wr(MAIN, 0x80, 0x03);
++	c_bits(0x81, 0x08, 0x08);               /* T_PDB_IMP */
++	c_wr(MAIN, 0x30, 0x0a);                 /* HP analog volume, Samsung's default */
++	c_wr(MAIN, 0x31, 0x0a);
++	c_wr(MAIN, 0x51, 0xff);                 /* DAC muted */
++	c_wr(MAIN, 0x52, 0xff);
++	c_wr(MAIN, 0x10, 0x10);                 /* PD_REF */
++	/* cod3035x_dai_set_fmt: I2S, 16 bits, BCLK 32 fs */
++	c_wr(MAIN, 0x41, 0x00);
++	c_wr(MAIN, 0x42, 0x10);
++	c_wr(MAIN, 0x43, 0x20);
++	/* cod3035x_lassenA_normal (48 kHz) */
++	c_wr(MAIN, 0xf2, 0x03);
++	c_wr(MAIN, 0xf3, 0x1f);
++	c_wr(MAIN, 0xf5, 0x1a);
++	c_wr(MAIN, 0xf6, 0xc7);
++	c_wr(MAIN, 0x58, 0x81);
++	c_bits(0x50, 0x08, 0x00);               /* DAC1_INGN_MODE off */
++	c_bits(0x53, 0x01, 0x00);               /* UHQA off */
++	c_wr(MAIN, 0x7a, 0x2f);
++	c_wr(MAIN, 0x7b, 0x80);
++	delay(100);
++	c_wr(ANALOG, 0x50, 0x1a);
++	c_wr(ANALOG, 0x51, 0x68);
++	delay(200);
++	c_wr(ANALOG, 0x41, 0x01);
++	c_wr(ANALOG, 0x42, 0xda);
++	c_wr(ANALOG, 0x43, 0x32);
++	c_wr(ANALOG, 0x44, 0x32);
++	c_wr(ANALOG, 0x4a, 0xfe);
++	c_wr(ANALOG, 0x4b, 0x85);
++	c_wr(ANALOG, 0x4c, 0x00);
++	c_wr(ANALOG, 0x4d, 0x83);
++	c_wr(ANALOG, 0x4e, 0x10);
++	delay(100);
++	c_wr(MAIN, 0xbb, 0x33);
++	c_wr(MAIN, 0x7d, 0x8b);
++	delay(1000);
++	/* DAC (dac_ev PRE_PMU): digital power on, reset pulse */
++	c_bits(0x40, 0x20, 0x20);
++	c_bits(0x40, 0x10, 0x00);
++	c_bits(0x40, 0x10, 0x10);
++	/* HP On, then hpdrv_ev: hp_playback_init, post_hpdrv_normal (DAC stays muted until the tone) */
++	c_bits(0x77, 0x10, 0x10);
++	c_bits(0x45, 0x10, 0x10);
++	c_wr(MAIN, 0x73, 0x20);
++	c_wr(MAIN, 0x74, 0x89);
++	delay(100);
++	c_wr(MAIN, 0x33, 0x00);
++	c_wr(MAIN, 0xbb, 0x33);
++	c_bits(0x37, 0x84, 0x84);               /* EN_HP_MIXL_DCTL | EN_HP_MIXR_DCTR */
++	c_bits(0x18, 0x12, 0x12);               /* PW_AUTO_DA | APW_HP */
++	delay(135000);
++	c_bits(0x3e, 0xd0, (2u << 6) | 0x10);   /* LOCK_UP_TIME 1.5, OVP_APON */
++	printf("SWEET AUDIO: 4 codec: done, %s; 0x18 %#x 0x37 %#x 0x40 %#x 0x77 %#x\n", cerr ? "with errors" : "no errors",
++	    c_rd(MAIN, 0x18), c_rd(MAIN, 0x37), c_rd(MAIN, 0x40), c_rd(MAIN, 0x77));
++	return cerr == 0;
++}
++
++static bool
++step_uaif(void)
++{
++	uint32_t m = rd(mmu, 0x0);
++	if (m & 4) {
++		(void)wr(mmu, "SysMMU CTRL (translating: off, addresses physical)", 0x0, 0);
++	}
++	(void)wr_bits(abox, "SYSPOWER_CTRL (on)", SYSPOWER, 1, 1);
++	(void)wr_bits(abox, "SPUS_CTRL0 (chain 0: RDMA, SIFS1, no ASRC)", SPUS0, 0xf, 0x0);
++	(void)wr_bits(abox, "SPUS_CTRL1 (SIFS1 from SPUS OUT0)", SPUS1, 7u << 16, 0);
++	(void)wr_bits(abox, "ROUTE_CTRL0 (UAIF0 from SIFS1)", ROUTE0, 0xf, 2);
++	(void)wr(abox, "UAIF0 CTRL1 (2 x 16 bit I2S)", UAIF(0, 4), (0x9u << 24) | (1u << 23) | (1u << 18) | (15u << 12));
++	(void)wr(abox, "UAIF0 CTRL0 (master, data mode, FIFO diff 1)", UAIF(0, 0), (1u << 24) | (1u << 4) | (1u << 2));
++	(void)wr_bits(abox, "UAIF0 CTRL0 (SPK_ENABLE)", UAIF(0, 0), 1, 1);
++	delay(20000);
++	printf("SWEET AUDIO: 5 UAIF0: status %#x, gpb0 dat %#x\n", rd(abox, UAIF(0, 0xc)), rd(gpio, 0x4));
++	return (rd(abox, ROUTE0) & 0xf) == 2 && (rd(abox, UAIF(0, 0)) & 1);
++}
++
++static void
++step_tone(void)
++{
++	static const int16_t quarter[13] = { 0, 428, 848, 1254, 1638, 1995, 2317, 2600, 2838, 3028, 3165, 3249, 3277 };
++	unsigned secs = 3, vol = 0x6c;
++	volatile int16_t *s;
++
++	(void)PE_parse_boot_argn("a8audiosecs", &secs, sizeof(secs));
++	(void)PE_parse_boot_argn("a8audiovol", &vol, sizeof(vol));
++	secs = secs < 1 ? 1 : secs > 10 ? 10 : secs;
++	vol = vol < 0x30 ? 0x30 : vol > 0xff ? 0xff : vol;      /* never louder than 0x30 */
++	if (ring == 0) {
++		ring = ml_io_map(RMEM_PA, RING_BYTES);
++	}
++	if (ring == 0) {
++		printf("SWEET AUDIO: 6 tone: abox_rmem not mapped\n");
++		return;
++	}
++	s = (volatile int16_t *)ring;
++	for (unsigned f = 0; f < PERIOD * PERIODS; f++) {       /* 48 frames a cycle, -20 dBFS */
++		unsigned p = f % 48, q = p % 24;
++		int16_t v = q <= 12 ? quarter[q] : quarter[24 - q];
++		v = p < 24 ? v : (int16_t)-v;
++		s[2 * f] = v;
++		s[2 * f + 1] = v;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	(void)wr_bits(abox, "RDMA0 CTRL0 (off)", RDMA0(R_CTRL0), 1, 0);
++	(void)wr(abox, "RDMA0 BUF_STR", RDMA0(R_BUF_STR), RMEM_PA);
++	(void)wr(abox, "RDMA0 BUF_END", RDMA0(R_BUF_END), RMEM_PA + RING_BYTES);
++	(void)wr(abox, "RDMA0 BUF_OFFSET (period)", RDMA0(R_BUF_OFFSET), PERIOD * 4u);
++	(void)wr(abox, "RDMA0 STR_POINT", RDMA0(R_STR_POINT), RMEM_PA);
++	if ((rd(abox, RDMA0(R_VOL)) & 0xffffff) == 0) {
++		(void)wr_bits(abox, "RDMA0 VOL_FACTOR (unity)", RDMA0(R_VOL), 0xffffff, 0x800000);
++	}
++	if (((rd(abox, RDMA0(R_CTRL0)) >> 19) & 0xf) == 0) {
++		(void)wr_bits(abox, "RDMA0 CTRL0 (BURST_LEN 8)", RDMA0(R_CTRL0), 0xfu << 19, 8u << 19);
++	}
++	c_wr(MAIN, 0x51, (uint8_t)vol);
++	c_wr(MAIN, 0x52, (uint8_t)vol);
++	(void)wr_bits(abox, "RDMA0 CTRL0 (ENABLE)", RDMA0(R_CTRL0), 1, 1);
++	printf("SWEET AUDIO: 6 tone: 1 kHz, -20 dBFS, DAC volume %#x, %u s\n", vol, secs);
++	for (unsigned t = 0; t < secs * 4; t++) {
++		uint32_t st = rd(abox, RDMA0(R_STATUS));
++		if (t < 4 || t % 4 == 0) {
++			printf("SWEET AUDIO: 6 tone: %u ms: RDMA0 status %#x (progress %u, offset %u, count %u), UAIF0 status %#x\n",
++			    t * 250, st, st >> 31, (st >> 16) & 0x1fff, st & 0x1fff, rd(abox, UAIF(0, 0xc)));
++		}
++		delay(250000);
++	}
++	c_wr(MAIN, 0x51, 0xff);
++	c_wr(MAIN, 0x52, 0xff);
++	(void)wr_bits(abox, "RDMA0 CTRL0 (off)", RDMA0(R_CTRL0), 1, 0);
++	printf("SWEET AUDIO: 6 tone: done; did you hear it in the headphones?\n");
++}
++
++void
++sweet_a8_audio_run(void)
++{
++	unsigned n = 0;
++
++	if (!PE_parse_boot_argn("a8audio", &n, sizeof(n)) || n == 0) {
++		return;
++	}
++	abox = ml_io_map(ABOX_PA, 0x2000);
++	cmu = ml_io_map(CMU_PA, 0x3000);
++	gpio = ml_io_map(GPIO_PA, 0x1000);
++	mmu = ml_io_map(MMU_PA, 0x1000);
++	if (!abox || !cmu || !gpio || !mmu) {
++		printf("SWEET AUDIO: cannot map\n");
++		return;
++	}
++	step_look();
++	if (n < 2 || !step_clocks()) {
++		return;
++	}
++	if (n < 3 || !step_pins()) {
++		return;
++	}
++	if (n < 4 || !step_codec()) {
++		return;
++	}
++	if (n < 5 || !step_uaif()) {
++		return;
++	}
++	if (n >= 6) {
++		step_tone();
++	}
++	step_look();
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1066,2 +1066,3 @@ static int wst_chan;
+ extern void sweet_a8_dvfs_init(void);                  /* xnu 0137, sweet_a8acpm.c */
++extern void sweet_a8_audio_run(void);                  /* xnu 0138, sweet_a8audio.c */
+ 
+@@ -1136,2 +1137,3 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 			sweet_a8_dvfs_init();
++			sweet_a8_audio_run();
+ 		}
