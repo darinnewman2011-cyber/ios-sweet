@@ -1,0 +1,15 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 8830671..1cf2508 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -1052,7 +1052,9 @@ LD_KERNEL_LIBS	   = -lcc_kext
+ LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
+ 
+ # Link binary support library
+-ifneq ($(KDKROOT),)
++# sweet: only if the KDK ships one for this machine config (there is no libSWEET.os.*.a;
++# xnu-10063 and older never force-loaded it)
++ifneq ($(wildcard $(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a),)
+         LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+ endif
+ 
