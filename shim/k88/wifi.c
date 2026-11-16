@@ -646,6 +646,8 @@ static void crash_reason(void)
 	con_str("CRASH", s);
 }
 
+#include "wcn.c"
+
 /* ---- top ---- */
 
 static void test_wifi(void)
@@ -675,6 +677,7 @@ static void test_wifi(void)
 		crash_reason();
 		k88_present();
 		wcnss_ctrl();
+		wlan_stage3();
 		list_channels();
 		crash_reason();
 		k88_present();
