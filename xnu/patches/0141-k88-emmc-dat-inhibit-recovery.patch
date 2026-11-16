@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6c61479..2bec698 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1120,10 +1120,36 @@ k88_wait_ready(uint32_t rca)
+ static bool
+ k88_cmd_b(uint32_t idx, uint32_t arg)
+ {
+-	uint32_t resp = 0, st = mmc_cmd(idx, arg, CMDR_RESP_48B | CMDR_CRC | CMDR_INDEX, 0, &resp);
+-	if (st == UINT32_MAX || (st & INT_ERR) || (resp & R1_ERRORS)) {
+-		printf("SWEET MMC: CMD%u 0x%x: int 0x%x r1 0x%x\n", idx, arg, st, resp);
++	uint32_t resp = 0, st = UINT32_MAX;
++
++	/*
++	 * ios7 (turbo, 0139): CMD6 right after a good CMD13 still came back
++	 * UINT32_MAX. Guess: DAT_INHIBIT left set by the CMD7 busy period (that
++	 * wait's result was ignored), so mmc_cmd's inhibit wait gives up. Reset
++	 * the DAT line when it is stuck, retry, and log the controller state.
++	 */
++	for (int attempt = 0; attempt < 3; attempt++) {
++		uint32_t pres = ufs_rd(HC_PRESENT);
++		if (pres & (PRES_CMD_INHIBIT | PRES_DAT_INHIBIT)) {
++			printf("SWEET MMC: CMD%u try %d: present 0x%x int 0x%x before, resetting CMD/DAT\n", idx, attempt, pres,
++			    ufs_rd(HC_INT));
++			hc_reset(RESET_CMD | RESET_DAT);
++			ufs_wr(HC_INT, 0xffffffff);
++		}
++		resp = 0;
++		st = mmc_cmd(idx, arg, CMDR_RESP_48B | CMDR_CRC | CMDR_INDEX, 0, &resp);
++		if (st != UINT32_MAX && !(st & INT_ERR) && !(resp & R1_ERRORS)) {
++			break;
++		}
++		printf("SWEET MMC: CMD%u 0x%x try %d: int 0x%x r1 0x%x present 0x%x int now 0x%x\n", idx, arg, attempt, st, resp,
++		    ufs_rd(HC_PRESENT), ufs_rd(HC_INT));
+ 		mmc_abort();
++		if (idx != 6 || (st != UINT32_MAX && !(st & INT_ERR))) {
++			return false;               /* only retry CMD6 timeouts / bus errors */
++		}
++		delay(10000);
++	}
++	if (st == UINT32_MAX || (st & INT_ERR) || (resp & R1_ERRORS)) {
+ 		return false;
+ 	}
+ 	/*
+@@ -1131,7 +1157,9 @@ k88_cmd_b(uint32_t idx, uint32_t arg)
+ 	 * waits for it); DAT0 alone can still read high before busy starts.
+ 	 */
+ 	st = hc_wait_int(INT_XFER_COMPLETE, 4 * MMC_DATA_NS);
+-	(void)mmc_wait(HC_PRESENT, PRES_DAT0 | PRES_DAT_INHIBIT, PRES_DAT0, MMC_DATA_NS);
++	if (!mmc_wait(HC_PRESENT, PRES_DAT0 | PRES_DAT_INHIBIT, PRES_DAT0, MMC_DATA_NS)) {
++		printf("SWEET MMC: CMD%u busy end: xfer int 0x%x, present 0x%x after 500 ms\n", idx, st, ufs_rd(HC_PRESENT));
++	}
+ 	ufs_wr(HC_INT, 0xffffffff);
+ 	return true;
+ }
