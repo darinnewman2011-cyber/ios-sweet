@@ -109,3 +109,26 @@ TWRP never boots the Wi-Fi core, so nothing below is verified live yet.
   The `WCNSS_qcom_cfg.ini` in the firmware dir is only a link to `/data/misc/wifi/`.
 - `wcnss.mdt`/`wcnss.bNN` are not in the system image: they are in the `modem` partition (FAT, `image/`) and must be
   read from the tablet. `persist` may hold a per-device NV file and the MAC (`wlan_mac.bin`).
+- **Firmware (read 2026-11-15 from the tablet's `modem` partition, FAT `image/`):** `wcnss.mdt` + `wcnss.b00,b01,b02,b04,b06,b09,
+  b10,b11,b12`, build **`CNSS.PR.3.0.C1-00064`** (M8952, 2016-11-11). ELF segments linked at **`0x8D100000`–`0x8D77B0A4`**
+  (6.5 MiB, inside the 23 MiB `reloc_mem` carve-out), flagged relocatable; hash segment = program header 1 (6856 bytes).
+  Copies of `modem.img` (SHA-256 `8002eef1…ec5b`) and `persist.img` (`212af740…c676`) are in `backup/k88/wifi/` (git-ignored;
+  persist holds the Wi-Fi MAC in `wifimac.dat`, which must stay out of git). persist has no per-device NV file, so the
+  vendor `WCNSS_qcom_wlan_nv.bin` is the one Android used.
+- `tools/k88wifiblob.py FWDIR NV OUT` packs the PAS metadata (ELF header + program headers + hash segment), the
+  segments and the NV file into one blob that `WIFIBLOB=... shim/k88/build.sh` links into the shim.
+
+### Shim runs
+
+- **wifi1** (stage 1 probe, commit 46709d9, boot image `fa4d893a…ec6d`, 2026-11-15; log `backup/k88/runs/wifi1-console.txt`):
+  back in TWRP by itself after 35 s.
+  - **SCM: the SMC32 convention answers** (`IS_CALL_AVAIL` fast call `0x82000601` → r0 0, r1 1); SMC64 returns -1.
+    INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET, SHUTDOWN, IS_SUPPORTED and MSS_RESET are all available. **PAS supports
+    peripheral 6** (and 1).
+  - GCC `APCS_CLOCK_BRANCH_ENA_VOTE` = `0x0001E407`: the crypto AHB/AXI/core votes (bits 0-2) are already on.
+  - Rails (PM8950 SID 1, STATUS bit 7 = output OK, EN_CTL bit 7): S2, L3, L5, **L7 on**; **L9 (Iris PA, 3.3 V) and L19
+    (Iris RFA, 1.3 V) off** (status `0x00`/`0x01`, EN_CTL 0). Turning them on needs RPM requests over SMD (`rpm_requests`,
+    edge 15): needed for the radio, probably not for the firmware to boot.
+  - SMEM: heap version 11 (`0x000B0000`), plus a `$TOC` partition table with 7 partitions; the **APPS↔WCNSS partition
+    (hosts 0/4) is at SMEM + `0x5A000`**, magic `$PRT`, empty (free offset `0x20`). No SMD allocation table yet (the
+    firmware creates its channels when it boots).
