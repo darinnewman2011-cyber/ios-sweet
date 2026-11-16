@@ -44,12 +44,15 @@ diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 index b7fbdf6..1dcfb03 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -967,6 +967,9 @@ exception_triage(
+@@ -967,6 +967,12 @@ exception_triage(
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <vm/vm_shared_region.h>
 +#if __has_include(<vm/vm_shared_region_xnu.h>)
 +#include <vm/vm_shared_region_xnu.h> /* xnu-11417: struct vm_shared_region */
++#endif
++#if __has_include(<vm/vm_map_internal.h>)
++#include <vm/vm_map_internal.h> /* xnu-11417: vm_map_region_recurse_64 */
 +#endif
  #include <arm/thread.h>
  
