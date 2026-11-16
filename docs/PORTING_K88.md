@@ -195,6 +195,25 @@ Runs:
 7. Keys (TLMM GPIO 85/90 + PON), Goodix touch on BLSP I²C `0x78B7000`.
 8. Later: Adreno 405 GPU (freedreno), audio, Wi-Fi (WCNSS/pronto), USB device log (ChipIdea).
 
+## MILESTONE 2026-11-16: iPadOS 16.6.1 home screen (observed, user photo)
+
+- Kernel: xnu-8796 + patches through **0141** (eMMC DAT-line recovery before CMD6), CI run 43821738552, artifact in
+  `_tmp/k88art9`; **0140** iPad canvas 1620x2160 (`sweetfb_fit`), ADT J171AP/iPad7,11 (commit c501bf7).
+- Boot image `ipad1` (`dd4da679…`): base cmdline + `cpus=8 k88clock=2 sweetreboot=0` (all 8 cores at turbo:
+  1516.8 / 1209.6 MHz).
+- Root: iPadOS 16.6.1 (20G81) 13 GiB HFS+ written raw over cache+system+userdata (sectors 1179648…30507008,
+  `tools/k88push.py`, all chunks verified); AMFI extensions.plist dsc patch at `.05+0x5b55328`.
+- First run sat on the "Updating" progress bar for 2+ hours: sweet-root-tweaks wrote the iPhone build (20H392) as
+  `LastSystemVersion`, so DataMigration ran its update pass. Fixed in d01c05d (build read from SystemVersion.plist).
+- Fixed root: verbose console until ~1280 s, GUI from then, SpringBoard idle in its run loop by ~1800 s (sampler),
+  ~2.93M sectors written / 0 failed. The screen had blanked (idle); **volume up + down (= Home) woke it to the iPad
+  home screen**: status bar "Wed Dec 31", 100 % battery, icons, dock, page dots. Widgets show as blank white panels,
+  no wallpaper (black): expected without GL/Metal (see a8 lessons: posters need Metal, widgets need extensions + GPU).
+- Crash-looping: fairplayd.A2 (removed from the next root, 4f1ad07), bluetoothd (no BT driver), the speech
+  synthesizers (MacinTalkAUSP, KonaSynthesizer, SiriTTSSynthesizer: abort at the same pc, probably no audio device).
+- Not working yet: power key (PMIC PON over SPMI arbiter v2, not implemented), clock (add `sweettime=`), GPU.
+- Next: software Metal/GL path from the A8 (posters, widgets), then Adreno 405; power key patch 0142.
+
 ## Rules for this device
 
 - Never write `aboot`, `sbl1`, `rpm`, `tz`, `hyp`, `modem*`, `fsg`, `persist`, `DDR`, `devinfo`, `recovery`, or the GPT.
