@@ -1,0 +1,338 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_a8input.c			standard
+ bsd/dev/sweet_a8gpu.c			standard
+ bsd/dev/sweet_a8power.c			standard
+ bsd/dev/sweet_a8wlbt.c			standard
++bsd/dev/sweet_a8acpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a8acpm.c
+@@ -0,0 +1,302 @@
++/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
++/*
++ * Galaxy A8 (2018, jackpotlte): talking to ACPM, the Exynos 7885's power-management firmware (a Cortex-M core
++ * with its own SRAM). ACPM owns the clocks and voltages of the CPU clusters, the memory bus and the GPU (it
++ * sets the PLL *and* the regulator itself, in the right order), and the SPEEDY bus that the PMIC and the
++ * COD3035 audio codec sit on. So:
++ *   - CPU / memory / GPU speed: one "set rate" message per domain (S-Boot leaves the A53s at 1013 of
++ *     1690 MHz and the A73s at 1351 of 2184, measured by xnu 0117);
++ *   - audio: the codec's registers are read and written through ACPM, never over SPEEDY directly
++ *     (the bus is shared with ACPM's own PMIC traffic).
++ *
++ * Facts (Samsung's SM-A530F kernel, GPL-2.0, read for facts only: drivers/soc/samsung/acpm/acpm_ipc.c,
++ * acpm_mfd.c, fw_header/framework.h, cal-if/acpm_dvfs.[ch], cal-if/exynos7885/acpm_dvfs_exynos7885.h,
++ * sound/soc/codecs/cod3035x.c; exynos7885.dtsi; the phone's live device tree):
++ *   mailbox 0x11C40000 (INTGR0 0x08: (1 << id) << 16 rings ACPM; INTCR1 0x20 clears; INTSR1 0x28 status),
++ *   SRAM 0x02052000 (0x1B000), struct acpm_framework at SRAM + 0x4B80 (u32: plugins, num_plugins,
++ *   ipc_channels, num_ipc_channels, pid_framework, pid_max, ipc_ap_max, ...); ipc_channels = SRAM offset of
++ *   struct ipc_channel { id, field, owner, type, { rx_rear, rx_front, rx_base, rx_indr_buf,
++ *   rx_indr_buf_base, rx_indr_buf_size, tx_rear, tx_front, tx_base, q_len, q_elem_size, credit,
++ *   mbox_addr }, ap_poll } (17 u32). The AP sends on the rx_* queue and reads replies on the tx_* queue;
++ *   cmd[0] carries a sequence number (1..63) at bits 21:16 which the reply repeats.
++ *   DVFS: channel 5, cmd = { domain, kHz, 0 = FREQ_REQ | 1 = FREQ_GET, 0 }; domains 0 MIF (memory bus),
++ *   1 INT, 2 CPUCL0 (A73s), 3 CPUCL1 (A53s), 4 G3D, 5 FSYS, 6 CAM, 7 DISP, 8 AUD.
++ *   Tables (live DT): A53 208..1690 MHz, A73 520..2184 MHz, MIF up to 1794 MHz, G3D up to 1300 MHz with
++ *   gpu_max_clock 1100 MHz.
++ *   MFD (PMIC/codec): channel 2, cmd[0] = (type << 8) | reg, cmd[1] = 0 read / 1 | val << 8 write;
++ *   reply cmd[1]: value at 15:8, return code at 31:24. Codec type 7, PMIC type 1.
++ *
++ * Boot-args (nothing happens without a8dvfs):
++ *   a8dvfs=1   read every domain's rate, read the codec's first registers (no writes anywhere)
++ *   a8dvfs=2   and set the rates below, then read them back
++ *   a8lit=KHZ  A53s (default 1690000)    a8big=KHZ  A73s (default 2184000)
++ *   a8mif=KHZ  memory bus (default 1794000)    a8g3d=KHZ  GPU (default 0 = leave it; replaces sweetgpumhz)
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_a8_dvfs_init(void);
++int sweet_a8_acpm_codec_read(uint8_t reg, uint8_t *val);
++int sweet_a8_acpm_codec_write(uint8_t reg, uint8_t val);
++
++#define MBOX_PA         0x11c40000u
++#define SRAM_PA         0x02052000u
++#define SRAM_SIZE       0x1b000u
++#define INITDATA        0x4b80u
++#define INTGR0          0x08u
++#define INTCR1          0x20u
++#define INTSR1          0x28u
++#define CH_MFD          2
++#define CH_DVFS         5
++#define FREQ_REQ        0
++#define FREQ_GET        1
++#define TYPE_CODEC      7
++
++struct q {
++	uint32_t rear, front, base;     /* SRAM offsets */
++};
++struct chan {
++	uint32_t id, len, size;
++	struct q send, recv;            /* AP -> ACPM (its rx queue), ACPM -> AP (its tx queue) */
++	unsigned seq;
++};
++
++static vm_offset_t mbox, sram;
++static struct chan ch[8];
++static int acpm_ready;
++
++static inline uint32_t s_rd(uint32_t off) { return *(volatile uint32_t *)(sram + off); }
++static inline void s_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(sram + off) = v; }
++
++static int
++chan_setup(int i)
++{
++	uint32_t fw = INITDATA, chans = s_rd(fw + 8), apmax = s_rd(fw + 24);
++	uint32_t c;
++
++	if (chans == 0 || chans >= SRAM_SIZE || apmax == 0 || apmax > 32 || (unsigned)i >= apmax) {
++		printf("SWEET ACPM: framework at %#x looks wrong: channels %#x, ap max %u\n", fw, chans, apmax);
++		return ENXIO;
++	}
++	c = chans + (uint32_t)i * 17 * 4;
++	ch[i].id = s_rd(c + 0);
++	ch[i].send.rear = s_rd(c + 16 + 0);
++	ch[i].send.front = s_rd(c + 16 + 4);
++	ch[i].send.base = s_rd(c + 16 + 8);
++	ch[i].recv.rear = s_rd(c + 16 + 24);
++	ch[i].recv.front = s_rd(c + 16 + 28);
++	ch[i].recv.base = s_rd(c + 16 + 32);
++	ch[i].len = s_rd(c + 16 + 36);
++	ch[i].size = s_rd(c + 16 + 40);
++	printf("SWEET ACPM: channel %d: id %u, queue %u x %u bytes, send %#x/%#x/%#x, reply %#x/%#x/%#x, poll %u\n",
++	    i, ch[i].id, ch[i].len, ch[i].size, ch[i].send.rear, ch[i].send.front, ch[i].send.base,
++	    ch[i].recv.rear, ch[i].recv.front, ch[i].recv.base, s_rd(c + 16 + 52));
++	if (ch[i].id > 15 || ch[i].len == 0 || ch[i].len > 64 || ch[i].size < 16 || ch[i].size > 64 ||
++	    ch[i].send.base >= SRAM_SIZE || ch[i].recv.base >= SRAM_SIZE ||
++	    ch[i].send.base + ch[i].len * ch[i].size > SRAM_SIZE || ch[i].recv.base + ch[i].len * ch[i].size > SRAM_SIZE) {
++		printf("SWEET ACPM: channel %d refused\n", i);
++		return ENXIO;
++	}
++	return 0;
++}
++
++static int
++acpm_init(void)
++{
++	if (acpm_ready) {
++		return acpm_ready > 0 ? 0 : ENXIO;
++	}
++	acpm_ready = -1;
++	mbox = ml_io_map(MBOX_PA, 0x1000);
++	sram = ml_io_map(SRAM_PA, SRAM_SIZE);
++	if (!mbox || !sram) {
++		printf("SWEET ACPM: cannot map\n");
++		return ENOMEM;
++	}
++	printf("SWEET ACPM: framework: plugins %u, channels %u, ap channels %u, INTSR1 %#x\n",
++	    s_rd(INITDATA + 4), s_rd(INITDATA + 12), s_rd(INITDATA + 24), *(volatile uint32_t *)(mbox + INTSR1));
++	if (chan_setup(CH_MFD) || chan_setup(CH_DVFS)) {
++		return ENXIO;
++	}
++	acpm_ready = 1;
++	return 0;
++}
++
++/* One command, polled reply (150 ms). cmd has the channel's size in words (at most 16). */
++static int
++acpm_send(int i, uint32_t *cmd)
++{
++	struct chan *c = &ch[i];
++	uint32_t words = c->size / 4, front, rear, next, seq, slot;
++	uint64_t t0, now, limit;
++
++	nanoseconds_to_absolutetime(150 * NSEC_PER_MSEC, &limit);
++	front = s_rd(c->send.front);
++	next = (front + 1) % c->len;
++	t0 = mach_absolute_time();
++	while (s_rd(c->send.rear) == next) {
++		if (mach_absolute_time() - t0 > limit) {
++			printf("SWEET ACPM: channel %d: queue full (front %u rear %u)\n", i, front, s_rd(c->send.rear));
++			return ETIMEDOUT;
++		}
++	}
++	if (++c->seq >= 64) {
++		c->seq = 1;
++	}
++	seq = c->seq;
++	cmd[0] = (cmd[0] & ~(0x3fu << 16)) | (seq << 16);
++	for (uint32_t w = 0; w < words; w++) {
++		s_wr(c->send.base + c->size * front + w * 4, cmd[w]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	s_wr(c->send.front, next);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(mbox + INTGR0) = (1u << c->id) << 16;
++
++	t0 = mach_absolute_time();
++	for (;;) {
++		rear = s_rd(c->recv.rear);
++		front = s_rd(c->recv.front);
++		for (slot = rear; slot != front; slot = (slot + 1) % c->len) {
++			uint32_t at = c->recv.base + c->size * slot;
++			if (((s_rd(at) >> 16) & 0x3f) == seq) {
++				for (uint32_t w = 0; w < words; w++) {
++					cmd[w] = s_rd(at + w * 4);
++				}
++				if (slot != rear) {     /* as Linux: move the older entry into the hole, then advance */
++					for (uint32_t w = 0; w < words; w++) {
++						s_wr(at + w * 4, s_rd(c->recv.base + c->size * rear + w * 4));
++					}
++				}
++				rear = (rear + 1) % c->len;
++				s_wr(c->recv.rear, rear);
++				if (rear == s_rd(c->recv.front)) {
++					*(volatile uint32_t *)(mbox + INTCR1) = 1u << c->id;
++				}
++				return 0;
++			}
++		}
++		now = mach_absolute_time();
++		if (now - t0 > limit) {
++			printf("SWEET ACPM: channel %d: no reply to seq %u (reply rear %u front %u, INTSR1 %#x)\n",
++			    i, seq, rear, front, *(volatile uint32_t *)(mbox + INTSR1));
++			return ETIMEDOUT;
++		}
++	}
++}
++
++static int
++dvfs(uint32_t domain, uint32_t khz, uint32_t func, uint32_t *out)
++{
++	uint32_t cmd[16] = { domain, khz, func, 0 };
++	int e = acpm_send(CH_DVFS, cmd);
++	if (out != NULL) {
++		*out = cmd[1];
++	}
++	return e;
++}
++
++int
++sweet_a8_acpm_codec_read(uint8_t reg, uint8_t *val)
++{
++	uint32_t cmd[16] = { (TYPE_CODEC << 8) | reg, 0 };
++	int e;
++
++	if (acpm_init()) {
++		return ENXIO;
++	}
++	e = acpm_send(CH_MFD, cmd);
++	if (e) {
++		return e;
++	}
++	*val = (uint8_t)(cmd[1] >> 8);
++	return (cmd[1] >> 24) & 0xff ? EIO : 0;
++}
++
++int
++sweet_a8_acpm_codec_write(uint8_t reg, uint8_t val)
++{
++	uint32_t cmd[16] = { (TYPE_CODEC << 8) | reg, 1u | ((uint32_t)val << 8) };
++	int e;
++
++	if (acpm_init()) {
++		return ENXIO;
++	}
++	e = acpm_send(CH_MFD, cmd);
++	if (e) {
++		return e;
++	}
++	return (cmd[1] >> 24) & 0xff ? EIO : 0;
++}
++
++static const char *const names[9] = { "MIF", "INT", "A73", "A53", "G3D", "FSYS", "CAM", "DISP", "AUD" };
++
++static void
++dvfs_report(const char *when)
++{
++	char line[200];
++	int n = 0;
++
++	for (uint32_t d = 0; d < 9; d++) {
++		uint32_t khz = 0;
++		int e = dvfs(d, 0, FREQ_GET, &khz);
++		n += snprintf(line + n, sizeof(line) - n, e ? " %s ?" : " %s %u", names[d], khz / 1000);
++	}
++	printf("SWEET DVFS: %s (MHz):%s\n", when, line);
++}
++
++/* Once, from the storage status thread 30 s after boot (before the CPU clock measurement). */
++void
++sweet_a8_dvfs_init(void)
++{
++	unsigned level = 0, lit = 1690000, big = 2184000, mif = 1794000, g3d = 0;
++	char line[200];
++	int n = 0;
++
++	if (!PE_parse_boot_argn("a8dvfs", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	if (acpm_init()) {
++		return;
++	}
++	dvfs_report("now");
++
++	/* Audio, step 1 (look): the codec's first 16 registers through ACPM, read only. */
++	for (uint8_t r = 0; r < 16; r++) {
++		uint8_t v = 0;
++		int e = sweet_a8_acpm_codec_read(r, &v);
++		n += snprintf(line + n, sizeof(line) - n, e ? " ??" : " %02x", v);
++	}
++	printf("SWEET AUDIO: COD3035 registers 0x00-0x0f through ACPM:%s\n", line);
++
++	if (level < 2) {
++		return;
++	}
++	(void)PE_parse_boot_argn("a8lit", &lit, sizeof(lit));
++	(void)PE_parse_boot_argn("a8big", &big, sizeof(big));
++	(void)PE_parse_boot_argn("a8mif", &mif, sizeof(mif));
++	(void)PE_parse_boot_argn("a8g3d", &g3d, sizeof(g3d));
++	/* memory bus first (the CPUs' constraint tables want it at least as high), then the clusters */
++	struct { uint32_t d, khz, lo, hi; } want[4] = {
++		{ 0, mif, 420000, 1794000 }, { 3, lit, 208000, 1690000 }, { 2, big, 520000, 2184000 }, { 4, g3d, 343000, 1300000 },
++	};
++	for (int i = 0; i < 4; i++) {
++		if (want[i].khz == 0) {
++			continue;
++		}
++		if (want[i].khz < want[i].lo || want[i].khz > want[i].hi) {
++			printf("SWEET DVFS: %s %u kHz is outside %u..%u, skipped\n", names[want[i].d], want[i].khz, want[i].lo, want[i].hi);
++			continue;
++		}
++		int e = dvfs(want[i].d, want[i].khz, FREQ_REQ, NULL);
++		printf("SWEET DVFS: %s to %u MHz: %s (%d)\n", names[want[i].d], want[i].khz / 1000, e ? "failed" : "asked", e);
++	}
++	dvfs_report("after");
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1063,4 +1063,5 @@ static int wst_chan;
+ extern processor_t cpu_to_processor(int cpu);
+ extern processor_t thread_bind(processor_t processor);
+ extern unsigned int real_ncpus;
++extern void sweet_a8_dvfs_init(void);                  /* xnu 0137, sweet_a8acpm.c */
+ 
+@@ -1131,7 +1132,10 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    wst.wbad, wst.rbad, wst.zero, wst.bad_lba, wst.bad_want, wst.bad_got, wst.dirty,
+ 		    wst.multi, wst.mfail, wst.mbad);
+ 		sweet_mali_status();
+ #if defined(SWEET_JACKPOTLTE)
++		if (clocks == 0) {                              /* xnu 0137: ACPM speeds (boot-arg a8dvfs) */
++			sweet_a8_dvfs_init();
++		}
+ 		if (clocks++ % 4 == 0) {                        /* 30 s after boot, then every 2 minutes */
+ 			sweet_cpu_clocks();
+ 		}
