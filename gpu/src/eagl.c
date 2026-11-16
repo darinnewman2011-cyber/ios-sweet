@@ -789,9 +789,9 @@ wrapped_alpha_first(IOSurfaceRef surface)
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	first = !(last_bad < first_bad);
 	if (told++ < 32) {
-		say("redwood-gl: IOSurface %u (no pixel format, %zu x %zu): %u lit samples, %u break opacity-first, %u "
-		    "opacity-last: read opacity %s\n", IOSurfaceGetID(surface), w, h, lit, first_bad, last_bad,
-		    first ? "first" : "last (blue-first)");
+		say("redwood-gl: nofmt %u %zux%zu lit %u bad %u/%u %s
+", IOSurfaceGetID(surface), w, h, lit, first_bad, last_bad,
+		    first ? "AF" : "BGRA");
 	}
 	return first;
 }
