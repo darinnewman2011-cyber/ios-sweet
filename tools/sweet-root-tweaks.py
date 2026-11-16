@@ -32,7 +32,7 @@ screen (image versions v8-v14 in NOTES.md):
 """
 import glob, os, plistlib, shutil, sys
 
-BUILD, VERSION = '20H392', '16.7.16'
+BUILD, VERSION = None, None  # read from the image's SystemVersion.plist in main()
 MOBILE = 501
 
 
@@ -144,6 +144,12 @@ def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
+    global BUILD, VERSION
+    # The migration and activation keys must name the image's own build: a mismatch
+    # makes DataMigration run its update pass (Apple logo + progress bar) on every boot.
+    sv = load(os.path.join(root, 'System/Library/CoreServices/SystemVersion.plist'))
+    BUILD, VERSION = sv['ProductBuildVersion'], sv['ProductVersion']
+    print('system version', VERSION, BUILD)
     launchd(root)
     containers(root)
     activation(root)
