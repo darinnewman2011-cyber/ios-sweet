@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,656 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -273,6 +273,29 @@ new file mode 100644
 +		} else {
 +			printf("SWEET AUDIO: 2 clocks: %s = %#x, left\n", qch[i].name, v);
 +		}
++	}
++	/*
++	 * Run 72: RDMA0 never read memory with any format. Its way to DRAM: ABOX's ASB/SysMMU/PPMU, LHS_AXI_D_ABOX
++	 * (CMU_DISPAUD) and LHM_AXI_D_ABOX (CMU_CORE 0x12000000). Their gates held on (CG_VAL|MANUAL) and their
++	 * Q-channels forced on (ENABLE 0, CLOCK_REQ 1). Offsets: Samsung cmucal-sfr.c for the 7885 (facts only).
++	 */
++	static const struct { uint32_t off; const char *name; } path_gate[] = {
++		{ 0x2020, "gate ABOX CCLK_ASB" }, { 0x2024, "gate ABOX CCLK_CA7" }, { 0x2088, "gate LHS_AXI_D_ABOX" },
++		{ 0x209c, "gate PPMU_ABOX ACLK" }, { 0x20d0, "gate SMMU_ABOX" },
++	};
++	static const struct { uint32_t off; const char *name; } path_qch[] = {
++		{ 0x3034, "QCH LHS_AXI_D_ABOX" }, { 0x303c, "QCH PPMU_ABOX" }, { 0x3044, "QCH SMMU_ABOX" },
++	};
++	for (unsigned i = 0; i < sizeof(path_gate) / sizeof(path_gate[0]); i++) {
++		(void)wr_bits(cmu, path_gate[i].name, path_gate[i].off, GATE_ON, GATE_ON);
++	}
++	for (unsigned i = 0; i < sizeof(path_qch) / sizeof(path_qch[0]); i++) {
++		(void)wr_bits(cmu, path_qch[i].name, path_qch[i].off, 3, 2);
++	}
++	vm_offset_t core = ml_io_map(0x12000000u, 0x4000);
++	if (core) {
++		(void)wr_bits(core, "CMU_CORE gate LHM_AXI_D_ABOX", 0x2070, GATE_ON, GATE_ON);
++		(void)wr_bits(core, "CMU_CORE QCH LHM_AXI_D_ABOX", 0x3034, 3, 2);
 +	}
 +	return true;
 +}
@@ -532,6 +555,114 @@ new file mode 100644
 +	printf("SWEET AUDIO: 6 tone: done; did you hear it in the headphones?\n");
 +}
 +
++/*
++ * Speaker, step 1 (look, read only on the amplifier): the NXP TFA9872 at 0x34 on I2C3 (0x13860000, an s3c2440-type
++ * controller; stock DT /i2c@13860000/tfa98xx@34), fed by ABOX UAIF3 on Android (mixer_paths route-spkamp-playback).
++ * Pins gpp3-0/1 function 2, pull-up (pinctrl 0x139B0000 bank 0x80); clock CMU_PERI 0x10010000 gate 0x2044, Q 0x3024.
++ * Registers are 16 bits, big endian, after an 8-bit address. Polled: IICCON bit 4 is the pending flag.
++ */
++#define I2C3_PA         0x13860000u
++#define IICCON          0x00u
++#define IICSTAT         0x04u
++#define IICDS           0x0cu
++#define IICLC           0x10u
++#define TFA_ADDR        0x34u
++
++static vm_offset_t i2c;
++
++static int
++i2c_wait(void)
++{
++	for (int i = 0; i < 2000; i++) {
++		if (rd(i2c, IICCON) & 0x10) {
++			return 0;
++		}
++		delay(10);
++	}
++	return ETIMEDOUT;
++}
++
++static inline void i2c_go(uint32_t ack) { *(volatile uint32_t *)(i2c + IICCON) = (ack ? 0x80u : 0) | 0x60u | 3u; }
++
++static void
++i2c_stop(uint32_t mode)
++{
++	*(volatile uint32_t *)(i2c + IICSTAT) = mode;
++	i2c_go(0);
++	delay(100);
++}
++
++static int
++tfa_read(uint8_t reg, uint16_t *val)
++{
++	uint8_t hi, lo;
++
++	*(volatile uint32_t *)(i2c + IICDS) = TFA_ADDR << 1;
++	*(volatile uint32_t *)(i2c + IICSTAT) = 0xf0;           /* master transmit, START, output on */
++	if (i2c_wait() || (rd(i2c, IICSTAT) & 1)) {
++		i2c_stop(0xd0);
++		return ENXIO;                                       /* no ACK for the address */
++	}
++	*(volatile uint32_t *)(i2c + IICDS) = reg;
++	i2c_go(1);
++	if (i2c_wait() || (rd(i2c, IICSTAT) & 1)) {
++		i2c_stop(0xd0);
++		return EIO;
++	}
++	*(volatile uint32_t *)(i2c + IICDS) = (TFA_ADDR << 1) | 1;
++	*(volatile uint32_t *)(i2c + IICSTAT) = 0xb0;           /* master receive, repeated START */
++	i2c_go(1);
++	if (i2c_wait()) {
++		i2c_stop(0x90);
++		return EIO;
++	}
++	i2c_go(1);                                              /* first byte, ACK */
++	if (i2c_wait()) {
++		i2c_stop(0x90);
++		return EIO;
++	}
++	hi = (uint8_t)rd(i2c, IICDS);
++	i2c_go(0);                                              /* last byte, NACK */
++	if (i2c_wait()) {
++		i2c_stop(0x90);
++		return EIO;
++	}
++	lo = (uint8_t)rd(i2c, IICDS);
++	i2c_stop(0x90);
++	*val = (uint16_t)(hi << 8 | lo);
++	return 0;
++}
++
++static void
++step_speaker_look(void)
++{
++	vm_offset_t peri = ml_io_map(0x10010000u, 0x4000), top = ml_io_map(0x139b0000u, 0x1000);
++	char line[160];
++	int n = 0;
++
++	i2c = ml_io_map(I2C3_PA, 0x100);
++	if (!peri || !top || !i2c) {
++		printf("SWEET AUDIO: spk: cannot map\n");
++		return;
++	}
++	(void)wr_bits(peri, "spk: CMU_PERI gate I2C3 PCLK", 0x2044, GATE_ON, GATE_ON);
++	(void)wr_bits(peri, "spk: CMU_PERI QCH I2C3", 0x3024, 3, 2);
++	(void)wr_bits(top, "spk: gpp3 CON (0, 1 function 2: I2C3)", 0x80, 0xff, 0x22);
++	(void)wr_bits(top, "spk: gpp3 PUD (0, 1 pull-up)", 0x88, 0xff, 0x33);
++	*(volatile uint32_t *)(i2c + IICLC) = 0;
++	i2c_go(1);
++	*(volatile uint32_t *)(i2c + IICSTAT) = 0x10;           /* output on, idle */
++	printf("SWEET AUDIO: spk: I2C3 CON %#x STAT %#x; gpp3 DAT %#x (both high when the bus is idle)\n",
++	    rd(i2c, IICCON), rd(i2c, IICSTAT), rd(top, 0x84));
++	static const uint8_t regs[6] = { 0x00, 0x01, 0x03, 0x10, 0x13, 0x51 };
++	for (unsigned i = 0; i < 6; i++) {
++		uint16_t v = 0;
++		int e = tfa_read(regs[i], &v);
++		n += snprintf(line + n, sizeof(line) - n, e ? " %02x:err%d" : " %02x:%04x", regs[i], e ? e : v);
++	}
++	printf("SWEET AUDIO: spk: TFA9872 at 0x34 (0x03 is the revision; 0x..72 is a TFA9872):%s\n", line);
++}
++
 +void
 +sweet_a8_audio_run(void)
 +{
@@ -548,6 +679,7 @@ new file mode 100644
 +		printf("SWEET AUDIO: cannot map\n");
 +		return;
 +	}
++	step_speaker_look();
 +	step_look();
 +	if (n < 2 || !step_clocks()) {
 +		return;
