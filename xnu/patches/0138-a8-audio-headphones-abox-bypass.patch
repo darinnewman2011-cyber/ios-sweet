@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,450 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -257,6 +257,23 @@ new file mode 100644
 +	(void)wr_bits(cmu, "gate RSTNSYNC UAIF0", GATE_RST0, GATE_ON, GATE_ON);
 +	(void)wr_bits(cmu, "gate RSTNSYNC UAIF2", GATE_RST2, GATE_ON, GATE_ON);
 +	printf("SWEET AUDIO: 2 clocks: DIV_UAIF2 (the codec's MCLK) left at %#x\n", rd(cmu, DIV_UAIF2));
++	/*
++	 * Q-channels (as Scion's S9 driver asks them on, as clk_enable() does): CLOCK_REQ (bit 1) unless the hardware
++	 * gates the clock itself (ENABLE, bit 0). CMU_DISPAUD: DMYQCH ABOX 0x3000, DMYQCH CPU 0x3004 (ABOX's CPU clock,
++	 * which Samsung's abox_enable() turns on even before firmware), QCH BUS 0x300C, UAIF0 0x3010, UAIF2 0x3014.
++	 */
++	static const struct { uint32_t off; const char *name; } qch[] = {
++		{ 0x3000, "QCH ABOX (dummy)" }, { 0x3004, "QCH CPU (dummy)" }, { 0x300c, "QCH BUS" },
++		{ 0x3010, "QCH UAIF0" }, { 0x3014, "QCH UAIF2" },
++	};
++	for (unsigned i = 0; i < sizeof(qch) / sizeof(qch[0]); i++) {
++		uint32_t v = rd(cmu, qch[i].off);
++		if (!(v & 1) && !(v & 2)) {
++			(void)wr_bits(cmu, qch[i].name, qch[i].off, 2, 2);
++		} else {
++			printf("SWEET AUDIO: 2 clocks: %s = %#x, left\n", qch[i].name, v);
++		}
++	}
 +	return true;
 +}
 +
@@ -356,6 +373,9 @@ new file mode 100644
 +		(void)wr(mmu, "SysMMU CTRL (translating: off, addresses physical)", 0x0, 0);
 +	}
 +	(void)wr_bits(abox, "SYSPOWER_CTRL (on)", SYSPOWER, 1, 1);
++	/* ABOX never gates its bus clock or UAIF0's BCLK while it plays (Scion: ACLK and BCLK_UAIF1 = bit 3; so
++	 * BCLK_UAIF0 = bit 2 and ACLK = bit 0 here, INFERRED from the S9's layout) */
++	(void)wr_bits(abox, "QCHANNEL_DISABLE (ACLK, BCLK_UAIF0; inferred bits)", QCH_DISABLE, 0x5, 0x5);
 +	(void)wr_bits(abox, "SPUS_CTRL0 (chain 0: RDMA, SIFS1, no ASRC)", SPUS0, 0xf, 0x0);
 +	/*
 +	 * (run 59) RDMA0 said "in progress" but never read a byte: without calliope, nobody gives it a sample bank.
@@ -447,7 +467,7 @@ new file mode 100644
 +		return;
 +	}
 +	abox = ml_io_map(ABOX_PA, 0x2000);
-+	cmu = ml_io_map(CMU_PA, 0x3000);
++	cmu = ml_io_map(CMU_PA, 0x4000);
 +	gpio = ml_io_map(GPIO_PA, 0x1000);
 +	mmu = ml_io_map(MMU_PA, 0x1000);
 +	if (!abox || !cmu || !gpio || !mmu) {
