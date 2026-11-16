@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        description: macOS release whose xnu to build (13.5 = xnu-8796 iOS 16, 14.6 = xnu-10063 iOS 17, 15.6 = xnu-11417 iOS 18)
         default: "13.5"
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
@@ -51,8 +51,31 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # build.sh applies dxb/patches (12.5-14.3), patches/14.4 (14.4-14.5) or
+          # patches/15.0 (14.6-15.6); ours go next to blacktop's in that dir
+          case "$MACOS_VERSION" in
+            12.5|13.*|14.[0-3]) pdir=dxb/patches ;;
+            14.4|14.5) pdir=dxb/patches/14.4 ;;
+            14.6|15.*) pdir=dxb/patches/15.0 ;;
+            *) echo "unsupported macos_version $MACOS_VERSION"; exit 1 ;;
+          esac
+          echo "PATCH_DIR=$pdir" >> "$GITHUB_ENV"
+          cp xnu/patches/*.patch xnu/patches/*.sh "$pdir"/
+          # xnu/patches-<macOS>/ ports the series to a newer xnu: NAME.patch
+          # replaces the base patch of that name, NAME.patch.drop removes it
+          # (already upstream), new names add patches (09xx sort after the base)
+          if [ -d "xnu/patches-$MACOS_VERSION" ]; then
+            for f in xnu/patches-"$MACOS_VERSION"/*; do
+              b=$(basename "$f")
+              case "$b" in
+                *.drop) rm -v "$pdir/${b%.drop}" ;;
+                *) cp -v "$f" "$pdir/$b" ;;
+              esac
+            done
+          elif [ "$MACOS_VERSION" != 13.5 ]; then
+            echo "no xnu/patches-$MACOS_VERSION: the series targets xnu-8796 (13.5)"; exit 1
+          fi
+          ls "$pdir" > patchlist.txt
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
@@ -62,7 +85,7 @@ jobs:
             sed -i '' "s/VALID_ARCHS=\"x86_64 arm64e arm64\"/& 'OTHER_CFLAGS=\$(inherited) \$(SWEET_ARCH_CFLAGS_\$(CURRENT_ARCH))' 'SWEET_ARCH_CFLAGS_arm64=-mcpu=generic -march=armv8-a'/" dxb/build.sh
             grep -c 'SWEET_ARCH_CFLAGS_arm64=' dxb/build.sh
           fi
-          ls dxb/patches
+          cat patchlist.txt
 
       - name: Deps
         run: |
@@ -83,7 +106,13 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+          # build.sh only warns when a patch does not apply; every one of ours must
+          if grep -E 'Skipping patch .*/[0-9]{4}-' ../build.log; then
+            echo "::error::one of our xnu patches did not apply"; exit 1
+          fi
 
       - name: Package build tree for local compiles
         if: always()
@@ -103,7 +132,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree-${{ env.SWEET_BOARD }}
+          name: xnu-buildtree-${{ env.SWEET_BOARD }}${{ env.MACOS_VERSION != '13.5' && format('-{0}', env.MACOS_VERSION) || '' }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -155,6 +184,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel-${{ env.SWEET_BOARD }}
+          name: xnu-kernel-${{ env.SWEET_BOARD }}${{ env.MACOS_VERSION != '13.5' && format('-{0}', env.MACOS_VERSION) || '' }}
           path: out/
           if-no-files-found: warn

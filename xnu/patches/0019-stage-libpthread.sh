@@ -3,15 +3,15 @@
 set -euo pipefail
 
 [[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
-[[ "${MACOS_VERSION:-}" == 13.5 ]] || {
-    echo 'SWEET libpthread integration requires xnu-8796.141.3 (macOS 13.5)' >&2
-    exit 1
-}
+case "${MACOS_VERSION:-}" in
+    13.5) pthread_tag=libpthread-514.100.2 pthread_sha=a6c70ca0e544347a0377babf748f831577ec24f9 ;;  # paired with xnu-8796.141.3 in macos-135
+    14.6) pthread_tag=libpthread-519.120.4 pthread_sha=c0e60fb5ecfc54cf379c261d3f9572cc22ded891 ;;  # paired with xnu-10063.141.1 in macos-146
+    15.6) pthread_tag=libpthread-536 pthread_sha=1ebf56b3a702df53213c2996e5e128a535d2577e ;;  # paired with xnu-11417.140.69 in macos-156
+    *) echo "SWEET libpthread integration: no pinned libpthread for macOS ${MACOS_VERSION:-}" >&2; exit 1 ;;
+esac
 [[ -f bsd/pthread/pthread_shims.c ]] || exit 1
 
-# libpthread-514.100.2 is paired with xnu-8796.141.3 in Apple's macos-135
-# release.json. Fetch the immutable commit, never a moving branch/tag.
-pthread_sha=a6c70ca0e544347a0377babf748f831577ec24f9
+# Apple release.json pairing; fetch the immutable commit, never a moving branch/tag.
 pthread_tmp=$(mktemp -d)
 trap 'rm -rf "$pthread_tmp"' EXIT
 git init -q "$pthread_tmp"
@@ -62,4 +62,4 @@ PY
 # the provider so local compiles from the uploaded build tree work as well.
 pthread_sdk=$(xcrun --sdk macosx --show-sdk-path)
 cp "$pthread_sdk/usr/include/TargetConditionals.h" bsd/pthread/sweet_libpthread/
-echo "Staged libpthread-514.100.2 ($pthread_sha) for SWEET"
+echo "Staged ${pthread_tag} ($pthread_sha) for SWEET"

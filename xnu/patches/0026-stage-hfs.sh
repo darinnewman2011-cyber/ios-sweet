@@ -4,15 +4,15 @@
 set -euo pipefail
 
 [[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
-[[ "${MACOS_VERSION:-}" == 13.5 ]] || {
-    echo 'SWEET HFS integration requires xnu-8796.141.3 (macOS 13.5)' >&2
-    exit 1
-}
+case "${MACOS_VERSION:-}" in
+    13.5) hfs_tag=hfs-627.100.6 hfs_sha=31d5ec238dfab485e78a9a30b8b92d13e8914f03 ;;  # paired with xnu-8796.141.3 in macos-135
+    14.6) hfs_tag=hfs-650.140.2 hfs_sha=8804cd8e786c267e2610a8e05060de4abad20b1e ;;  # paired with xnu-10063.141.1 in macos-146
+    15.6) hfs_tag=hfs-683.120.3 hfs_sha=0d90b5c1924ce74cf865ff3e92f94c0cc98cd1bc ;;  # paired with xnu-11417.140.69 in macos-156
+    *) echo "SWEET hfs integration: no pinned hfs for macOS ${MACOS_VERSION:-}" >&2; exit 1 ;;
+esac
 [[ -f bsd/kern/bsd_init.c ]] || exit 1
 
-# hfs-627.100.6 is paired with xnu-8796.141.3 in Apple's macos-135
-# release.json. Fetch the immutable commit, never a moving branch/tag.
-hfs_sha=31d5ec238dfab485e78a9a30b8b92d13e8914f03
+# Apple release.json pairing; fetch the immutable commit, never a moving branch/tag.
 hfs_tmp=$(mktemp -d)
 trap 'rm -rf "$hfs_tmp"' EXIT
 git init -q "$hfs_tmp"
@@ -52,4 +52,4 @@ PY
 # Kernel builds use -nostdinc; HFS's kext-config.h needs the SDK's target macros.
 hfs_sdk=$(xcrun --sdk macosx --show-sdk-path)
 cp "$hfs_sdk/usr/include/TargetConditionals.h" bsd/sweet_hfs/
-echo "Staged hfs-627.100.6 ($hfs_sha) for SWEET"
+echo "Staged ${hfs_tag} ($hfs_sha) for SWEET"
