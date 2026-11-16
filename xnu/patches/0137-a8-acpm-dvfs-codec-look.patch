@@ -33,7 +33,7 @@ new file mode 100644
 + *   ipc_channels, num_ipc_channels, pid_framework, pid_max, ipc_ap_max, ...); ipc_channels = SRAM offset of
 + *   struct ipc_channel { id, field, owner, type, { rx_rear, rx_front, rx_base, rx_indr_buf,
 + *   rx_indr_buf_base, rx_indr_buf_size, tx_rear, tx_front, tx_base, q_len, q_elem_size, credit,
-+ *   mbox_addr }, ap_poll } (17 u32). The AP sends on the rx_* queue and reads replies on the tx_* queue;
++ *   mbox_addr }, ap_poll } (18 u32). The AP sends on the rx_* queue and reads replies on the tx_* queue;
 + *   cmd[0] carries a sequence number (1..63) at bits 21:16 which the reply repeats.
 + *   DVFS: channel 5, cmd = { domain, kHz, 0 = FREQ_REQ | 1 = FREQ_GET, 0 }; domains 0 MIF (memory bus),
 + *   1 INT, 2 CPUCL0 (A73s), 3 CPUCL1 (A53s), 4 G3D, 5 FSYS, 6 CAM, 7 DISP, 8 AUD.
@@ -100,7 +100,7 @@ new file mode 100644
 +		printf("SWEET ACPM: framework at %#x looks wrong: channels %#x, ap max %u\n", fw, chans, apmax);
 +		return ENXIO;
 +	}
-+	c = chans + (uint32_t)i * 17 * 4;
++	c = chans + (uint32_t)i * 18 * 4;   /* 4 + 13 + 1 words (run 58: 17 read the wrong place) */
 +	ch[i].id = s_rd(c + 0);
 +	ch[i].send.rear = s_rd(c + 16 + 0);
 +	ch[i].send.front = s_rd(c + 16 + 4);
