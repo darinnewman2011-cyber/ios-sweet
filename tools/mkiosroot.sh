@@ -80,7 +80,9 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# MKIOSROOT_NOSYMBOLS=1 leaves out the dyld cache .symbols file (debug symbols only, several GB:
+	# iOS 17 does not fit the K88's ~14 GiB root range with it).
+	sudo rsync -aH --numeric-ids ${MKIOSROOT_NOSYMBOLS:+--exclude=dyld_shared_cache_*.symbols} "$1/" "$2/"
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
