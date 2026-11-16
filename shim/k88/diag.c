@@ -569,18 +569,10 @@ static void test_clock(void)
 	k88_present();
 }
 
-#ifdef K88_CLOCK
-/*
- * Milestone 6b: clocks up. diag12 (read only) found the c0 cluster (MPIDR
- * 0x0xx, RCG 0xb111050) on XO (19 MHz, cfg 0) and c1 (0x1xx, RCG 0xb011050)
- * on GPLL0 (800 MHz, cfg 0x401 = source 4); both A53SS PLLs off but with
- * CONFIG_CTL set; VDD_APC (PM8950 S5, FTS2.5 range 0: 80 mV + 5 mV * VSET)
- * at 1.225 V = the DT's nominal-corner ceiling; VDD_MX (L3) high.
- * DT cpu-clock-8939 tables (speed bin 1): c1 806.4/960/1094.4/1344 MHz
- * nominal, 1440/1516.8 turbo; c0 806.4/998.4/1094.4 nominal, 1209.6 turbo.
- * Turbo ceiling 1.35 V; open-loop voltage from the CPR fuse (row 0x1b bits
- * 0-5, sign + 10 mV steps from 1.35 V). mem-acc (0x1942130) 0xffff at the turbo corner.
- */
+#if defined(K88_CLOCK) || defined(K88_WP)
+#define K88_SPMI_WR
+#endif
+#ifdef K88_SPMI_WR
 #define SPMI_CHNLS	0x02400000UL
 
 static uint32_t spmi_wr(unsigned sid, unsigned addr, uint8_t v)
@@ -600,6 +592,20 @@ static uint32_t spmi_wr(unsigned sid, unsigned addr, uint8_t v)
 	}
 	return 0x1fe;
 }
+#endif
+
+#ifdef K88_CLOCK
+/*
+ * Milestone 6b: clocks up. diag12 (read only) found the c0 cluster (MPIDR
+ * 0x0xx, RCG 0xb111050) on XO (19 MHz, cfg 0) and c1 (0x1xx, RCG 0xb011050)
+ * on GPLL0 (800 MHz, cfg 0x401 = source 4); both A53SS PLLs off but with
+ * CONFIG_CTL set; VDD_APC (PM8950 S5, FTS2.5 range 0: 80 mV + 5 mV * VSET)
+ * at 1.225 V = the DT's nominal-corner ceiling; VDD_MX (L3) high.
+ * DT cpu-clock-8939 tables (speed bin 1): c1 806.4/960/1094.4/1344 MHz
+ * nominal, 1440/1516.8 turbo; c0 806.4/998.4/1094.4 nominal, 1209.6 turbo.
+ * Turbo ceiling 1.35 V; open-loop voltage from the CPR fuse (row 0x1b bits
+ * 0-5, sign + 10 mV steps from 1.35 V). mem-acc (0x1942130) 0xffff at the turbo corner.
+ */
 
 static inline void wdog_pet(void)
 {
@@ -1028,6 +1034,136 @@ static void test_mmc(void)
 	con_hex2(" ", "blksz=", sec[10], "blocks=", sec[11]);
 }
 
+#ifndef K88_CLOCK
+void secondary_clock(void)	/* start.S entry used only by K88_CLOCK builds */
+{
+	smc(PSCI_CPU_OFF, 0, 0, 0);
+}
+#endif
+
+#ifdef K88_WP
+/*
+ * diag20 (read only for the card's data): LK power-on write-protects the old
+ * `system` partition (ios5: CMD25 into it got R1 0x4000c00 = WP_VIOLATION).
+ * Read EXT_CSD's WP setup, ask CMD31 for the protection of a few areas, then
+ * try (1) CMD0 + full init and (2) an eMMC VCC power cycle (PM8950 L8, SID 1
+ * 0x4700, enable 0x46 bit 7) + full init, asking CMD31 again after each.
+ */
+static uint32_t ext_csd[128];
+
+/* one data block of len bytes for command idx; returns 0 on success */
+static int sd_rdcmd(uint32_t idx, uint32_t arg, uint32_t len, uint32_t *buf)
+{
+	uint32_t r, st;
+
+	wr32(HC(0x04), (1U << 16) | len);
+	st = sd_cmd(idx, arg, R48 | 0x20U, 0x10U, &r);
+	if (!(st & 1) || (st & 0x8000U))
+		return 0x100 | (st & 0xff);
+	st = sd_wait(0x20, 500);
+	if (!(st & 0x20) || (st & 0x8000U)) {
+		sd_reset();
+		return 0x200 | (st >> 16);
+	}
+	wr32(HC(0x30), 0x20);
+	for (uint32_t i = 0; i < len / 4; i++)
+		buf[i] = mmio32(HC(0x20));
+	sd_wait(2, 500);
+	wr32(HC(0x30), 0xffffffffU);
+	return (r >> 26) & 0x3f ? 0x400 | (r >> 26) : 0;
+}
+
+static uint8_t ecsd(unsigned i) { return (ext_csd[i / 4] >> (8 * (i % 4))) & 0xff; }
+
+/* bring the card from idle to transfer state at RCA 2, 8-bit, 50 MHz */
+static int mmc_init_full(void)
+{
+	uint32_t st, r, ocr = 0;
+
+	wr8(HC(0x28), 0);
+	sd_rate(0);
+	st = sd_cmd(0, 0, 0, 0, &r);
+	delay_ms(2);
+	for (int i = 0; i < 1000; i++) {
+		st = sd_cmd(1, 0x40ff8080U, 0x02, 0, &ocr);
+		if ((st & 1) && (ocr & 0x80000000U))
+			break;
+		delay_ms(2);
+	}
+	con_hex2(" CMD1", "int=", st, "ocr=", ocr);
+	sd_cmd(2, 0, 0x09, 0, &r);
+	sd_cmd(3, 2U << 16, R48, 0, &r);
+	st = sd_cmd(7, 2U << 16, R48B, 0, &r);
+	st = sd_cmd(13, 2U << 16, R48, 0, &r);
+	con_hex2(" CMD13", "int=", st, "r1=", r);
+	if (!(st & 1) || ((r >> 9) & 15) != 4)
+		return -1;
+	sd_cmd(6, (3U << 24) | (185U << 16) | (1U << 8), R48B, 0, &r);
+	sd_cmd(6, (3U << 24) | (183U << 16) | (2U << 8), R48B, 0, &r);
+	wr8(HC(0x28), 0x24);
+	sd_rate(1);
+	st = sd_cmd(13, 2U << 16, R48, 0, &r);
+	return ((r >> 9) & 15) == 4 ? 0 : -2;
+}
+
+/* the root's failed write (0x7cff38), system/cache/userdata starts (sectors) */
+static const uint32_t wp_lba[4] = { 1179648 + 0x7cff38, 3276800, 1179648, 9568256 };
+
+static void wp_status(const char *when)
+{
+	static uint32_t t[2];
+
+	con_str("WP", when);
+	for (int i = 0; i < 4; i++) {
+		t[0] = t[1] = 0xdeadbeef;
+		int e = sd_rdcmd(31, wp_lba[i], 8, t);	/* 32 groups x 2 bits, first group in the top bits */
+		con_hex2(" wp", "e=", e | (i << 16), "w0=", t[0]);
+		con_hex2(" ", "w1=", t[1], "lba=", wp_lba[i]);
+	}
+	k88_present();
+}
+
+static void test_wp(void)
+{
+	uint32_t e, r, en;
+
+	e = sd_rdcmd(8, 0, 512, ext_csd);
+	con_hex2("ECSD", "e=", e, "rev=", ecsd(192));
+	con_hex2(" ", "userwp=", ecsd(171), "bootwp=", ecsd(173));
+	con_hex2(" ", "rstn=", ecsd(162), "egdef=", ecsd(175));
+	con_hex2(" ", "wpgrp=", ecsd(221), "ergrp=", ecsd(224));
+	wp_status("as LK left it");
+
+	/* 1: CMD0 + full init */
+	e = mmc_init_full();
+	con_hex2("RESET1", "cmd0 init=", e, 0, 0);
+	if (!e)
+		wp_status("after CMD0");
+
+	/* 2: eMMC VCC power cycle */
+	con_hex2("L8", "type=", spmi_rd(1, 0x4704), "sub=", spmi_rd(1, 0x4705));
+	en = spmi_rd(1, 0x4746);
+	con_hex2(" ", "en=", en, "vset=", spmi_rd(1, 0x4741));
+	/* diag20: type 0x21 subtype 0x0b = ULT LDO (qcom spmi-regulator types: 0x04 LDO, 0x21 ULT_LDO) */
+	if (spmi_rd(1, 0x4704) != 0x04 && spmi_rd(1, 0x4704) != 0x21) {	/* not an LDO: leave it */
+		con_str("L8", "not an LDO, skip");
+		return;
+	}
+	wr8(HC(0x2c), mmio32(HC(0x2c)) & ~4U);		/* card clock off */
+	r = spmi_wr(1, 0x4746, en & 0x7f);
+	delay_ms(100);
+	con_hex2(" off", "wr=", r, "en=", spmi_rd(1, 0x4746));
+	r = spmi_wr(1, 0x4746, en | 0x80);
+	delay_ms(20);
+	con_hex2(" on", "wr=", r, "en=", spmi_rd(1, 0x4746));
+	wr32(HC(0x2c), mmio32(HC(0x2c)) | 4);
+	e = mmc_init_full();
+	con_hex2("RESET2", "vcc init=", e, 0, 0);
+	if (!e)
+		wp_status("after VCC cycle");
+}
+#endif
+
 /*
  * Milestone 5: keys and touch. TLMM (0x1000000): GPIO n config at n * 0x1000
  * (pull [1:0], function [5:2], drive [8:6], output enable 9), in/out at +4.
@@ -1323,6 +1459,11 @@ void k88_main(uintptr_t dtb)
 	k88_present();
 	test_mmc();
 	k88_present();
+#ifdef K88_WP
+	test_wp();
+	k88_present();
+	finish();
+#endif
 	test_input();
 	k88_present();
 	finish();

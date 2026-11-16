@@ -139,6 +139,22 @@ Runs:
   `ios16-root-base.img` was written there with `tools/k88push.py` (64 MiB chunks, each read back and MD5-checked; `adb
   exec-in` mangles binary data on this TWRP, so chunks go through `/tmp`). The system partition was saved first to WSL
   `/opt/sweet/k88-system.img` (MD5 `0c4cead6…`). Android no longer boots; TWRP still does.
+- **LK power-on write-protects `system` (2026-11-15).** After ios5 reached the lock screen once, every later boot failed
+  `cannot mount root, errno = 19`: the HFS journal replay's first CMD25 (root sector `0x7cff38`, inside the old `system`
+  partition) got R1 `0x4000c00` = WP_VIOLATION, and the driver's reads failed after that. ZTE's LK (aboot strings
+  `mmc_wp`, `Failed to set power on WP for user`, `emmcwpflag`) sets eMMC power-on write protection on the partition
+  named `system` at every normal boot (TWRP's recovery boot does not, which is why the root could be written from TWRP).
+  Shim diag20/21 (`-DK88_WP`): EXT_CSD USER_WP = 1, RST_n function 1 (no reset pin wired), WP group 8 MiB; CMD31 shows
+  `system` all power-on protected, cache/userdata not. CMD0 + re-init does not clear it; a direct SPMI write to PM8950 L8
+  (eMMC VCC, ULT LDO type 0x21 at SID 1 0x4700) is ignored (RPM-owned). Renaming the GPT entry made LK reboot-loop (it
+  needs a `system` entry); restored. **Fix (Darin's OK):** both GPT copies now put `system` at sectors 30507008-30523391
+  (8 MiB, unused tail) and end `userdata` at 30507007; the root range (cache start to userdata end) still covers the
+  13 GiB image (ends at 28442624). LK boots normally and protects only that unused tail. Originals and edited copies:
+  `_tmp/k88gpt/` (PC only; `gptmove.py`).
+- **CPU clocks (shim diag12-19, `-DK88_CLOCK`):** c1 1516.8 MHz and c0 1209.6 MHz at 1.275 V pass an 8-core stress.
+  Sequence: CPU_ON one c0 core on its FIRST start and park it (c0 restarts at XO hang; c0's PLL0/RCG only work while the
+  cluster is powered), S5 VSET from the CPR fuse + 25 mV, mem-acc 0xffff, c1 GPLL0 -> PLL1 (L 79), PLL0 (L 63), c0 XO ->
+  PLL0. APCS watchdog bite is 20 bits wide (keep `K88_WDOG_S` under 32).
 - **eMMC hand-over (shim diag5-11):** LK's exit (`target_uninit`: `mmc_put_card_to_sleep`, `sdhci_mode_disable`) leaves
   HC_MODE 0, its HS400 vendor setting (hc+0x10c `0x358B1C`), the GCC SDCC1 clock at the HS200 rate (cfg `0x205`) and the
   card asleep at RCA 2. What works (diag11, then xnu 0137): vendor function `0xA1C`, HC_MODE_EN + FF_CLK_SW_RST_DIS,
