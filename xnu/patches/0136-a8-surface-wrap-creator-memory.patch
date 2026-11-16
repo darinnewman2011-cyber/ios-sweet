@@ -16,7 +16,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +	}
  	OSSafeReleaseNULL(memory);
  	OSSafeReleaseNULL(state);
-@@ -688,4 +691,32 @@
+@@ -688,4 +691,43 @@
  	ret = sweet_surface_layout(s, props);
 -	if (ret == kIOReturnSuccess) {
 +	OSNumber *wrap_at = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
@@ -26,14 +26,25 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +		 * (A8, run 55) IOSurfaceAddress: a surface around the creator's own memory. The home screen's
 +		 * icons come this way (180 x 180, no pixel format); given fresh zeroed memory instead, every one
 +		 * of them was empty in the window server. The creator's pages are wired and used as they are;
-+		 * if they cannot be (not page aligned, not all there), the old fresh memory is used.
++		 * if they cannot be (planes, not all there), the old fresh memory is used.
++		 * (run 56) backboardd wraps its own malloc'd copies, not page aligned (0x108e05600): the whole
++		 * pages around them are wrapped and the start within the first page goes into the surface's
++		 * offset, which the library adds to the mapping for the base address.
 +		 */
 +		mach_vm_address_t at = wrap_at->unsigned64BitValue();
-+		if ((at & PAGE_MASK) == 0) {
-+			creators = IOMemoryDescriptor::withAddressRange(at, s->allocSize, kIODirectionInOut, fTask);
++		mach_vm_address_t first_page = trunc_page_64(at);
++		uint64_t in_page = at - first_page;
++		uint64_t need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		uint64_t length = round_page_64(in_page + need);
++		if (s->planeCount == 0 && length <= SWEET_SURFACE_MAX_ALLOC) {
++			creators = IOMemoryDescriptor::withAddressRange(first_page, length, kIODirectionInOut, fTask);
 +		}
 +		if (creators != NULL && creators->prepare() != kIOReturnSuccess) {
 +			OSSafeReleaseNULL(creators);
++		}
++		if (creators != NULL) {
++			s->offset += (uint32_t)in_page;
++			s->allocSize = (uint32_t)length;
 +		}
 +		if (sweet_surface_creates_logged < 64 || creators == NULL) {
 +			IOLog("SWEET SURF: create: IOSurfaceAddress %#llx, %u bytes: %s\n", (unsigned long long)at,
