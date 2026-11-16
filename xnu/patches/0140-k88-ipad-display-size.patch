@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f00eb15..ec9b28c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,8 +97,13 @@ enum {
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
++#if defined(SWEET_K88)	/* iPad 7 (iPad7,11) iPadOS 16 userland: its 1620x2160 panel, 810x1080 points @2x */
++#define SWEET_FB_LOGICAL_W              1620
++#define SWEET_FB_LOGICAL_H              2160
++#else
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++#endif
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7f05c86..dcc26e0 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -450,8 +450,13 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++#if defined(SWEET_K88)	/* iPad 7 (iPad7,11) iPadOS 16 userland: its 1620x2160 panel, 810x1080 points @2x */
++	fLogicalW = native ? SWEET_TOUCH_PANEL_W : 1620;
++	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2160;
++#else
+ 	fLogicalW = native ? SWEET_TOUCH_PANEL_W : 1125;
+ 	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
++#endif
+ 	fOffX = (fLogicalW - SWEET_TOUCH_PANEL_W) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	int fit = 0;

@@ -780,8 +780,10 @@ static void clock_up(void)
 		con_str("TURBO", "voltage not set, stop");
 		return;
 	}
+#ifndef K88_NOMEMACC
 	wr32(0x01942130, 0xffff);
 	__asm__ volatile("dsb sy");
+#endif
 	step("1 volt ok=", 1);
 
 	r = pll_set(0x0b016000, 79) & 1;		/* c1 1516.8 MHz */
@@ -807,7 +809,11 @@ static void clock_up(void)
 	park_flag = 0;
 	__asm__ volatile("dsb sy" ::: "memory");
 	delay_ms(200);
+#ifdef K88_NOMEMACC
+	for (int k = 0; k < 2; k++)
+#else
 	for (int k = 0; k < 4; k++)
+#endif
 		all_cpus("TURBO", 1);
 }
 #endif
@@ -1450,6 +1456,21 @@ void k88_main(uintptr_t dtb)
 	test_clock();
 #ifdef K88_CLOCK
 	clock_up();
+#ifdef K88_NOMEMACC
+	/*
+	 * diag22: XNU at turbo lost the SDHCI (registers read all ones) while
+	 * nominal clocks (no voltage, no mem-acc) were fine. Read the eMMC at
+	 * turbo without mem-acc, then write mem-acc 0xffff and read again.
+	 */
+	test_mmc();
+	k88_present();
+	wr32(0x01942130, 0xffff);
+	__asm__ volatile("dsb sy");
+	delay_ms(10);
+	con_hex2("MEMACC", "now=", mmio32(0x01942130), "hcver=", mmio32(SDHC_BASE + 0xfc));
+	test_mmc();
+	k88_present();
+#endif
 	finish();
 #endif
 	con_hex2("SDHC", "ver=", mmio32(SDHC_BASE + 0xfc), "pst=", mmio32(SDHC_BASE + 0x24));

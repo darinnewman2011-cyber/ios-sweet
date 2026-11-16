@@ -101,6 +101,9 @@ K88_MMC, K88_MMC_SIZE = 0x07824900, 0x200   # hc_mem incl. the vendor registers 
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+# The K88 runs the iPad 7 (iPad7,11 / J171AP) iPadOS 16.6.1 userland instead:
+#   ipsw img4 im4p extract Firmware/all_flash/DeviceTree.j171ap.im4p -o j171ap.adt
+J171AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-ipad7/j171ap.adt')
 
 
 def d22ap_product(path=D22AP_ADT):
@@ -264,8 +267,8 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(1620 if k88 else 1125)),
+            ('canvas-height', u32(2160 if k88 else 2436)),
         ])])
 
     if jp:
@@ -318,7 +321,7 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
+    product_props = d22ap_product(J171AP_ADT if k88 else D22AP_ADT)
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
@@ -335,14 +338,14 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         compat = (cstr('D22AP') + cstr('iPhone10,3') + cstr('samsung,jackpotlte') +
                   cstr('samsung,exynos7885') + cstr('xiaomi,sweet') + cstr('AppleARM'))
     if k88:
-        compat = (cstr('D22AP') + cstr('iPhone10,3') + cstr('zte,k88') +
+        compat = (cstr('J171AP') + cstr('iPad7,11') + cstr('zte,k88') +
                   cstr('qcom,msm8952') + cstr('xiaomi,sweet') + cstr('AppleARM'))
     return node('device-tree', [
         ph(),
         ('compatible', compat),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
+        ('model', cstr('iPad7,11' if k88 else 'iPhone10,3')),
+        ('target-type', cstr('J171' if k88 else 'D22')),
+        ('target-sub-type', cstr('J171AP' if k88 else 'D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
