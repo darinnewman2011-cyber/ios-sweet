@@ -74,6 +74,25 @@ secondary_entry:
 4:	wfe
 	b	4b
 
+	.globl secondary_entry_clock
+secondary_entry_clock:
+	msr	daifset, #0xf
+	msr	spsel, #1
+	mrs	x0, mpidr_el1
+	ubfx	x1, x0, #8, #8
+	and	x0, x0, #0xff
+	add	x0, x0, x1, lsl #2
+	adrl	x1, _sec_stacks
+	add	x1, x1, x0, lsl #12
+	add	x1, x1, #0x1000
+	mov	sp, x1
+	adr	x1, vectors
+	msr	vbar_el1, x1
+	isb
+	bl	secondary_clock
+5:	wfe
+	b	5b
+
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number and
  * jumps to the common path, which saves x0-x28 and calls k88_exc(slot, regs).

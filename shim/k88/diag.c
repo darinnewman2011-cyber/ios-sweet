@@ -108,7 +108,7 @@ static const uint32_t ctl_off[3] = { 0x2000, 0x2200, 0x2400 };
 #define SDHC_BASE	0x07824900UL
 #define SDCORE_BASE	0x07824000UL
 
-extern char secondary_entry[];
+extern char secondary_entry[], secondary_entry_clock[];
 
 
 static volatile uint32_t irq_count, irq_other, irq_last, irq_src;
@@ -140,8 +140,12 @@ static void delay_ms(unsigned ms)
 {
 	uint64_t end = now() + ticks_per_sec() / 1000 * ms;
 
-	while (now() < end)
-		;
+	while (now() < end) {
+#ifdef K88_WDOG_S
+		/* pet the watchdog: only a boot CPU stuck outside delay_ms lets it bite */
+		*(volatile uint32_t *)(0x0b017000UL + 0x04) = 1;
+#endif
+	}
 }
 
 static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
@@ -412,10 +416,30 @@ static void test_gic(void)
 
 /* ---- SMP ---- */
 
+/* CPU clock in MHz: PMU cycle counter over 10 ms of the 19.2 MHz generic timer */
+static uint32_t cpu_mhz(void)
+{
+	uint64_t c0, c1, t0, t1;
+
+	wsr("pmcr_el0", rsr("pmcr_el0") | 1);		/* E */
+	wsr("pmcntenset_el0", 1ULL << 31);		/* cycle counter */
+	wsr("pmccfiltr_el0", 0);			/* count at EL0 and EL1 */
+	__asm__ volatile("isb");
+	t0 = now();
+	c0 = rsr("pmccntr_el0");
+	while ((t1 = now()) - t0 < ticks_per_sec() / 100)
+		;
+	c1 = rsr("pmccntr_el0");
+	return (uint32_t)((c1 - c0) * ticks_per_sec() / (t1 - t0) / 1000000);
+}
+
+static volatile uint32_t sec_mhz[12];
+
 void secondary_main(void)
 {
 	uint64_t m = rsr("mpidr_el1");
 
+	sec_mhz[MPIDR_SLOT(m) % 12] = cpu_mhz();
 	sec_mpidr[MPIDR_SLOT(m) % 12] = m | (1ULL << 63);
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_CPU_OFF, 0, 0, 0);
@@ -445,7 +469,342 @@ static void test_smp(void)
 		if (sec_mpidr[i])
 			alive |= 1u << i;
 	con_hex2("SMP", "alive=", alive, "want=", want);	/* bit = Aff1 * 4 + Aff0 */
+	con_hex2("MHZ", "c0cpu0=", sec_mhz[0], "c0cpu3=", sec_mhz[3]);	/* MPIDR 0x0xx */
+	con_hex2("MHZ", "c1cpu1=", sec_mhz[5], "c1cpu3=", sec_mhz[7]);	/* MPIDR 0x1xx */
 }
+
+/*
+ * Milestone 6 (read only): CPU clock and voltage state as LK leaves it.
+ * From the K88 DTB (jasmine): qcom,cpu-clock-8939 RCGs at 0xb111050 (c0),
+ * 0xb011050 (c1), 0xb1d1050 (CCI); the A53SS PLLs (qcom,gcc-8952 apcs_*_base)
+ * at 0xb116000, 0xb016000, 0xb1d0000; mem-acc 0x1942130; QFPROM 0x5c000.
+ * PMIC over SPMI arbiter v2 (qcom,spmi@200f000: core 0x200f000, obsrvr
+ * 0x2c00000, EE 0): PM8950 SID 1 S5 (0x2000) = VDD_APC, L3 (0x4200) = VDD_MX,
+ * SID 0 PON (0x800) = power key.
+ */
+#define SPMI_CORE	0x0200f000UL
+#define SPMI_OBS	0x02c00000UL
+
+static int spmi_chan(unsigned sid, unsigned periph)
+{
+	for (int ch = 0; ch < 256; ch++)
+		if (((mmio32(SPMI_CORE + 0x800 + 4 * ch) >> 8) & 0xfff) == ((sid << 8) | periph))
+			return ch;
+	return -1;
+}
+
+/* one byte through the observer channel; returns 0x1xx on error */
+static uint32_t spmi_rd(unsigned sid, unsigned addr)
+{
+	int ch = spmi_chan(sid, addr >> 8);
+	uintptr_t b;
+
+	if (ch < 0)
+		return 0x1ff;
+	b = SPMI_OBS + 0x8000UL * ch;
+	wr32(b + 0x00, (1u << 27) | ((addr & 0xff) << 4) | 0);	/* EXT_READL, 1 byte */
+	for (int i = 0; i < 1000; i++) {
+		uint32_t st = mmio32(b + 0x08);
+		if (st & 1)
+			return st & 0xe ? 0x100 | st : mmio32(b + 0x18) & 0xff;
+		delay_ms(0);
+	}
+	return 0x1fe;
+}
+
+static uint32_t spmi_rd4(unsigned sid, unsigned addr)
+{
+	uint32_t v = 0;
+
+	for (int i = 0; i < 4; i++)
+		v |= (spmi_rd(sid, addr + i) & 0xff) << (8 * i);
+	return v;
+}
+
+static void test_clock(void)
+{
+	static const uintptr_t rcg[3] = { 0x0b111050, 0x0b011050, 0x0b1d1050 };
+	static const uintptr_t pll[3] = { 0x0b116000, 0x0b016000, 0x0b1d0000 };
+	int n = 0;
+
+	con_hex2("CLK", "mhz=", cpu_mhz(), "mpidr=", rsr("mpidr_el1"));
+	for (int i = 0; i < 3; i++) {
+		char l[] = "RCGn";
+
+		l[3] = '0' + i;
+		con_hex2(l, "cmd=", mmio32(rcg[i]), "cfg=", mmio32(rcg[i] + 4));
+	}
+	for (int i = 0; i < 3; i++) {
+		char l[] = "PLLn";
+
+		l[3] = '0' + i;
+		con_hex2(l, "mode=", mmio32(pll[i]), "l=", mmio32(pll[i] + 4));
+		con_hex2(" ", "m=", mmio32(pll[i] + 8), "n=", mmio32(pll[i] + 0xc));
+		con_hex2(" ", "user=", mmio32(pll[i] + 0x10), "cfg=", mmio32(pll[i] + 0x14));
+		con_hex2(" ", "test=", mmio32(pll[i] + 0x18), "st=", mmio32(pll[i] + 0x1c));
+		con_hex2(" ", "20=", mmio32(pll[i] + 0x20), "24=", mmio32(pll[i] + 0x24));
+		k88_present();
+	}
+	con_hex2("MEMACC", "l1=", mmio32(0x01942130), 0, 0);
+	static const uint8_t rows[] = { 1, 0x1b, 0x1d, 0x1e, 0x1f };
+	for (unsigned i = 0; i < sizeof(rows); i++) {
+		char l[] = "FUSE xx";
+
+		l[5] = "0123456789abcdef"[rows[i] >> 4];
+		l[6] = "0123456789abcdef"[rows[i] & 15];
+		con_hex2(l, "lo=", mmio32(0x5c000 + 8 * rows[i]), "hi=", mmio32(0x5c004 + 8 * rows[i]));
+	}
+	k88_present();
+	for (int ch = 0; ch < 256; ch++)
+		if (mmio32(SPMI_CORE + 0x800 + 4 * ch))
+			n++;
+	con_hex2("SPMI", "chans=", n, "s5ch=", (uint32_t)spmi_chan(1, 0x20));
+	con_hex2("S5", "type=", spmi_rd4(1, 0x2004), "st=", spmi_rd4(1, 0x2008));
+	con_hex2(" ", "40=", spmi_rd4(1, 0x2040), "44=", spmi_rd4(1, 0x2044));
+	con_hex2(" ", "48=", spmi_rd4(1, 0x2048), "60=", spmi_rd4(1, 0x2060));
+	con_hex2("L3", "type=", spmi_rd4(1, 0x4204), "40=", spmi_rd4(1, 0x4240));
+	con_hex2(" ", "44=", spmi_rd4(1, 0x4244), "st=", spmi_rd4(1, 0x4208));
+	con_hex2("S1", "type=", spmi_rd4(1, 0x1404), "40=", spmi_rd4(1, 0x1440));
+	con_hex2("PON", "rt=", spmi_rd4(0, 0x810), "rev=", spmi_rd4(0, 0x800));
+	k88_present();
+}
+
+#ifdef K88_CLOCK
+/*
+ * Milestone 6b: clocks up. diag12 (read only) found the c0 cluster (MPIDR
+ * 0x0xx, RCG 0xb111050) on XO (19 MHz, cfg 0) and c1 (0x1xx, RCG 0xb011050)
+ * on GPLL0 (800 MHz, cfg 0x401 = source 4); both A53SS PLLs off but with
+ * CONFIG_CTL set; VDD_APC (PM8950 S5, FTS2.5 range 0: 80 mV + 5 mV * VSET)
+ * at 1.225 V = the DT's nominal-corner ceiling; VDD_MX (L3) high.
+ * DT cpu-clock-8939 tables (speed bin 1): c1 806.4/960/1094.4/1344 MHz
+ * nominal, 1440/1516.8 turbo; c0 806.4/998.4/1094.4 nominal, 1209.6 turbo.
+ * Turbo ceiling 1.35 V; open-loop voltage from the CPR fuse (row 0x1b bits
+ * 0-5, sign + 10 mV steps from 1.35 V). mem-acc (0x1942130) 0xffff at the turbo corner.
+ */
+#define SPMI_CHNLS	0x02400000UL
+
+static uint32_t spmi_wr(unsigned sid, unsigned addr, uint8_t v)
+{
+	int ch = spmi_chan(sid, addr >> 8);
+	uintptr_t b;
+
+	if (ch < 0)
+		return 0x1ff;
+	b = SPMI_CHNLS + 0x8000UL * ch;
+	wr32(b + 0x10, v);
+	wr32(b + 0x00, (0u << 27) | ((addr & 0xff) << 4) | 0);	/* EXT_WRITEL, 1 byte */
+	for (int i = 0; i < 1000; i++) {
+		uint32_t st = mmio32(b + 0x08);
+		if (st & 1)
+			return st & 0xe ? 0x100 | st : 0;
+	}
+	return 0x1fe;
+}
+
+static inline void wdog_pet(void)
+{
+#ifdef K88_WDOG_S
+	wr32(0x0b017000 + 0x04, 1);
+#endif
+}
+
+/* A53SS PLL: off, L, outputs, bypass, reset release, lock (status bit 16), output on */
+static int pll_set(uintptr_t p, uint32_t l)
+{
+	wr32(p + 0x00, 0);
+	wr32(p + 0x04, l);
+	wr32(p + 0x08, 0);
+	wr32(p + 0x0c, 1);
+	wr32(p + 0x10, mmio32(p + 0x10) | 9);	/* main + early output */
+	__asm__ volatile("dsb sy");
+	wr32(p + 0x00, 2);			/* BYPASSNL */
+	delay_ms(1);
+	wr32(p + 0x00, 6);			/* RESET_N */
+	for (int i = 0; i < 100; i++) {
+		if (mmio32(p + 0x1c) & (1u << 16)) {
+			wr32(p + 0x00, 7);	/* OUTCTRL */
+			return 0;
+		}
+		delay_ms(1);
+	}
+	return -1;
+}
+
+/* RCG source switch: CFG = src << 8 | div field 1 (= divide by 1), then UPDATE */
+static int rcg_src(uintptr_t r, uint32_t src)
+{
+	wr32(r + 4, (src << 8) | 1);
+	wr32(r, mmio32(r) | 1);
+	for (int i = 0; i < 100; i++) {
+		if (!(mmio32(r) & 1))
+			return 0;
+		delay_ms(1);
+	}
+	return -1;
+}
+
+static volatile uint32_t stress_bad[12], stress_done[12];
+static volatile int stress_mode, park_flag, parked;	/* 0 = measure only, 1 = measure + stress */
+
+static uint64_t stress_ref_a, stress_ref_b;
+
+static void stress_round(uint64_t *pa, uint64_t *pb)
+{
+	uint64_t a = 0x9e3779b97f4a7c15ULL, b = 0;
+
+	for (int i = 0; i < 200000; i++) {
+		a ^= a << 13; a ^= a >> 7; a ^= a << 17;
+		b += a * 0xff51afd7ed558ccdULL;
+	}
+	*pa = a;
+	*pb = b;
+}
+
+/* 40 rounds, each compared with the boot CPU's result from before any clock change */
+static uint32_t stress_run(void)
+{
+	uint32_t bad = 0;
+
+	for (int round = 0; round < 40; round++) {
+		uint64_t a, b;
+
+		stress_round(&a, &b);
+		if (a != stress_ref_a || b != stress_ref_b)
+			bad++;
+	}
+	return bad;
+}
+
+void secondary_clock(void)
+{
+	uint64_t m = rsr("mpidr_el1");
+	unsigned s = MPIDR_SLOT(m) % 12;
+
+	if (park_flag) {
+		/* keep this core's cluster powered while the boot CPU switches its RCG */
+		parked = 1;
+		__asm__ volatile("dsb sy" ::: "memory");
+		while (park_flag)
+			;
+		smc(PSCI_CPU_OFF, 0, 0, 0);
+	}
+	sec_mhz[s] = cpu_mhz();
+	if (stress_mode)
+		stress_bad[s] = stress_run();
+	stress_done[s] = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_CPU_OFF, 0, 0, 0);
+}
+
+static void all_cpus(const char *label, int stress)
+{
+	uint64_t self = rsr("mpidr_el1") & 0xffffff;
+	uint32_t bad = 0, done = 0, t0 = (uint32_t)now(), own = 0;
+
+	stress_mode = stress;
+	for (int i = 0; i < 12; i++)
+		sec_mhz[i] = stress_bad[i] = stress_done[i] = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (int i = 0; i < 8; i++)
+		if (k88_mpidr[i] != self)
+			smc(PSCI_CPU_ON, k88_mpidr[i], (uintptr_t)secondary_entry_clock, i);
+	if (stress)
+		own = stress_run();
+	for (int w = 0; w < 600; w++) {
+		done = 0;
+		for (int i = 0; i < 12; i++)
+			done += stress_done[i];
+		if (done == 7)
+			break;
+		wdog_pet();
+		delay_ms(50);
+	}
+	for (int i = 0; i < 12; i++)
+		bad += stress_bad[i];
+	con_hex2(label, "c1mhz=", cpu_mhz(), "c0mhz=", sec_mhz[0]);
+	con_hex2(" ", "c0cpu3=", sec_mhz[3], "c1cpu3=", sec_mhz[7]);
+	if (stress)
+		con_hex2(" stress", "bad=", bad + own, "done=", done);
+	con_hex2(" ", "ms=", ((uint32_t)now() - t0) / 19200, 0, 0);
+	k88_present();
+}
+
+/*
+ * diag15: c1 GPLL0 -> PLL1 1516.8 (1.275 V) and c0 XO -> PLL0 1094.4 passed
+ * the 8-core stress (bad 0). Moving c0 off PLL0 (to XO, like diag13's GPLL0)
+ * never finished the RCG update; both times c0's cores had all done CPU_OFF,
+ * so the guess is that c0's RCG only switches while its cluster is powered.
+ * diag17: park a c0 core first (cluster powered), then PLL0 1209.6 and switch.
+ */
+static void step(const char *what, uint32_t r)
+{
+	con_hex2(" step", what, r, "c0rcg=", mmio32(0x0b111050));
+	k88_present();
+}
+
+static void clock_up(void)
+{
+	uint32_t fuse = mmio32(0x5c000 + 8 * 0x1b) & 0x3f, uv, vset, r;
+
+	stress_round(&stress_ref_a, &stress_ref_b);
+	/*
+	 * diag17: a c0 core started after the voltage/mem-acc change never
+	 * reached its park loop (test_smp's, before them, run fine). So park
+	 * one c0 core now, before anything changes, and keep its cluster on.
+	 */
+	park_flag = 1;
+	parked = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	r = (uint32_t)smc(PSCI_CPU_ON, 0x000, (uintptr_t)secondary_entry_clock, 4);
+	for (int i = 0; i < 500 && !parked; i++)
+		delay_ms(10);
+	step("0 park rc=", r);
+	step("0 parked=", parked);
+	uv = 1350000 + ((fuse & 0x20) ? -1 : 1) * (int)(fuse & 0x1f) * 10000 + 25000;
+	if (uv < 1130000)
+		uv = 1130000;
+	if (uv > 1350000)
+		uv = 1350000;
+	vset = (uv - 80000) / 5000;
+	con_hex2("TURBO", "fuse=", fuse, "uv=", uv);
+	r = spmi_wr(1, 0x2041, (uint8_t)vset);
+	delay_ms(2);
+	con_hex2(" vset", "wr=", r, "now=", spmi_rd(1, 0x2041));
+	if (r || spmi_rd(1, 0x2041) != vset) {
+		con_str("TURBO", "voltage not set, stop");
+		return;
+	}
+	wr32(0x01942130, 0xffff);
+	__asm__ volatile("dsb sy");
+	step("1 volt ok=", 1);
+
+	r = pll_set(0x0b016000, 79) & 1;		/* c1 1516.8 MHz */
+	step("2a pll1=", r);
+	r = rcg_src(0x0b011050, 5) & 1;
+	step("2b c1src=", r);
+
+	/*
+	 * diag16: with c0's cluster off, PLL0 did not lock and the RCG update
+	 * did not finish (diag15 3a only worked while c0 cores were still
+	 * running). So power the cluster first: park one c0 core on XO, then
+	 * PLL0 1209.6, switch, release.
+	 */
+	step("3a parked=", parked);
+	if (parked) {
+		r = pll_set(0x0b116000, 63) & 1;	/* c0 1209.6 MHz */
+		step("3b pll0=", r);
+		if (!r) {
+			r = rcg_src(0x0b111050, 5) & 1;
+			step("3c c0src=", r);
+		}
+	}
+	park_flag = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	delay_ms(200);
+	for (int k = 0; k < 4; k++)
+		all_cpus("TURBO", 1);
+}
+#endif
 
 /* ---- main ---- */
 
@@ -891,6 +1250,21 @@ void k88_main(uintptr_t dtb)
 
 	log_init();
 	con_tee("K88 SHIM started\n");
+#ifdef K88_WDOG_S
+	/*
+	 * APCS watchdog (qcom,wdt@b017000, 32768 Hz): a hang ends in a bite reset
+	 * after K88_WDOG_S seconds; the IMEM restart reason sends LK to recovery.
+	 * Registers as in msm_watchdog: RST 0x4, EN 0x8, BARK 0x10, BITE 0x14.
+	 */
+	wr32(IMEM_RESTART, RESTART_RECOVERY);
+	wr32(0x0b017000 + 0x08, 0);
+	wr32(0x0b017000 + 0x10, 32768u * K88_WDOG_S);
+	wr32(0x0b017000 + 0x14, 32768u * K88_WDOG_S);
+	wr32(0x0b017000 + 0x04, 1);
+	wr32(0x0b017000 + 0x08, 1);
+	__asm__ volatile("dsb sy" ::: "memory");
+	con_hex2("WDOG", "en=", mmio32(0x0b017000 + 0x08), "bite=", mmio32(0x0b017000 + 0x14));
+#endif
 	find_scanout();
 	/* the scanout as LK left it, before we change it */
 	if (fb_pipe >= 0) {
@@ -933,8 +1307,15 @@ void k88_main(uintptr_t dtb)
 	test_gic();
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), 0, 0);
 	k88_present();
-	test_smp();
+#ifndef K88_CLOCK
+	test_smp();	/* K88_CLOCK: the c0 cores' first start is kept for clock_up (restarts at XO hang) */
+#endif
 	k88_present();
+	test_clock();
+#ifdef K88_CLOCK
+	clock_up();
+	finish();
+#endif
 	con_hex2("SDHC", "ver=", mmio32(SDHC_BASE + 0xfc), "pst=", mmio32(SDHC_BASE + 0x24));
 	con_hex2("SDHC2", "ctl=", mmio32(SDHC_BASE + 0x28), "clk=", mmio32(SDHC_BASE + 0x2c));
 	con_hex2("SDHC3", "ctl2=", mmio32(SDHC_BASE + 0x3c), "cap=", mmio32(SDHC_BASE + 0x40));
