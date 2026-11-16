@@ -1,0 +1,13 @@
+diff --git a/makedefs/MakeInc.rule b/makedefs/MakeInc.rule
+index 5857ff4..9b36a72 100644
+--- a/makedefs/MakeInc.rule
++++ b/makedefs/MakeInc.rule
+@@ -130,7 +130,7 @@ $(1): $(5)% : $(2) | $(3)_MKDIR
+ 	fi;								\
+ 	$$(INSTALL) $$(DATA_INSTALL_FLAGS) \
+ 		./$(3)/$$*.unifdef.$$$$$$$$$$(suffix $$*) $$@ || exit 1; \
+-	$$(LLDBMACROS_SOURCE)/core/syntax_checker.py \
++	/usr/bin/env python3 -I $$(LLDBMACROS_SOURCE)/core/syntax_checker.py \
+ 		./$(3)/$$*.unifdef.$$$$$$$$$$(suffix $$*) $$(_vstdout) || exit 1; \
+ 	$$(RM) ./$(3)/$$*.unifdef.$$$$$$$$$$(suffix $$*)
+ 	$$(_v)if [ -n "$(5)" ]; then $$(TOUCH) "$(5)"; fi
