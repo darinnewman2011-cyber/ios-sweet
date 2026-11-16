@@ -130,7 +130,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=None):
+def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=None, scale=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     device='jackpotlte': Galaxy A8 (2018) / Exynos 7885 (GICv2, eMMC, 26 MHz timer).
     fb=(phys, width, height) overrides the framebuffer ABL/S-Boot leaves (required for jackpotlte)."""
@@ -171,7 +171,10 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        ('display-scale', u32(3)),
+        # K88 (iPad 7 userland): 2 = the iPad's own 1620x2160 @2x (810x1080 points); 3 left it at 540x720
+        # points and squeezed the home screen. --scale 1 with boot-arg sweetfb_native=1: the panel's
+        # 800x1280 as 800x1280 points (fills the screen, no bars).
+        ('display-scale', u32(scale or (2 if device == 'k88' else 3))),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -372,7 +375,9 @@ if __name__ == '__main__':
         w, h = (int(x) for x in dims.split('x')) if dims else (JP_FB_W, JP_FB_H)
         fb = (int(addr, 0), w, h)
     mem = int(_opt('--mem-size'), 0) if _opt('--mem-size') else None
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, device=device, fb=fb, mem=mem)
+    scale = int(_opt('--scale')) if _opt('--scale') else None
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, device=device, fb=fb, mem=mem,
+                 scale=scale)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
