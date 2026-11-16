@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -95,18 +96,48 @@ sweet_gl_loader(void)
 	const char *name = getprogname();
 	io_service_t gpu;
 
-	if (name == NULL || strcmp(name, "backboardd") != 0 || access(SWEET_GL, R_OK) != 0) {
+	bool soft = false;
+
+	if (name == NULL || access(SWEET_GL, R_OK) != 0) {
+		return;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		const char *off = strstr(arguments, "sweetgl=0");
+		const char *sw = strstr(arguments, "sweetgl=soft");
+
+		if (off != NULL && (off == arguments || off[-1] == ' ')) {
+			if (strcmp(name, "backboardd") == 0) {
+				stderr_to_console();
+				say("sweet-gl: sweetgl=0: CoreAnimation keeps its software renderer\n");
+			}
+			return;
+		}
+		soft = sw != NULL && (sw == arguments || sw[-1] == ' ');
+	}
+	/*
+	 * sweetgl=soft (the ZTE K88: no GPU driver yet): OpenGL ES on Mesa's softpipe, in plain C on the
+	 * processor, for every program the kernel inserts this loader into (sweetinject=NAME,NAME..., xnu
+	 * 0142), not only backboardd. What it is for is apps whose Core Image or GLKit needs an OpenGL ES
+	 * context at all (Settings draws its icons through CIContext over EAGL and dies without one);
+	 * backboardd is better left out of the list, CoreAnimation's own software renderer being much
+	 * faster than softpipe.
+	 */
+	if (soft) {
+		if (strcmp(name, "backboardd") == 0) {
+			stderr_to_console();
+		}
+		setenv("GALLIUM_DRIVER", "softpipe", 0);
+		if (dlopen(SWEET_GL, RTLD_NOW) == NULL) {
+			say("sweet-gl: %s: %s: %s\n", name, SWEET_GL, dlerror());
+			return;
+		}
+		say("sweet-gl: %s loaded into %s: OpenGL ES on softpipe (sweetgl=soft)\n", SWEET_GL, name);
+		return;
+	}
+	if (strcmp(name, "backboardd") != 0) {
 		return;
 	}
 	stderr_to_console();
-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
-		const char *off = strstr(arguments, "sweetgl=0");
-
-		if (off != NULL && (off == arguments || off[-1] == ' ')) {
-			say("sweet-gl: sweetgl=0: CoreAnimation keeps its software renderer\n");
-			return;
-		}
-	}
 	gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RedwoodMali"));
 	if (gpu == 0) {
 		say("sweet-gl: no GPU (RedwoodMali): CoreAnimation keeps its software renderer\n");

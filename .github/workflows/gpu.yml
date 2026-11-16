@@ -4,7 +4,7 @@ name: gpu-userland
 on:
   workflow_dispatch:
   push:
-    branches: [jackpotlte]
+    branches: [jackpotlte, k88]   # k88: the same userland, run on softpipe there (sweetgl=soft)
     paths: ['gpu/**', '.github/workflows/gpu.yml']
 
 jobs:
