@@ -1379,6 +1379,10 @@ static void k88_boot_xnu(int fb32)
 	finish();
 }
 
+#ifdef K88_WIFI
+#include "wifi.c"
+#endif
+
 void k88_main(uintptr_t dtb)
 {
 	uint64_t s = 0;
@@ -1450,6 +1454,10 @@ void k88_main(uintptr_t dtb)
 	test_clock();
 #ifdef K88_CLOCK
 	clock_up();
+	finish();
+#endif
+#ifdef K88_WIFI
+	test_wifi();
 	finish();
 #endif
 	con_hex2("SDHC", "ver=", mmio32(SDHC_BASE + 0xfc), "pst=", mmio32(SDHC_BASE + 0x24));
