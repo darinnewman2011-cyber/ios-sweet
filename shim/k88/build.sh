@@ -2,10 +2,12 @@
 # Build the ZTE K88 shim (clang + lld, no GNU cross toolchain needed).
 #   shim/k88/build.sh                         diagnostics (milestones 1+2)
 #   PAYLOAD=xnu-k88.payload shim/k88/build.sh XNU loader (tools/mkpayload.py output, linked into the Image)
+#   EXTRA_CFLAGS=-DK88_WIFI WIFIBLOB=wifi.blob shim/k88/build.sh   Wi-Fi bring-up (tools/k88wifiblob.py output)
 # Then: python tools/mkqcomboot.py <K88 boot.img> shim/k88/out/Image <jasmine.dtb> OUT.img and write OUT.img
 # to the boot partition from TWRP (the K88 has no working fastboot).
 set -euo pipefail
 [ -z "${PAYLOAD:-}" ] || PAYLOAD="$(cd "$(dirname "$PAYLOAD")" && pwd)/$(basename "$PAYLOAD")"
+[ -z "${WIFIBLOB:-}" ] || WIFIBLOB="$(cd "$(dirname "$WIFIBLOB")" && pwd)/$(basename "$WIFIBLOB")"
 cd "$(dirname "$0")"
 export PATH="/c/Program Files/LLVM/bin:$PATH"
 # FB_BASE = the 32 bpp scanout the shim sets up (= SWEET_FB_PA, boot_args.Video)
@@ -13,7 +15,7 @@ CFLAGS="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fno
  -mgeneral-regs-only -mstrict-align -Wall -Wextra \
  -DFB_BASE=0x83400000UL -DFB_W=800 -DFB_H=1280 -DCON_SCALE=2 ${EXTRA_CFLAGS:-}"
 mkdir -p out
-rm -f out/*.o out/Image out/payload.bin
+rm -f out/*.o out/Image out/payload.bin out/wifi.blob
 {
 	echo '	.section .rodata.payload, "a"'
 	echo '	.balign 16'
@@ -29,6 +31,16 @@ rm -f out/*.o out/Image out/payload.bin
 	echo '	.globl k88_payload_size'
 	echo 'k88_payload_size:'
 	echo '	.quad k88_payload_end - k88_payload'
+	echo '	.balign 4096'
+	echo '	.globl k88_wifiblob'
+	echo 'k88_wifiblob:'
+	if [ -n "${WIFIBLOB:-}" ]; then
+		cp "$WIFIBLOB" out/wifi.blob
+		echo '	.incbin "out/wifi.blob"'
+	fi
+	echo '	.balign 8'
+	echo '	.globl k88_wifiblob_end'
+	echo 'k88_wifiblob_end:'
 } > out/payload.S
 clang $CFLAGS -c start.S -o out/start.o
 clang $CFLAGS -c out/payload.S -o out/payload.o
