@@ -16,7 +16,7 @@
 
 #define DKIOCGETBLOCKSIZE       _IOR('d', 24, uint32_t)
 #define DKIOCGETBLOCKCOUNT      _IOR('d', 25, uint64_t)
-#define HFSIOC_RESIZE_VOLUME    _IOW('h', 16, uint64_t)
+#define HFSIOC_RESIZE_VOLUME    _IOW('h', 2, uint64_t)  /* 0x80086802: the case in hfs_vnop_ioctl that calls hfs_extendfs */
 int fsctl(const char *, unsigned long, void *, unsigned int);
 
 static void show(const char *when)
