@@ -789,8 +789,7 @@ wrapped_alpha_first(IOSurfaceRef surface)
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	first = !(last_bad < first_bad);
 	if (told++ < 32) {
-		say("redwood-gl: nofmt %u %zux%zu lit %u bad %u/%u %s
-", IOSurfaceGetID(surface), w, h, lit, first_bad, last_bad,
+		say("redwood-gl: nofmt %u %zux%zu lit %u bad %u/%u %s\n", IOSurfaceGetID(surface), w, h, lit, first_bad, last_bad,
 		    first ? "AF" : "BGRA");
 	}
 	return first;
