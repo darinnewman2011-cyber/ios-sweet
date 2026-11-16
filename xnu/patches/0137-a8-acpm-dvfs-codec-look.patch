@@ -35,7 +35,7 @@ new file mode 100644
 + *   rx_indr_buf_base, rx_indr_buf_size, tx_rear, tx_front, tx_base, q_len, q_elem_size, credit,
 + *   mbox_addr }, ap_poll } (18 u32). The AP sends on the rx_* queue and reads replies on the tx_* queue;
 + *   cmd[0] carries a sequence number (1..63) at bits 21:16 which the reply repeats.
-+ *   DVFS: channel 5, cmd = { domain, kHz, 0 = FREQ_REQ | 1 = FREQ_GET, 0 }; domains 0 MIF (memory bus),
++ *   DVFS: channel 4 (the "samsung,exynos-acpm" node, as cal-if uses it), cmd = { domain, kHz, 0 = FREQ_REQ | 1 = FREQ_GET, 0 }; domains 0 MIF (memory bus),
 + *   1 INT, 2 CPUCL0 (A73s), 3 CPUCL1 (A53s), 4 G3D, 5 FSYS, 6 CAM, 7 DISP, 8 AUD.
 + *   Tables (live DT): A53 208..1690 MHz, A73 520..2184 MHz, MIF up to 1794 MHz, G3D up to 1300 MHz with
 + *   gpu_max_clock 1100 MHz.
@@ -69,7 +69,7 @@ new file mode 100644
 +#define INTCR1          0x20u
 +#define INTSR1          0x28u
 +#define CH_MFD          2
-+#define CH_DVFS         5
++#define CH_DVFS         4       /* the "acpm" node's channel (cal-if); 5 is ACPM->AP notices, queue of 1 (run 59) */
 +#define FREQ_REQ        0
 +#define FREQ_GET        1
 +#define TYPE_CODEC      7

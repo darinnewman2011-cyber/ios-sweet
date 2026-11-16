@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,413 @@
+@@ -0,0 +1,430 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -220,6 +220,8 @@ new file mode 100644
 +	    rd(cmu, GATE_RST0), rd(cmu, GATE_RST2));
 +	printf("SWEET AUDIO: 1 look: gpb0 con %#x dat %#x pud %#x; SysMMU ctrl %#x\n", rd(gpio, 0x0), rd(gpio, 0x4), rd(gpio, 0x8),
 +	    rd(mmu, 0x0));
++	printf("SWEET AUDIO: 1 look: SPUS sample banks 0x220..: %#x %#x %#x %#x %#x %#x %#x %#x\n", rd(abox, 0x220), rd(abox, 0x224),
++	    rd(abox, 0x228), rd(abox, 0x22c), rd(abox, 0x230), rd(abox, 0x234), rd(abox, 0x238), rd(abox, 0x23c));
 +	codec_dump(MAIN, 0x00);
 +	codec_dump(MAIN, 0x40);
 +	codec_dump(ANALOG, 0x40);
@@ -355,13 +357,28 @@ new file mode 100644
 +	}
 +	(void)wr_bits(abox, "SYSPOWER_CTRL (on)", SYSPOWER, 1, 1);
 +	(void)wr_bits(abox, "SPUS_CTRL0 (chain 0: RDMA, SIFS1, no ASRC)", SPUS0, 0xf, 0x0);
++	/*
++	 * (run 59) RDMA0 said "in progress" but never read a byte: without calliope, nobody gives it a sample bank.
++	 * Scion's S9 driver gives RDMA0 512 bytes (SPUS_SBANK_RDMA0 at +0x220, SIFS SIZE [29:20] in 16-byte units),
++	 * Samsung's S10 value; ABOX here is the same generation (the same register map otherwise).
++	 */
++	if (((rd(abox, 0x220) >> 20) & 0x3ff) == 0) {
++		(void)wr_bits(abox, "SPUS_SBANK_RDMA0 (512 bytes)", 0x220, 0x3ffu << 20, (512u / 16u) << 20);
++	}
 +	(void)wr_bits(abox, "SPUS_CTRL1 (SIFS1 from SPUS OUT0)", SPUS1, 7u << 16, 0);
 +	(void)wr_bits(abox, "ROUTE_CTRL0 (UAIF0 from SIFS1)", ROUTE0, 0xf, 2);
 +	(void)wr(abox, "UAIF0 CTRL1 (2 x 16 bit I2S)", UAIF(0, 4), (0x9u << 24) | (1u << 23) | (1u << 18) | (15u << 12));
 +	(void)wr(abox, "UAIF0 CTRL0 (master, data mode, FIFO diff 1)", UAIF(0, 0), (1u << 24) | (1u << 4) | (1u << 2));
 +	(void)wr_bits(abox, "UAIF0 CTRL0 (SPK_ENABLE)", UAIF(0, 0), 1, 1);
 +	delay(20000);
-+	printf("SWEET AUDIO: 5 UAIF0: status %#x, gpb0 dat %#x\n", rd(abox, UAIF(0, 0xc)), rd(gpio, 0x4));
++	uint32_t hi = 0, lo = 0x1f;
++	for (int i = 0; i < 64; i++) {          /* gpb0-1..4 toggle if UAIF0 drives BCLK/LRCK */
++		uint32_t d = rd(gpio, 0x4);
++		hi |= d;
++		lo &= d;
++	}
++	printf("SWEET AUDIO: 5 UAIF0: status %#x; gpb0 pins ever high %#x, always high %#x (toggling %#x)\n",
++	    rd(abox, UAIF(0, 0xc)), hi, lo, hi & ~lo);
 +	return (rd(abox, ROUTE0) & 0xf) == 2 && (rd(abox, UAIF(0, 0)) & 1);
 +}
 +
