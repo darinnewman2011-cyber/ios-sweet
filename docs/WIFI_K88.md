@@ -132,3 +132,19 @@ TWRP never boots the Wi-Fi core, so nothing below is verified live yet.
   - SMEM: heap version 11 (`0x000B0000`), plus a `$TOC` partition table with 7 partitions; the **APPS↔WCNSS partition
     (hosts 0/4) is at SMEM + `0x5A000`**, magic `$PRT`, empty (free offset `0x20`). No SMD allocation table yet (the
     firmware creates its channels when it boots).
+- **wifi2** (stage 2, commit eb35b84, `716dce87…b682`): PAS INIT_IMAGE (metadata at `0x9E000000`) **accepted** (r0 0);
+  MEM_SETUP(6, `0x8D100000`, `0x67B0A4`) refused, r0 -2 (bad address/size).
+- **wifi3** (`cdf2e500…d7fb`, log `backup/k88/runs/wifi3-console.txt`): **THE WI-FI CORE BOOTS.** MEM_SETUP with the size
+  rounded up to 4 KiB (`0x67C000`) at the linked base `0x8D100000` returns 0; segments copied; PMU before = cfg
+  `0x00400000`, spare 0; the Iris reset and XO-config status bits clear at once (19.2 MHz XO; cfg ends `0x10`, spare
+  `0x02000000`); **AUTH_AND_RESET returns 0**. The firmware then allocates its SMD channels in the APPS↔WCNSS partition
+  (table at `0x8635A030`): `IPCRTR` 1, `sys_mon` 2, `APPS_RIVA_CTRL` 3, `APPS_RIVA_DATA` 4, `WCNSS_CTRL` 5 (flags `0x206`
+  = packet mode, edge 6; byte-flag info, 8 KiB FIFOs), later `WLAN_CTRL` 6, `APPS_RIVA_BT_CMD/ACL` 7/8, `ANT` 9/10,
+  `APPS_FM` 11. `WCNSS_CTRL` opens; **version reply 1.5.1.2** (bytes `01 05 01 02`); the vendor NV file (11 fragments of
+  3072 bytes, 31723 total) is answered with NV_RESP status 2 (= cold boot calibration follows) and then
+  **CBC_COMPLETE_IND** (cold boot calibration done). PAS SHUTDOWN at the end returns 0. All of this with L9/L19 off.
+  - SMEM item 422 holds the firmware's default string "SFR Init: wdog or kernel error suspected." from boot on: it is not a
+    crash report by itself.
+  - About 25 s after TWRP was back, the tablet reset once more into TWRP: the shim's APCS watchdog (`K88_WDOG_S=25`) is
+    still running after the PS_HOLD warm reset and TWRP's kernel does not pet it. The Wi-Fi builds now switch it off
+    before the reset.

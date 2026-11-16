@@ -315,12 +315,28 @@ static int pronto_boot(void)
 	con_hex2("PAS init", "r0=", (uint32_t)r.r0, "r1=", (uint32_t)r.r1);
 	if (r.r0 || r.r1)
 		return -2;
-	r = scm_call(0, 2, 2, SCM_ARGS(3, 0, 0), PAS_WCNSS, lo, hi - lo);
-	con_hex2("PAS mem", "r0=", (uint32_t)r.r0, "r1=", (uint32_t)r.r1);
-	if (r.r0 || r.r1)
+	/*
+	 * wifi2: MEM_SETUP(6, 0x8D100000, 0x67B0A4) = -2 (bad address). Try page-aligned sizes,
+	 * then the relocatable image at the start of the reloc_mem carve-out.
+	 */
+	static const uint32_t try_base[4] = { 0, 0, 0x8c200000u, 0x8c200000u };
+	uint32_t size4k = (hi - lo + 0xfff) & ~0xfffu, size1m = (hi - lo + 0xfffff) & ~0xfffffu;
+	uint32_t try_size[4] = { size4k, size1m, size4k, 0x1700000u };
+	uint32_t base = 0;
+	int t;
+
+	for (t = 0; t < 4; t++) {
+		base = try_base[t] ? try_base[t] : lo;
+		r = scm_call(0, 2, 2, SCM_ARGS(3, 0, 0), PAS_WCNSS, base, try_size[t]);
+		con_hex2("PAS mem", "base=", base, "size=", try_size[t]);
+		con_hex2(" ->", "r0=", (uint32_t)r.r0, "r1=", (uint32_t)r.r1);
+		if (!r.r0 && !r.r1)
+			break;
+	}
+	if (t == 4)
 		return -3;
 	for (uint32_t i = 0; i < nseg; i++) {
-		uint32_t pa = blob32(40 + 16 * i), fsz = blob32(44 + 16 * i);
+		uint32_t pa = blob32(40 + 16 * i) - lo + base, fsz = blob32(44 + 16 * i);
 		uint32_t msz = blob32(48 + 16 * i), off = blob32(52 + 16 * i);
 
 		copy_out(pa, k88_wifiblob + off, fsz);
@@ -665,4 +681,6 @@ static void test_wifi(void)
 	}
 	struct scm_res r = scm_call(0, 2, 6, SCM_ARGS(1, 0, 0), PAS_WCNSS, 0, 0);
 	con_hex2("PAS shut", "r0=", (uint32_t)r.r0, "r1=", (uint32_t)r.r1);
+	/* the APCS watchdog survives the PS_HOLD warm reset and TWRP does not pet it (wifi3): switch it off */
+	wr32(0x0b017000 + 0x08, 0);
 }
