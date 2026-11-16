@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/sweet_a8gpu.c b/bsd/dev/sweet_a8gpu.c
+index d411685..dab94e5 100644
+--- a/bsd/dev/sweet_a8gpu.c
++++ b/bsd/dev/sweet_a8gpu.c
+@@ -22,6 +22,9 @@
+ #include <machine/machine_routines.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#if __has_include(<vm/vm_kern_xnu.h>)
++#include <vm/vm_kern_xnu.h> /* xnu-11417: kmem_alloc*, KMA_* */
++#endif
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/proc.h>
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6a894ab..e47fc90 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -36,6 +36,9 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#if __has_include(<vm/vm_kern_xnu.h>)
++#include <vm/vm_kern_xnu.h> /* xnu-11417: kmem_alloc*, KMA_* */
++#endif
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..a82f53c 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -20,6 +20,9 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#if __has_include(<vm/vm_kern_xnu.h>)
++#include <vm/vm_kern_xnu.h> /* xnu-11417: kmem_alloc*, KMA_* */
++#endif
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index b7fbdf6..1dcfb03 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -967,6 +967,9 @@ exception_triage(
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
++#if __has_include(<vm/vm_shared_region_xnu.h>)
++#include <vm/vm_shared_region_xnu.h> /* xnu-11417: struct vm_shared_region */
++#endif
+ #include <arm/thread.h>
+ 
+ /*
+diff --git a/pexpert/pexpert/arm64/apple_arm64_cpu.h b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+index f76d5c8..caf41a7 100644
+--- a/pexpert/pexpert/arm64/apple_arm64_cpu.h
++++ b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+@@ -28,6 +28,11 @@
+ 
+ #pragma once
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* sweet: MPIDR_CORETYPE_* live here; Apple SoCs get it via apple_arm64_common.h */
++#include <pexpert/arm64/apple_arm64_regs.h>
++#endif
++
+ #if !defined(__ASSEMBLER__)
+ 
+ #include <stdbool.h>

@@ -1,0 +1,30 @@
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_amcc.c b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+new file mode 100644
+index 0000000..49310bf
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm config_pmap_ppl, but the
++ * source only ships in Apple's closed per-SoC library (xnu-10063 and later
++ * split the AMCC read-only region code into more files). KTRR/CTRR needs Apple
++ * memory controller hardware; nothing references it on SWEET.
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c b/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c
+new file mode 100644
+index 0000000..49310bf
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm config_pmap_ppl, but the
++ * source only ships in Apple's closed per-SoC library (xnu-10063 and later
++ * split the AMCC read-only region code into more files). KTRR/CTRR needs Apple
++ * memory controller hardware; nothing references it on SWEET.
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
