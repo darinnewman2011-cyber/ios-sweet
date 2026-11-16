@@ -67,11 +67,14 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    # CommCenter: no baseband. fairplayd.*: no SEP/FairPlay hardware, it crash-loops every few seconds (each crash
+    # spawns xpcproxy and a ReportCrash write); only App Store apps and protected media need it.
+    removed = [k for k, j in jobs.items()
+               if j.get('Label') == 'com.apple.CommCenter' or str(j.get('Label', '')).startswith('com.apple.fairplayd.')]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter/fairplayd jobs removed ({", ".join(removed)})')
 
 
 def containers(root):
