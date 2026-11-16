@@ -1,10 +1,11 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -38,3 +38,4 @@
+@@ -38,3 +38,5 @@
  	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
  	IOOptionBits              mapCache;     /* cache mode for user mappings */
 +	bool                      wrapped;      /* memory is the creator's own (IOSurfaceAddress), prepared */
++	bool                      wrapReadOnly; /* ... and only readable (mapped read-only) */
  	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 --- a/iokit/Kernel/arm/SweetSurface.cpp
@@ -16,7 +17,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +	}
  	OSSafeReleaseNULL(memory);
  	OSSafeReleaseNULL(state);
-@@ -688,4 +691,43 @@
+@@ -688,4 +691,59 @@
  	ret = sweet_surface_layout(s, props);
 -	if (ret == kIOReturnSuccess) {
 +	OSNumber *wrap_at = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
@@ -39,12 +40,28 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +		if (s->planeCount == 0 && length <= SWEET_SURFACE_MAX_ALLOC) {
 +			creators = IOMemoryDescriptor::withAddressRange(first_page, length, kIODirectionInOut, fTask);
 +		}
-+		if (creators != NULL && creators->prepare() != kIOReturnSuccess) {
++		IOReturn prep = creators != NULL ? creators->prepare() : kIOReturnNoMemory;
++		bool read_only = false;
++		if (creators != NULL && prep != kIOReturnSuccess) {
++			/*
++			 * (run 57) Most fail read-write: backboardd's copies of the icons arrived as read-only memory
++			 * (and a write into one was its SIGBUS in run 55). Those are wrapped for reading only.
++			 */
 +			OSSafeReleaseNULL(creators);
++			creators = IOMemoryDescriptor::withAddressRange(first_page, length, kIODirectionOut, fTask);
++			prep = creators != NULL ? creators->prepare() : kIOReturnNoMemory;
++			read_only = prep == kIOReturnSuccess;
++			if (prep != kIOReturnSuccess) {
++				OSSafeReleaseNULL(creators);
++			}
++		}
++		if (creators == NULL) {
++			IOLog("SWEET SURF: create: IOSurfaceAddress %#llx: prepare 0x%x\n", (unsigned long long)at, prep);
 +		}
 +		if (creators != NULL) {
 +			s->offset += (uint32_t)in_page;
 +			s->allocSize = (uint32_t)length;
++			s->wrapReadOnly = read_only;
 +		}
 +		if (sweet_surface_creates_logged < 64 || creators == NULL) {
 +			IOLog("SWEET SURF: create: IOSurfaceAddress %#llx, %u bytes: %s\n", (unsigned long long)at,
@@ -54,7 +71,7 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 +	if (ret == kIOReturnSuccess && creators != NULL) {
 +		s->memory = creators;
 +		s->wrapped = true;
-+		s->mapCache = kIOMapDefaultCache;
++		s->mapCache = kIOMapDefaultCache | (s->wrapReadOnly ? kIOMapReadOnly : 0);
 +		if (!sweet_surface_publish(s)) {
 +			ret = kIOReturnNoResources;
 +		}
