@@ -91,7 +91,11 @@ def containers(root):
 def find_container(root, kind, identifier):
     for meta in glob.glob(os.path.join(root, 'private/var/containers', kind, '*',
                                        '.com.apple.mobile_container_manager.metadata.plist')):
-        if load(meta).get('MCMMetadataIdentifier') == identifier:
+        try:
+            info = load(meta)
+        except (plistlib.InvalidFileException, OSError, ValueError):
+            continue        # a root that iOS has run: some metadata files are unreadable here
+        if info.get('MCMMetadataIdentifier') == identifier:
             return os.path.dirname(meta)
     return None
 
