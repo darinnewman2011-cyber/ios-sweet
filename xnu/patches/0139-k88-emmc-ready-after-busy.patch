@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 09ba744..de8bef7 100644
+index 09ba744..6c61479 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -1093,6 +1093,30 @@ k88_tran(uint32_t rca)
+@@ -1093,6 +1093,29 @@ k88_tran(uint32_t rca)
  	return R1_STATE(resp) == 4;
  }
  
@@ -25,15 +25,14 @@ index 09ba744..de8bef7 100644
 +		}
 +		delay(1000);
 +	}
-+	printf("SWEET MMC: card not ready (RCA %u) after 1 s
-+", rca);
++	printf("SWEET MMC: card not ready (RCA %u) after 1 s\n", rca);
 +	return false;
 +}
 +
  /* R1b command, then DAT0 released; true if answered without error */
  static bool
  k88_cmd_b(uint32_t idx, uint32_t arg)
-@@ -1149,7 +1173,7 @@ ufs_take_over_host(void)
+@@ -1149,7 +1172,7 @@ ufs_take_over_host(void)
  		}
  	}
  	for (uint32_t rca = 1; rca <= 3 && !mmc_rca; rca++) {
@@ -42,7 +41,7 @@ index 09ba744..de8bef7 100644
  			mmc_rca = rca;              /* woken from LK's sleep (LK uses RCA 2) */
  		}
  	}
-@@ -1157,8 +1181,11 @@ ufs_take_over_host(void)
+@@ -1157,8 +1180,11 @@ ufs_take_over_host(void)
  		printf("SWEET MMC: card does not answer at RCA 1-3, int 0x%x\n", ufs_rd(HC_INT));
  		return ENXIO;
  	}
