@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,336 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte): talking to ACPM, the Exynos 7885's power-management firmware (a Cortex-M core
@@ -200,8 +200,8 @@ new file mode 100644
 +		}
 +		now = mach_absolute_time();
 +		if (now - t0 > limit) {
-+			printf("SWEET ACPM: channel %d: no reply to seq %u (reply rear %u front %u, INTSR1 %#x)\n",
-+			    i, seq, rear, front, *(volatile uint32_t *)(mbox + INTSR1));
++			printf("SWEET ACPM: channel %d: no reply to seq %u (reply rear %u front %u, send rear %u front %u, INTSR1 %#x)\n",
++			    i, seq, rear, front, s_rd(c->send.rear), s_rd(c->send.front), *(volatile uint32_t *)(mbox + INTSR1));
 +			return ETIMEDOUT;
 +		}
 +	}
@@ -253,6 +253,39 @@ new file mode 100644
 +
 +static const char *const names[9] = { "MIF", "INT", "A73", "A53", "G3D", "FSYS", "CAM", "DISP", "AUD" };
 +
++/*
++ * ACPM's own log ring (framework +52 rear, +56 front, +60 base, +64 entry size, +68 length).
++ * Entry: header (id [31:29], time index, systick [22:0]), text (size - 8 bytes), value. Read only.
++ */
++static void
++acpm_log_dump(void)
++{
++	uint32_t fw = INITDATA, front = s_rd(fw + 56), base = s_rd(fw + 60);
++	uint32_t size = s_rd(fw + 64), len = s_rd(fw + 68);
++
++	printf("SWEET ACPM: log rear %u front %u base %#x entry %u x %u\n", s_rd(fw + 52), front, base, size, len);
++	if (len == 0 || len > 4096 || size < 12 || size > 64 || front >= len || base + size * len > SRAM_SIZE) {
++		return;
++	}
++	for (uint32_t k = 0; k < 48 && k < len; k++) {
++		uint32_t e = (front + len - 48 + k) % len, at = base + size * e;
++		char text[64];
++		uint32_t h = s_rd(at), t = 0;
++
++		for (uint32_t w = 4; w < size - 4; w += 4) {
++			uint32_t v = s_rd(at + w);
++			for (int b = 0; b < 4; b++) {
++				char ch8 = (char)(v >> (8 * b));
++				text[t++] = (ch8 >= 32 && ch8 < 127) ? ch8 : (ch8 ? '.' : ' ');
++			}
++		}
++		text[t] = 0;
++		if (h != 0) {
++			printf("SWEET ACPM: log %u: id %u tick %u [%s] %#x\n", e, h >> 29, h & 0x7fffff, text, s_rd(at + size - 4));
++		}
++	}
++}
++
 +static void
 +dvfs_report(const char *when)
 +{
@@ -282,6 +315,7 @@ new file mode 100644
 +		return;
 +	}
 +	dvfs_report("now");
++	acpm_log_dump();
 +
 +	/* Audio, step 1 (look): the codec's first 16 registers through ACPM, read only. */
 +	for (uint8_t r = 0; r < 16; r++) {

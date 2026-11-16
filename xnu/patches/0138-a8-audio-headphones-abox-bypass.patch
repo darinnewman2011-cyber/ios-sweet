@@ -12,7 +12,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
 --- a/bsd/dev/sweet_a8acpm.c
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -299,4 +299,25 @@
+@@ -333,4 +333,25 @@
  	}
  	dvfs_report("after");
  }
