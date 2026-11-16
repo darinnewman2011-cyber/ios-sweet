@@ -40,7 +40,11 @@ int main(int argc, char **argv)
 		perror("sweet-grow: statfs");
 		return 1;
 	}
-	int fd = open(s.f_mntfromname, O_RDONLY);
+	/* the block device is busy while mounted (EBUSY, run 53): ask the raw one, /dev/rNAME */
+	char raw[sizeof(s.f_mntfromname) + 2];
+	const char *slash = strrchr(s.f_mntfromname, '/');
+	snprintf(raw, sizeof(raw), "/dev/r%s", slash != NULL ? slash + 1 : s.f_mntfromname);
+	int fd = open(raw, O_RDONLY);
 	if (fd < 0 || ioctl(fd, DKIOCGETBLOCKSIZE, &bs) != 0 || ioctl(fd, DKIOCGETBLOCKCOUNT, &count) != 0) {
 		perror("sweet-grow: device size");
 		return 1;

@@ -757,6 +757,45 @@ bgra_to_w30r(const uint8_t *from, uint8_t *to, GLsizei width)
 	}
 }
 
+/*
+ * A surface with no pixel format (see my_attachImage): opacity first in memory (true) or last, by
+ * which order keeps every colour at or below its opacity, as premultiplied pixels are.
+ */
+static bool
+wrapped_alpha_first(IOSurfaceRef surface)
+{
+	static unsigned told;
+	size_t w = IOSurfaceGetWidth(surface), h = IOSurfaceGetHeight(surface), row = IOSurfaceGetBytesPerRow(surface);
+	const uint8_t *base;
+	unsigned first_bad = 0, last_bad = 0, lit = 0;
+	bool first;
+
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+		return true;
+	}
+	base = IOSurfaceGetBaseAddress(surface);
+	for (size_t y = 0; base != NULL && y < h; y += h > 64 ? h / 64 : 1) {
+		for (size_t x = 0; x < w; x += w > 64 ? w / 64 : 1) {
+			const uint8_t *p = base + y * row + 4 * x;
+
+			if ((p[0] | p[1] | p[2] | p[3]) == 0) {
+				continue;
+			}
+			lit++;
+			first_bad += p[1] > p[0] || p[2] > p[0] || p[3] > p[0];
+			last_bad += p[0] > p[3] || p[1] > p[3] || p[2] > p[3];
+		}
+	}
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	first = !(last_bad < first_bad);
+	if (told++ < 32) {
+		say("redwood-gl: IOSurface %u (no pixel format, %zu x %zu): %u lit samples, %u break opacity-first, %u "
+		    "opacity-last: read opacity %s\n", IOSurfaceGetID(surface), w, h, lit, first_bad, last_bad,
+		    first ? "first" : "last (blue-first)");
+	}
+	return first;
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -4391,6 +4430,15 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * there being no pixel format.
 	 */
 	image->wrapped = image->alpha_first = pixels == 0;
+	if (pixels == 0) {
+		/*
+		 * (ios-sweet, A8 run 53) Not every surface without a pixel format is opacity first: the home
+		 * screen's icons come as 180 x 180 ones, and read opacity first they were not seen at all
+		 * (blue taken for opacity). Premultiplied, no colour is above the opacity, so the order is
+		 * the one that keeps to that; with nothing to go by (all zero, or both fit), opacity first.
+		 */
+		image->alpha_first = wrapped_alpha_first(surface);
+	}
 	image->w30r = pixels == 'w30r';
 	note_format("IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width, image->height);
 	/*
