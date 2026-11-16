@@ -148,3 +148,19 @@ TWRP never boots the Wi-Fi core, so nothing below is verified live yet.
   - About 25 s after TWRP was back, the tablet reset once more into TWRP: the shim's APCS watchdog (`K88_WDOG_S=25`) is
     still running after the PS_HOLD warm reset and TWRP's kernel does not pet it. The Wi-Fi builds now switch it off
     before the reset.
+- **wifi4** (stage 3, commit d5ae07c, `49999cdf…0afc`, log `backup/k88/runs/wifi4-console.txt`): `WLAN_CTRL` opens; the HAL NV
+  download (11 fragments, NV file minus its 4-byte valid word) is accepted; **HAL START answers status 38 =
+  `eHAL_STATUS_WLAN_BOOT_TEST_FAILURE`** (Prima's `wlan_status_code.h`), version fields empty. Guess: the Iris RF chip
+  fails its boot test because L9 (PA 3.3 V) and L19 (RFA 1.3 V) are off.
+- **Side effect seen in wifi3 and wifi4:** some seconds after the shim's reset into TWRP, the tablet resets again and LK
+  does a *normal* boot (LK log: `boot_mode :0`), so the test image runs a second time before TWRP comes back. Not the
+  watchdog (wifi4 disables it). Guess: TWRP's kernel (WCNSS drivers built in) trips over the SMD/Pronto state we leave.
+  Test scripts must wait for the second return (~2 min total) before restoring `boot`.
+
+### Next (not yet run)
+
+- **wifi5 (code committed, image not built/flashed):** before the PAS boot, open the RPM channel `rpm_requests` (edge 15,
+  global heap, word-access FIFOs in RPM message RAM via the SMEM `aux_base`) and send active-set requests: `ldoa` 7
+  (1.8 V), 19 (1.3 V), 9 (3.3 V) with `uv`/`swen`/`ma`, and `clka` 5 (RF_CLK2) `Enab` 1; then re-read the rails and the
+  PM8950 clock buffers. Expected: L9/L19 status bit 7 set, then HAL START status 0 and a scan list.
+- Then: XNU driver (patch for board k88) = this shim code moved into the kernel + TX DXE + join + WPA2-PSK + `en` ifnet.

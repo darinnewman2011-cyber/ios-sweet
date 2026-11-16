@@ -120,6 +120,9 @@ static void rail_probe(void)
 
 		con_hex2(wifi_rails[i].name, "tst=", id, "vme=", v);
 	}
+	/* PM8950 clock buffers (SID 0): BB_CLK1 0x5000, BB_CLK2 0x5100, RF_CLK1 0x5400, RF_CLK2 0x5500 */
+	con_hex2("CLKBUF", "bb1/2=", spmi_rd(0, 0x5046) | spmi_rd(0, 0x5146) << 8 | spmi_rd(0, 0x5008) << 16 | spmi_rd(0, 0x5108) << 24,
+		 "rf1/2=", spmi_rd(0, 0x5446) | spmi_rd(0, 0x5546) << 8 | spmi_rd(0, 0x5408) << 16 | spmi_rd(0, 0x5508) << 24);
 }
 
 /* ---- SMEM ---- */
@@ -167,7 +170,8 @@ static uintptr_t smem_get(uint32_t item, uint32_t *size)
 		return 0;
 	if (size)
 		*size = mmio32(t + 8);
-	return SMEM_BASE + mmio32(t + 4);
+	/* aux_base (bits 31:2) = the physical base of another region, e.g. RPM message RAM */
+	return (mmio32(t + 12) & ~3u ? (uintptr_t)(mmio32(t + 12) & ~3u) : SMEM_BASE) + mmio32(t + 4);
 }
 
 static void smem_probe(void)
@@ -360,6 +364,7 @@ struct smd_ch {
 	uint32_t isz;		/* 20 (byte flags) or 44 (word flags) */
 	uintptr_t txf, rxf;
 	uint32_t fsz;
+	uint32_t ipc_bit;	/* APCS IPC bit that interrupts the remote */
 };
 
 enum { F_DSR, F_CTS, F_CD, F_RI, F_HEAD, F_TAIL, F_STATE, F_BLOCKREADINTR };
@@ -377,11 +382,12 @@ static void smd_setflag(struct smd_ch *c, int rx, int n, uint32_t v)
 		wr8(smd_side(c, rx) + 4 + n, (uint8_t)v);
 }
 
-static void smd_kick(void)
+static void smd_kick_ch(struct smd_ch *c)
 {
 	__asm__ volatile("dsb sy" ::: "memory");
-	wr32(APCS_IPC, IPC_WCNSS_SMD);
+	wr32(APCS_IPC, c->ipc_bit);
 }
+#define smd_kick() smd_kick_ch(c)
 
 static void smd_set_state(struct smd_ch *c, uint32_t st)
 {
@@ -395,17 +401,22 @@ static void smd_set_state(struct smd_ch *c, uint32_t st)
 	smd_kick();
 }
 
-/* find channel WANT on edge 6 in the APPS<->WCNSS partition; 0 = found */
-static int smd_find(const char *want, struct smd_ch *c)
+/* find channel WANT on EDGE (6 = WCNSS: its partition; 15 = RPM: the global heap); 0 = found */
+static int smd_find_edge(const char *want, struct smd_ch *c, uint32_t edge)
 {
 	uint32_t sz = 0;
-	uintptr_t a = smem_get(13, &sz);
+	uintptr_t part = smem_part, a;
+
+	if (edge != SMD_EDGE_WCNSS)
+		smem_part = 0;
+	a = smem_get(13, &sz);
+	c->ipc_bit = edge == SMD_EDGE_WCNSS ? IPC_WCNSS_SMD : 1u;
 
 	for (int i = 0; a && i < 64; i++) {
 		uintptr_t e = a + 32 * i;
 		int k;
 
-		if (!mmio32(e + 28) || (mmio32(e + 24) & 0xff) != SMD_EDGE_WCNSS)
+		if (!mmio32(e + 28) || (mmio32(e + 24) & 0xff) != edge)
 			continue;
 		for (k = 0; want[k] && *(volatile char *)(e + k) == want[k]; k++)
 			;
@@ -417,6 +428,7 @@ static int smd_find(const char *want, struct smd_ch *c)
 
 		c->info = smem_get(14 + cid, &isz);
 		f = smem_get(338 + cid, &fsz);
+		smem_part = part;
 		if (!c->info || !f)
 			return -2;
 		c->isz = isz / 2;
@@ -427,7 +439,13 @@ static int smd_find(const char *want, struct smd_ch *c)
 		con_hex2(" fifo", "pa=", (uint32_t)f, "size=", c->fsz);
 		return 0;
 	}
+	smem_part = part;
 	return -1;
+}
+
+static int smd_find(const char *want, struct smd_ch *c)
+{
+	return smd_find_edge(want, c, SMD_EDGE_WCNSS);
 }
 
 static int smd_open(struct smd_ch *c)
@@ -454,6 +472,13 @@ static int smd_open(struct smd_ch *c)
 
 static void fifo_put(struct smd_ch *c, uint32_t *head, const uint8_t *p, uint32_t n)
 {
+	if (c->isz == 44) {	/* word channel: n and head are multiples of 4 */
+		for (uint32_t i = 0; i < n; i += 4) {
+			wr32(c->txf + *head, p[i] | p[i + 1] << 8 | p[i + 2] << 16 | (uint32_t)p[i + 3] << 24);
+			*head = (*head + 4) & (c->fsz - 1);
+		}
+		return;
+	}
 	for (uint32_t i = 0; i < n; i++) {
 		wr8(c->txf + *head, p[i]);
 		*head = (*head + 1) & (c->fsz - 1);
@@ -486,7 +511,8 @@ static int smd_send(struct smd_ch *c, const void *data, uint32_t len)
 
 static uint8_t fifo_get8(struct smd_ch *c, uint32_t *tail)
 {
-	uint8_t v = *(volatile uint8_t *)(c->rxf + *tail);
+	uint8_t v = c->isz == 44 ? (uint8_t)(mmio32(c->rxf + (*tail & ~3u)) >> (8 * (*tail & 3)))
+				 : *(volatile uint8_t *)(c->rxf + *tail);
 
 	*tail = (*tail + 1) & (c->fsz - 1);
 	return v;
@@ -525,6 +551,83 @@ static int smd_recv(struct smd_ch *c, uint8_t *buf, uint32_t cap, unsigned ms)
 	smd_setflag(c, 1, F_HEAD, 0);
 	smd_kick();
 	return (int)len;
+}
+
+/* ---- RPM requests (edge 15, channel rpm_requests): switch the Iris RF rails on ---- */
+
+#define RPM_REQ		0x00716572u	/* "req" */
+#define RPM_LDOA	0x616f646cu	/* "ldoa" */
+#define RPM_CLKA	0x616b6c63u	/* "clka": PMIC clock buffers */
+#define KEY_SWEN	0x6e657773u	/* "swen" */
+#define KEY_UV		0x00007675u	/* "uv" */
+#define KEY_MA		0x0000616du	/* "ma" */
+#define KEY_ENAB	0x62616e45u	/* "Enab" */
+
+static struct smd_ch rpm_ch;
+static uint32_t rpm_msgid = 0x100;
+
+/* one active-set request with up to 3 key/value pairs; prints the RPM's answer */
+static int rpm_req(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, int nkv)
+{
+	uint32_t m[2 + 5 + 9], n = 0, rx[16];
+	int len;
+
+	m[n++] = RPM_REQ;
+	m[n++] = 20 + 12 * nkv;
+	m[n++] = rpm_msgid++;
+	m[n++] = 0;		/* active set */
+	m[n++] = type;
+	m[n++] = id;
+	m[n++] = 12 * nkv;
+	for (int i = 0; i < nkv; i++) {
+		m[n++] = kv[2 * i];
+		m[n++] = 4;
+		m[n++] = kv[2 * i + 1];
+	}
+	if (smd_send(&rpm_ch, m, 4 * n)) {
+		con_str(what, "RPM tx failed");
+		return -1;
+	}
+	len = smd_recv(&rpm_ch, (uint8_t *)rx, sizeof(rx), 1000);
+	/* answer: "req", length, then messages: "msg#" id, or "err" + text */
+	con_hex2(what, "len=", (uint32_t)len, "m0=", len >= 12 ? rx[2] : 0);
+	if (len >= 24 && rx[4 + (rx[3] + 3) / 4] == 0x00727265u) {
+		char e[24];
+		int k;
+		const uint8_t *t = (const uint8_t *)&rx[6 + (rx[3] + 3) / 4];
+
+		for (k = 0; k < 23 && t + k < (const uint8_t *)rx + len && t[k]; k++)
+			e[k] = (char)t[k];
+		e[k] = 0;
+		con_str(" err", e);
+		return -2;
+	}
+	return len < 0 ? -3 : 0;
+}
+
+static void rpm_rails_on(void)
+{
+	static const uint32_t l19[] = { KEY_UV, 1300000, KEY_SWEN, 1, KEY_MA, 100 };
+	static const uint32_t l9[] = { KEY_UV, 3300000, KEY_SWEN, 1, KEY_MA, 515 };
+	static const uint32_t l7[] = { KEY_UV, 1800000, KEY_SWEN, 1, KEY_MA, 10 };
+	static const uint32_t clk[] = { KEY_ENAB, 1 };
+
+	if (smd_find_edge("rpm_requests", &rpm_ch, 15)) {
+		con_str("RPM", "no rpm_requests channel");
+		return;
+	}
+	con_hex2("RPM", "rstate=", mmio32(SMD_STATE(&rpm_ch, 1)), "lstate=", mmio32(SMD_STATE(&rpm_ch, 0)));
+	if (smd_open(&rpm_ch)) {
+		con_str("RPM", "open failed");
+		return;
+	}
+	rpm_req("RPM L7", RPM_LDOA, 7, l7, 3);
+	rpm_req("RPM L19", RPM_LDOA, 19, l19, 3);
+	rpm_req("RPM L9", RPM_LDOA, 9, l9, 3);
+	rpm_req("RPM RFCLK2", RPM_CLKA, 5, clk, 1);
+	delay_ms(5);
+	rail_probe();
+	k88_present();
 }
 
 /* ---- WCNSS_CTRL: version, NV download ---- */
@@ -666,6 +769,7 @@ static void test_wifi(void)
 	/* the Iris 5-wire bus: TLMM GPIO 76-80, function 1, pull-up, 6 mA (DT wcnss_default) */
 	for (unsigned g = 76; g <= 80; g++)
 		gpio_cfg(g, 1, 3, 6, 0);
+	rpm_rails_on();
 	con_str("WIFI", "stage 2: PAS boot");
 	if (pronto_boot() == 0) {
 		/* wait for the firmware to allocate its SMD channels */
