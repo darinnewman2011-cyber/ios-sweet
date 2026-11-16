@@ -12,7 +12,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
 --- a/bsd/dev/sweet_a8acpm.c
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -333,4 +333,25 @@
+@@ -339,4 +339,25 @@
  	}
  	dvfs_report("after");
  }
@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,524 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -402,6 +402,75 @@ new file mode 100644
 +	return (rd(abox, ROUTE0) & 0xf) == 2 && (rd(abox, UAIF(0, 0)) & 1);
 +}
 +
++/*
++ * Run 71: RDMA0 enabled reads nothing (STATUS 0x80000000 throughout). Scion's S9 driver also writes, before ENABLE,
++ * SBANK_LIMIT (+0x20, 128-byte units, field position not known here) and CTRL0's FORMAT (16-bit stereo, code 9 as
++ * in UAIF CTRL1 [28:24]) with BUF_UPDATE (position not known). Try each candidate with the DAC muted, 25 ms each,
++ * and keep the first that makes the read offset or count move. a8rdmaprobe=0 skips.
++ */
++static uint32_t probe_limit, probe_ctrl0;
++
++static int
++rdma_try(uint32_t limit, uint32_t bits)
++{
++	uint32_t base = rd(abox, RDMA0(R_CTRL0)) & ~1u, st;
++
++	*(volatile uint32_t *)(abox + RDMA0(0x20)) = limit;
++	*(volatile uint32_t *)(abox + RDMA0(R_STR_POINT)) = RMEM_PA;
++	*(volatile uint32_t *)(abox + RDMA0(R_CTRL0)) = base | bits;
++	*(volatile uint32_t *)(abox + RDMA0(R_CTRL0)) = base | bits | 1u;
++	delay(25000);
++	st = rd(abox, RDMA0(R_STATUS));
++	*(volatile uint32_t *)(abox + RDMA0(R_CTRL0)) = base | bits;
++	delay(2000);
++	*(volatile uint32_t *)(abox + RDMA0(R_CTRL0)) = base;
++	if (st & 0x1fff1fffu) {
++		printf("SWEET AUDIO: 6 probe: RDMA0 moves with SBANK_LIMIT %#x, CTRL0 bits %#x (status %#x)\n", limit, bits, st);
++		return 1;
++	}
++	return 0;
++}
++
++static int
++rdma_probe(void)
++{
++	static const uint32_t limits[6] = { 0, 4, 4u << 8, 4u << 16, 4u << 24, 0x7f };
++	unsigned on = 1, tries = 0;
++
++	(void)PE_parse_boot_argn("a8rdmaprobe", &on, sizeof(on));
++	if (!on) {
++		return 0;
++	}
++	printf("SWEET AUDIO: 6 probe: SBANK_LIMIT reads %#x, CTRL0 %#x, CTRL1 %#x\n",
++	    rd(abox, RDMA0(0x20)), rd(abox, RDMA0(R_CTRL0)), rd(abox, RDMA0(0x04)));
++	for (unsigned l = 0; l < 6; l++) {
++		for (unsigned b = 0; b < 32; b++) {     /* b 0: no extra bit; else one bit (not ENABLE or BURST_LEN) */
++			uint32_t bits = b == 0 ? 0 : (1u << b);
++			if (b >= 19 && b <= 22) {
++				continue;
++			}
++			tries++;
++			if (rdma_try(limits[l], bits)) {
++				probe_limit = limits[l]; probe_ctrl0 = bits;
++				return 1;
++			}
++		}
++		for (unsigned sh = 1; sh <= 27; sh++) {         /* FORMAT 9 (16-bit stereo) at each place clear of BURST_LEN */
++			if (sh + 4 >= 19 && sh <= 22) {
++				continue;
++			}
++			tries++;
++			if (rdma_try(limits[l], 9u << sh)) {
++				probe_limit = limits[l]; probe_ctrl0 = 9u << sh;
++				return 1;
++			}
++		}
++	}
++	*(volatile uint32_t *)(abox + RDMA0(0x20)) = 0;
++	printf("SWEET AUDIO: 6 probe: nothing moved RDMA0 in %u tries\n", tries);
++	return 0;
++}
++
 +static void
 +step_tone(void)
 +{
@@ -439,6 +508,11 @@ new file mode 100644
 +	}
 +	if (((rd(abox, RDMA0(R_CTRL0)) >> 19) & 0xf) == 0) {
 +		(void)wr_bits(abox, "RDMA0 CTRL0 (BURST_LEN 8)", RDMA0(R_CTRL0), 0xfu << 19, 8u << 19);
++	}
++	if (rdma_probe()) {
++		(void)wr(abox, "RDMA0 SBANK_LIMIT (probed)", RDMA0(0x20), probe_limit);
++		(void)wr_bits(abox, "RDMA0 CTRL0 (probed bits)", RDMA0(R_CTRL0), probe_ctrl0, probe_ctrl0);
++		(void)wr(abox, "RDMA0 STR_POINT", RDMA0(R_STR_POINT), RMEM_PA);
 +	}
 +	c_wr(MAIN, 0x51, (uint8_t)vol);
 +	c_wr(MAIN, 0x52, (uint8_t)vol);

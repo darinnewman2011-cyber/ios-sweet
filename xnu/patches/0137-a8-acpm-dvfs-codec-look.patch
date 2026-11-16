@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,342 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte): talking to ACPM, the Exynos 7885's power-management firmware (a Cortex-M core
@@ -260,10 +260,16 @@ new file mode 100644
 +static void
 +acpm_log_dump(void)
 +{
-+	uint32_t fw = INITDATA, front = s_rd(fw + 56), base = s_rd(fw + 60);
-+	uint32_t size = s_rd(fw + 64), len = s_rd(fw + 68);
++	/* run 71: +52/+56 hold the SRAM offsets of the rear/front indices (0x5408, 0x540c), as Linux's acpm.c maps them */
++	uint32_t fw = INITDATA, rp = s_rd(fw + 52), fp = s_rd(fw + 56), base = s_rd(fw + 60);
++	uint32_t size = s_rd(fw + 64), len = s_rd(fw + 68), front;
 +
-+	printf("SWEET ACPM: log rear %u front %u base %#x entry %u x %u\n", s_rd(fw + 52), front, base, size, len);
++	if (rp >= SRAM_SIZE || fp >= SRAM_SIZE) {
++		printf("SWEET ACPM: log pointers %#x/%#x out of range\n", rp, fp);
++		return;
++	}
++	front = s_rd(fp);
++	printf("SWEET ACPM: log rear %u front %u base %#x entry %u x %u\n", s_rd(rp), front, base, size, len);
 +	if (len == 0 || len > 4096 || size < 12 || size > 64 || front >= len || base + size * len > SRAM_SIZE) {
 +		return;
 +	}
