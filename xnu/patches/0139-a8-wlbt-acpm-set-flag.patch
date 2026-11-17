@@ -198,18 +198,48 @@ index 2f4a199..c89542c 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..983395f 100644
+index f638996..77a639d 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -48,6 +48,7 @@
+@@ -48,6 +48,19 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
++extern void sweet_a8net_publish(int which, const char *text);   /* xnu 0140: what the Sweet Connect app shows */
++
++/* Tell Sweet Connect (Wi-Fi and Bluetooth pages) where the radio core is: "state <word> <detail>\n". */
++static void
++app_state(const char *word, const char *detail)
++{
++	char text[256];
++
++	snprintf(text, sizeof(text), "state %s %s\n", word, detail);
++	sweet_a8net_publish(0, text);
++	sweet_a8net_publish(1, text);
++}
 +int sweet_a8_acpm_wlbt_flag(uint32_t *reply);  /* xnu 0139, sweet_a8acpm.c */
  void sweet_a8_wlbt_init(void);
  
  #define SHM_PA          0xe9000000u
-@@ -375,16 +376,24 @@ wlbt_thread(void *arg, wait_result_t wr_)
+@@ -306,7 +319,9 @@ wlbt_thread(void *arg, wait_result_t wr_)
+ 
+ 	(void)arg;
+ 	(void)wr_;
++	app_state("waiting", "radio core test starts 60 s after boot");
+ 	sleep_ms(60000);                /* the root file system is mounted and the boot is past its busiest */
++	app_state("starting", "loading the WLBT firmware");
+ 	shm = ml_io_map(SHM_PA, SHM_SIZE);
+ 	mbox = ml_io_map(MBOX_PA, 0x1000);
+ 	pmu = ml_io_map(PMU_PA, 0x8000);
+@@ -323,6 +338,7 @@ wlbt_thread(void *arg, wait_result_t wr_)
+ 	}
+ 	if ((error = load_firmware(&size))) {
+ 		printf("SWEET A8 WLBT: 2 load: %s: error %d (put the phone's /vendor/etc/wifi/mx140.bin there)\n", FW_PATH, error);
++		app_state("off", "WLBT firmware file missing (mx140.bin)");
+ 		goto out;
+ 	}
+ 	magic = rd(shm, 8);
+@@ -375,17 +391,44 @@ wlbt_thread(void *arg, wait_result_t wr_)
  	    rd(pmu, MEM_CONFIG1), rd(mbox, ISSR(0)), rd(mbox, ISSR(1)), rd(mbox, ISSR(2)), rd(mbox, ISSR(3)));
  	report("before start", runtime, panic_off);
  
@@ -225,14 +255,34 @@ index f638996..983395f 100644
  	wr(pmu, WIFI_CTRL_NS, rd(pmu, WIFI_CTRL_NS) & ~(1u << 2));
  	wr(pmu, WIFI_CTRL_S, rd(pmu, WIFI_CTRL_S) | (1u << 3));
  	printf("SWEET A8 WLBT: 5 started (PWRON, reset released, START)\n");
++	{
++		char d[200];
++
++		snprintf(d, sizeof(d), "radio core started; power flag %s (err %d)", fe == 0 ? "accepted" : "refused", fe);
++		app_state("starting", d);
++	}
  	for (int t = 1; t <= 20; t++) {
 -		char when[24];
-+		char when[80];
++		char when[80], d[200];
  
  		sleep_ms(t <= 4 ? 250 : 1000);
 -		snprintf(when, sizeof(when), "watch %d", t);
 +		snprintf(when, sizeof(when), "watch %d (SET_FLAG err %d, reply %#x %#x %#x %#x)", t, fe, fr[0], fr[1],
 +		    fr[2], fr[3]);
  		report(when, runtime, panic_off);
++		uint32_t p0 = rd(shm, panic_off), p1 = rd(shm, panic_off + 4), p2 = rd(shm, panic_off + 8),
++		    p3 = rd(shm, panic_off + 12), mw = rd(shm, mgmt_in.widx);
++		if (p0 | p1 | p2 | p3) {
++			snprintf(d, sizeof(d), "radio firmware crashed after %d s (record %08x %08x %08x %08x; power flag err %d)",
++			    t <= 4 ? 0 : t - 4, p0, p1, p2, p3, fe);
++			app_state("off", d);
++		} else if (mw) {
++			snprintf(d, sizeof(d), "radio firmware running, %u messages from the core (Wi-Fi scan not built yet)", mw);
++			app_state("on", d);
++		} else {
++			snprintf(d, sizeof(d), "radio core started, waiting for its first message (%d of 20)", t);
++			app_state("starting", d);
++		}
  	}
  	final_dump(panic_off);
+ 	wr(pmu, EXT_REG_OPTION, rd(pmu, EXT_REG_OPTION) & ~0x4u);
