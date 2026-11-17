@@ -1,8 +1,75 @@
 diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
-index 2f4a199..74c3d68 100644
+index 2f4a199..7cdc4ca 100644
 --- a/bsd/dev/sweet_a8acpm.c
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -360,4 +360,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
+@@ -106,6 +106,58 @@ chan_setup(int i)
+ 	return 0;
+ }
+ 
++static int acpm_send(int i, uint32_t *cmd);
++
++static uint8_t
++s_rd8(uint32_t off)
++{
++	return (uint8_t)(s_rd(off & ~3u) >> (8 * (off & 3u)));
++}
++
++/*
++ * xnu 0139, run 80: every DVFS request on channel 4 is consumed (send rear catches up) but never answered, and ACPM's
++ * own log shows fw_ipc returning 0xffffffff. Samsung's acpm.c plugins_init() attaches "dynamic plugins" (struct plugin,
++ * fw_header/common.h: id, base_addr, acpm_ops, plugin_ops, extern_func_mask, timer{period, multiplier}, u8 is_attached,
++ * size, u8 stay_attached, fw_name = 44 bytes) and reads the DVFS plugin's fvmap; booting from S-Boot nobody does.
++ * Dump the plugin table and the channel owners, and run Samsung's IPC loopback test (cmd0 = 1 << 23 | 3 << 26).
++ */
++static void
++acpm_dump_plugins(void)
++{
++	uint32_t np = s_rd(INITDATA + 4), pl = s_rd(INITDATA), nc = s_rd(INITDATA + 12), cb = s_rd(INITDATA + 8);
++	uint32_t cmd[16] = { (1u << 23) | (3u << 26), 0, 0, 0 };
++	int e;
++
++	printf("SWEET ACPM: plugin table at %#x, %u plugins\n", pl, np);
++	for (uint32_t i = 0; i < np && i < 16 && pl && pl + 44 * (i + 1) <= SRAM_SIZE; i++) {
++		uint32_t p = pl + 44 * i, fn = s_rd(p + 40);
++		char name[33];
++		unsigned n = 0;
++
++		if (fn && fn < SRAM_SIZE - 32) {
++			for (; n < 32; n++) {
++				uint8_t c = s_rd8(fn + n);
++				if (c == 0) {
++					break;
++				}
++				name[n] = (c >= 32 && c < 127) ? (char)c : '?';
++			}
++		}
++		name[n] = 0;
++		printf("SWEET ACPM: plugin %u: id %u base %#x ops %#x/%#x mask %#x timer %u/%u attached %u size %#x stay %u name '%s'\n",
++		    i, s_rd(p), s_rd(p + 4), s_rd(p + 8), s_rd(p + 12), s_rd(p + 16), s_rd(p + 20), s_rd(p + 24),
++		    s_rd8(p + 28), s_rd(p + 32), s_rd8(p + 36), name);
++	}
++	for (uint32_t i = 0; i < nc && i < 16 && cb && cb + 72 * (i + 1) <= SRAM_SIZE; i++) {
++		uint32_t c = cb + 72 * i;
++		printf("SWEET ACPM: channel entry %u: id %u field %#x owner %d type %u ap_poll %u\n", i, s_rd(c), s_rd(c + 4),
++		    (int)s_rd(c + 8), s_rd(c + 12), s_rd(c + 68));
++	}
++	e = acpm_send(CH_DVFS, cmd);
++	printf("SWEET ACPM: loopback test on channel %d: error %d, reply %#x %#x %#x %#x\n", CH_DVFS, e, cmd[0], cmd[1],
++	    cmd[2], cmd[3]);
++}
++
+ static int
+ acpm_init(void)
+ {
+@@ -125,6 +177,7 @@ acpm_init(void)
+ 		return ENXIO;
+ 	}
+ 	acpm_ready = 1;
++	acpm_dump_plugins();
+ 	return 0;
+ }
+ 
+@@ -360,4 +413,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
  	}
  	return (cmd[1] >> 24) & 0xff ? EIO : 0;
  }
