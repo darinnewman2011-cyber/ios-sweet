@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..e45fe27 100644
+index f638996..3bb380d 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,469 @@
+@@ -1,411 +1,977 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -959,6 +959,507 @@ index f638996..e45fe27 100644
 +	dump_words("panic record", panic_off, 56);
 +}
 +
++/*
++ * Stage 6 (xnu 0139): WLAN service + HIP4 + scan, once the core has sent MM_START_IND.
++ * Protocol facts read from Samsung's GPL scsc / scsc_wlan drivers (servman_messages.h, mifstream.c, cpacket_buffer.c,
++ * platform_mif.c, hip4.c/h, mbulk_def.h, mbulk.c, fapi.h, mlme.c, cfg80211_ops.c); no code copied.
++ *   service start: mgmt packet {chan 1, service 1 (WLAN), SM_MSG_START_REQ 0, ref of the HIP control block (LE32)}
++ *   HIP4 control (packed): init {0xcaaa0400, fw version, ref v4, ref v3} @0, config v3 @32, v4 @160 (120 bytes each),
++ *   scoreboard @320 (byte indices, host/fw owned), 6 queues of 256 refs @1344 + 1088 * q.
++ *   WLAN region (2 MB, 4 KB aligned): config 0, MIB (hcf minus 8-byte header) 0x2000, host buffers 0x3000 (ctl pool
++ *   0x70000, 32 x 2 KB), firmware buffers 0x80000.
++ *   mbulk header 20 bytes {next_ofs, flag, clas, pid, refcnt, dat_bufsz, sig_bufsz, len, head, chain}; the signal sits
++ *   at +24 (4 bytes the firmware reserves), data at +20 + head.
++ */
++#define INTGR1          0x01cu
++#define WL_SIZE         0x200000u
++#define WL_MIB          0x2000u
++#define WL_MIB_MAX      0x1000u
++#define WL_TX           0x3000u
++#define WL_TX_SIZE      0x7d000u
++#define WL_CTL          0x70000u
++#define WL_CTL_SLOT     0x800u
++#define WL_RX           0x80000u
++#define WL_RX_SIZE      0x100000u
++#define HC_INIT         0u
++#define HC_V3           32u
++#define HC_V4           160u
++#define HC_SCBRD        320u
++#define HC_Q(i)         (1344u + 1088u * (uint32_t)(i))
++#define FH_INT          5               /* from-host bits 0 (panic) and 1-4 are the mxconf streams' */
++#define TH_INT          7               /* to-host bits 0-6 likewise */
++#define SIG_ADD_SCAN_REQ        0x2005
++#define SIG_ADD_SCAN_CFM        0x2105
++#define SIG_SCAN_IND            0x2300
++#define SIG_SCAN_DONE_IND       0x2301
++enum { Q_FH_CTRL, Q_FH_DAT, Q_FH_RFB, Q_TH_CTRL, Q_TH_DAT, Q_TH_RFB };
++static const uint8_t q_layout[6][2] = { { 0, 64 }, { 1, 65 }, { 66, 2 }, { 67, 3 }, { 68, 4 }, { 5, 69 } };
++
++extern int IODTGetLoaderInfo(const char *key, void **infoAddr, int *infoSize);
++typedef int (*sweet_a8net_handler_t)(const char *cmd);
++extern void sweet_a8net_set_handler(int which, sweet_a8net_handler_t h);
++
++struct wnet {
++	uint8_t bssid[6];
++	char ssid[33];
++	int16_t rssi;
++	uint8_t secure;
++	uint16_t mhz;
++};
++static uint32_t wl;
++static unsigned ctl_slot;
++static uint8_t headroom, tailroom;
++static uint8_t wl_mac[6];
++static struct wnet nets[48];
++static int n_nets;
++static volatile int scan_req;
++static int scanning;
++static uint64_t scan_t0;
++static uint32_t wl_sigs, wl_scan_inds;
++static char wl_status[160];
++
++static inline void wl_dmb(void) { __asm__ volatile ("dmb sy" ::: "memory"); }
++static inline void wl_dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
++static uint8_t rd8(uint32_t off) { return *(volatile uint8_t *)(shm + off); }
++static void wr8(uint32_t off, uint8_t v) { *(volatile uint8_t *)(shm + off) = v; }
++static uint16_t rd16(uint32_t off) { return (uint16_t)(rd8(off) | (uint16_t)rd8(off + 1) << 8); }
++static void wr16(uint32_t off, uint16_t v) { wr8(off, (uint8_t)v); wr8(off + 1, (uint8_t)(v >> 8)); }
++static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++
++static void
++ring_r4(int bit)
++{
++	wl_dsb();
++	wr(mbox, INTGR1, 1u << bit);
++}
++
++static uint8_t
++q_idx(int q, int r)
++{
++	wl_dmb();
++	return rd8(wl + HC_SCBRD + q_layout[q][r]);
++}
++
++static void
++q_set(int q, int r, uint8_t v)
++{
++	wl_dmb();
++	wr8(wl + HC_SCBRD + q_layout[q][r], v);
++	wl_dsb();
++}
++
++static int
++q_put(int q, uint32_t ref)
++{
++	uint8_t w = q_idx(q, 0), r = q_idx(q, 1);
++
++	if ((uint8_t)(w + 1) == r) {
++		return ENOSPC;
++	}
++	wr(shm, wl + HC_Q(q) + 4u * w, ref);
++	q_set(q, 0, (uint8_t)(w + 1));
++	ring_r4(FH_INT);
++	return 0;
++}
++
++/* One control signal (FAPI header + body in sig[]) with optional bulk data, from the host control pool. */
++static int
++sig_send(const uint8_t *sig, uint32_t sig_len, const uint8_t *data, uint32_t data_len)
++{
++	uint32_t m = wl + WL_CTL + WL_CTL_SLOT * ctl_slot;
++	uint32_t sbuf = ((20u + 4u + sig_len + 3u) & ~3u) - 20u;
++	uint32_t dbuf = data_len ? data_len + headroom + tailroom : 0;
++
++	if (20u + sbuf + dbuf > WL_CTL_SLOT) {
++		return E2BIG;
++	}
++	ctl_slot = (ctl_slot + 1) % 32;
++	for (uint32_t o = 0; o < 20u + sbuf + dbuf + 4u; o += 4) {
++		wr(shm, m + o, 0);
++	}
++	wr8(m + 4, 1);                          /* MBULK_F_SIG */
++	wr8(m + 5, 1);                          /* MBULK_CLASS_FROM_HOST_CTL */
++	wr8(m + 6, 1);                          /* host control pool */
++	wr8(m + 7, data_len ? 1 : 0);
++	wr16(m + 8, (uint16_t)dbuf);
++	wr16(m + 10, (uint16_t)sbuf);
++	wr16(m + 12, (uint16_t)data_len);
++	wr16(m + 14, (uint16_t)(sbuf + (data_len ? headroom : 0)));
++	for (uint32_t i = 0; i < sig_len; i++) {
++		wr8(m + 24 + i, sig[i]);
++	}
++	for (uint32_t i = 0; i < data_len; i++) {
++		wr8(m + 20 + sbuf + headroom + i, data[i]);
++	}
++	wl_dsb();
++	return q_put(Q_FH_CTRL, m);
++}
++
++static uint32_t
++sig_hdr(uint8_t *s, uint16_t id, uint16_t vif)
++{
++	memset(s, 0, 64);
++	put16(s, id);
++	put16(s + 4, 0xc001);                   /* SLSI_TX_PROCESS_ID_MIN */
++	put16(s + 10, vif);
++	return 12;
++}
++
++static int
++same_ssid(const char *a, const char *b)
++{
++	for (int i = 0; i < 33; i++) {
++		if (a[i] != b[i]) {
++			return 0;
++		}
++		if (!a[i]) {
++			return 1;
++		}
++	}
++	return 1;
++}
++
++static void
++wl_publish(const char *word, const char *detail)
++{
++	static char text[4096];
++	uint8_t done[48] = { 0 };
++	int n = snprintf(text, sizeof(text), "state %s %s\n", word, detail);
++
++	/* strongest first, one line per SSID */
++	for (;;) {
++		int best = -1;
++		for (int i = 0; i < n_nets; i++) {
++			if (!done[i] && (best < 0 || nets[i].rssi > nets[best].rssi)) {
++				best = i;
++			}
++		}
++		if (best < 0 || n > (int)sizeof(text) - 96) {
++			break;
++		}
++		done[best] = 1;
++		int dup = 0;
++		for (int i = 0; i < n_nets; i++) {
++			if (i != best && done[i] == 2 && same_ssid(nets[i].ssid, nets[best].ssid)) {
++				dup = 1;
++			}
++		}
++		if (dup) {
++			continue;
++		}
++		done[best] = 2;
++		n += snprintf(text + n, sizeof(text) - (size_t)n, "net %s\t%d\t%d\t0\n", nets[best].ssid, nets[best].rssi,
++		    nets[best].secure ? 1 : 0);
++	}
++	sweet_a8net_publish(0, text);
++}
++
++static void
++scan_result(int16_t rssi, uint16_t freq_half_mhz, uint32_t f, uint32_t len)
++{
++	struct wnet w;
++	int i;
++
++	if (len < 36 || f + len > SHM_SIZE) {
++		return;
++	}
++	memset(&w, 0, sizeof(w));
++	for (i = 0; i < 6; i++) {
++		w.bssid[i] = rd8(f + 16 + (uint32_t)i);
++	}
++	w.rssi = rssi;
++	w.mhz = (uint16_t)(freq_half_mhz / 2);
++	w.secure = (rd8(f + 34) & 0x10) ? 1 : 0;        /* capability: privacy */
++	for (uint32_t p = 36; p + 2 <= len;) {
++		uint8_t id = rd8(f + p), l = rd8(f + p + 1);
++		if (p + 2 + l > len) {
++			break;
++		}
++		if (id == 0 && l <= 32) {
++			for (i = 0; i < l; i++) {
++				char c = (char)rd8(f + p + 2 + (uint32_t)i);
++				w.ssid[i] = (c < 32 || c == 127) ? '?' : c;
++			}
++			w.ssid[l] = 0;
++		} else if (id == 48) {
++			w.secure = 2;
++		}
++		p += 2u + l;
++	}
++	if (!w.ssid[0] || w.ssid[0] == '?') {
++		return;                         /* hidden network */
++	}
++	for (i = 0; i < n_nets; i++) {
++		if (memcmp(nets[i].bssid, w.bssid, 6) == 0) {
++			nets[i] = w;
++			return;
++		}
++	}
++	if (n_nets < (int)(sizeof(nets) / sizeof(nets[0]))) {
++		nets[n_nets++] = w;
++	}
++}
++
++static void
++send_scan(void)
++{
++	static const uint16_t mhz[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++		                        5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825 };
++	uint8_t s[64], d[160];
++	uint32_t dl = 0, ch;
++	int e;
++
++	sig_hdr(s, SIG_ADD_SCAN_REQ, 1);
++	put16(s + 12, 0x0100);                  /* scan id: ifnum 1 << 8 | SLSI_SCAN_HW_ID */
++	put16(s + 14, 2);                       /* FAPI_SCANTYPE_FULL_SCAN */
++	memcpy(s + 16, wl_mac, 6);
++	put16(s + 22, 0x0004);                  /* FAPI_REPORTMODE_REAL_TIME */
++	d[dl++] = 0;                            /* wildcard SSID element */
++	d[dl++] = 0;
++	{
++		static const uint8_t timing[19] = { 0xdd, 0x11, 0x00, 0x16, 0x32, 0x01, 0x01 };
++		memcpy(d + dl, timing, sizeof(timing));
++		dl += sizeof(timing);
++	}
++	ch = dl;
++	d[dl++] = 0xdd;
++	d[dl++] = 5;
++	d[dl++] = 0x00;
++	d[dl++] = 0x16;
++	d[dl++] = 0x32;
++	d[dl++] = 0x01;
++	d[dl++] = 0x02;
++	for (unsigned i = 0; i < sizeof(mhz) / sizeof(mhz[0]); i++) {
++		put16(d + dl, (uint16_t)(mhz[i] * 2));
++		d[dl + 2] = 0;                  /* active */
++		dl += 3;
++		d[ch + 1] = (uint8_t)(d[ch + 1] + 3);
++	}
++	n_nets = 0;
++	e = sig_send(s, 36, d, dl);
++	printf("SWEET A8 WIFI: scan request sent: error %d (%u bytes of elements)\n", e, dl);
++	scanning = (e == 0);
++	scan_t0 = mach_absolute_time();
++	wl_publish("on", e ? "scan request could not be queued" : "scanning...");
++}
++
++static void
++wl_signal(uint32_t sig, uint32_t sig_len, uint32_t dat, uint32_t dat_len)
++{
++	uint16_t id = rd16(sig);
++
++	wl_sigs++;
++	if (wl_sigs <= 40 && id != SIG_SCAN_IND) {
++		printf("SWEET A8 WIFI: signal %#x from the firmware (%u + %u bytes): %04x %04x %04x %04x\n", id, sig_len, dat_len,
++		    rd16(sig + 10), rd16(sig + 12), rd16(sig + 14), rd16(sig + 16));
++	}
++	switch (id) {
++	case SIG_ADD_SCAN_CFM:
++		if (rd16(sig + 12) != 0) {
++			snprintf(wl_status, sizeof(wl_status), "scan refused (result %#x)", rd16(sig + 12));
++			scanning = 0;
++			wl_publish("on", wl_status);
++		}
++		break;
++	case SIG_SCAN_IND:
++		wl_scan_inds++;
++		scan_result((int16_t)rd16(sig + 14), rd16(sig + 12), dat, dat_len);
++		break;
++	case SIG_SCAN_DONE_IND:
++		scanning = 0;
++		snprintf(wl_status, sizeof(wl_status), "%d networks found (Join is the next build)", n_nets);
++		printf("SWEET A8 WIFI: scan done: %u results, %d networks\n", wl_scan_inds, n_nets);
++		wl_publish("on", wl_status);
++		break;
++	default:
++		break;
++	}
++}
++
++/* Drains one to-host queue: hands each signal to wl_signal and gives the buffers (and chains) back on TH_RFB. */
++static void
++wl_drain(int q)
++{
++	uint8_t r = q_idx(q, 1), w = q_idx(q, 0);
++
++	while (r != w) {
++		uint32_t ref = rd(shm, wl + HC_Q(q) + 4u * r);
++		if (ref >= wl && ref < wl + WL_SIZE - 64) {
++			uint16_t sbuf = rd16(ref + 10), len = rd16(ref + 12), head = rd16(ref + 14);
++			uint8_t flag = rd8(ref + 4);
++			if (q == Q_TH_CTRL && (flag & 1) && sbuf >= 4 + 10) {
++				wl_signal(ref + 24, sbuf - 4u, ref + 20u + head, len);
++			}
++			(void)q_put(Q_TH_RFB, ref);
++			if ((flag & 0xc0) == 0xc0) {
++				uint32_t c = rd(shm, ref + 16);
++				for (int k = 0; k < 16 && c >= wl && c < wl + WL_SIZE - 64; k++) {
++					uint32_t next = (rd8(c + 4) & 0x80) ? rd(shm, c + 16) : 0;
++					(void)q_put(Q_TH_RFB, c);
++					c = next;
++				}
++			}
++		}
++		r++;
++		q_set(q, 1, r);
++	}
++}
++
++static int
++wl_cmd(const char *cmd)
++{
++	if (cmd[0] == 's' && cmd[1] == 'c' && cmd[2] == 'a' && cmd[3] == 'n') {
++		scan_req = 1;
++	} else if (cmd[0] == 'o' && cmd[1] == 'n') {
++		scan_req = 1;
++	} else if (cmd[0] == 'j' && cmd[1] == 'o' && cmd[2] == 'i' && cmd[3] == 'n') {
++		return ENOTSUP;
++	}
++	return 0;
++}
++
++/* Management packets from the core: returns 1 when SM_MSG_START_CFM for WLAN arrived. */
++static int
++mgmt_poll(void)
++{
++	uint32_t r = rd(shm, mgmt_in.ridx) % mgmt_in.num, w = rd(shm, mgmt_in.widx) % mgmt_in.num;
++	int cfm = 0;
++
++	while (r != w) {
++		uint32_t a = rd(shm, mgmt_in.buf + r * 8), b = rd(shm, mgmt_in.buf + r * 8 + 4);
++		printf("SWEET A8 WIFI: mgmt packet %u: %08x %08x\n", r, a, b);
++		if ((a & 0xffffff) == 0x010101) {
++			cfm = 1;                /* channel 1, service WLAN, SM_MSG_START_CFM */
++		}
++		r = (r + 1) % mgmt_in.num;
++	}
++	wl_dsb();
++	wr(shm, mgmt_in.ridx, r);
++	ring_r4(mgmt_in.rbit);
++	return cfm;
++}
++
++static void
++mgmt_send(uint8_t chan, uint8_t a, uint8_t b, uint32_t ref)
++{
++	uint32_t w = rd(shm, mgmt_out.widx) % mgmt_out.num, at = mgmt_out.buf + w * 8;
++
++	wr(shm, at, chan | (uint32_t)a << 8 | (uint32_t)b << 16 | (ref & 0xffu) << 24);
++	wr(shm, at + 4, ref >> 8);
++	wl_dsb();
++	wr(shm, mgmt_out.widx, (w + 1) % mgmt_out.num);
++	ring_r4(mgmt_out.wbit);
++}
++
++static void
++put_cfg(uint32_t at, uint16_t ver, uint32_t mib_sz)
++{
++	wr(shm, at + 0, 0xcaba0401u);
++	wr(shm, at + 4, ver | (120u << 16));
++	wr(shm, at + 28, 64u << 24);            /* host_cache_line */
++	wr(shm, at + 32, wl + WL_TX);
++	wr(shm, at + 36, WL_TX_SIZE);
++	wr(shm, at + 40, wl + WL_RX);
++	wr(shm, at + 44, WL_RX_SIZE);
++	wr(shm, at + 48, mib_sz ? wl + WL_MIB : 0);
++	wr(shm, at + 52, mib_sz);
++	wr(shm, at + 64, FH_INT | (TH_INT << 8));
++	wr(shm, at + 68, wl + HC_SCBRD);
++	wr(shm, at + 72, 6u | (256u << 16));
++	wr(shm, at + 76, 1u);
++	for (int i = 0; i < 6; i++) {
++		wr(shm, at + 80 + 4u * (uint32_t)i, wl + HC_Q(i));
++	}
++}
++
++static void
++wifi_run(uint32_t panic_off)
++{
++	void *bpa = NULL;
++	int bsz = 0, cfm = 0;
++	uint32_t mib_sz = 0, ver, cfg;
++	uint64_t now, lim15;
++	char d[200];
++
++	heap_next = (heap_next + 0xfffu) & ~0xfffu;
++	wl = heap_next;
++	if (wl + WL_SIZE > SHM_SIZE) {
++		app_state("off", "radio running, but no room for the Wi-Fi buffers");
++		return;
++	}
++	heap_next += WL_SIZE;
++	for (uint32_t o = 0; o < WL_TX; o += 4) {
++		wr(shm, wl + o, 0);
++	}
++	if (IODTGetLoaderInfo("SweetWLANHCF", &bpa, &bsz) == 0 && bsz > 8) {
++		const uint8_t *h = (const uint8_t *)ml_static_ptovirt((vm_offset_t)bpa);
++		if (h[7] == 1 && (uint32_t)bsz - 8 <= WL_MIB_MAX) {
++			mib_sz = (uint32_t)bsz - 8;
++			for (uint32_t i = 0; i < mib_sz; i++) {
++				wr8(wl + WL_MIB + i, h[8 + i]);
++			}
++		}
++	}
++	put_cfg(wl + HC_V4, 4, mib_sz);
++	put_cfg(wl + HC_V3, 3, mib_sz);
++	wr(shm, wl + HC_INIT + 0, 0xcaaa0400u);
++	wr(shm, wl + HC_INIT + 8, wl + HC_V4);
++	wr(shm, wl + HC_INIT + 12, wl + HC_V3);
++	{
++		uint64_t t = mach_absolute_time();
++		wl_mac[0] = 0x02;               /* locally administered */
++		for (int i = 1; i < 6; i++) {
++			wl_mac[i] = (uint8_t)(t >> (8 * i));
++		}
++	}
++	(void)mgmt_poll();                      /* consumes MM_START_IND */
++	printf("SWEET A8 WIFI: WLAN region at %#x, MIB %u bytes; sending SM_MSG_START_REQ\n", wl, mib_sz);
++	mgmt_send(1, 1, 0, wl + HC_INIT);
++	for (int t = 0; t < 300 && !cfm; t++) {
++		sleep_ms(10);
++		cfm = mgmt_poll();
++	}
++	ver = rd(shm, wl + HC_INIT + 4);
++	cfg = ver == 3 ? HC_V3 : HC_V4;
++	headroom = rd8(wl + cfg + 28);
++	tailroom = rd8(wl + cfg + 29);
++	snprintf(d, sizeof(d), "Wi-Fi service %s (HIP v%u, MLME SAP %#x, room %u/%u, MIB %u bytes)", cfm ? "started" :
++	    "did not confirm", ver, rd16(wl + cfg + 12), headroom, tailroom, mib_sz);
++	printf("SWEET A8 WIFI: %s; compat %#x build %u\n", d, rd(shm, wl + cfg + 8), rd(shm, wl + cfg + 20));
++	if (!cfm || (ver != 3 && ver != 4)) {
++		wl_publish("off", d);
++		return;
++	}
++	wl_publish("on", d);
++	sweet_a8net_set_handler(0, wl_cmd);
++	scan_req = 1;
++	nanoseconds_to_absolutetime(15ull * NSEC_PER_SEC, &lim15);
++	for (;;) {
++		wl_drain(Q_TH_CTRL);
++		wl_drain(Q_TH_DAT);
++		q_set(Q_FH_RFB, 1, q_idx(Q_FH_RFB, 0));     /* host buffers given back: our pool is round-robin */
++		now = mach_absolute_time();
++		if (scanning && now - scan_t0 > lim15) {
++			scanning = 0;
++			snprintf(wl_status, sizeof(wl_status), "scan timed out: %d networks, %u results, %u signals", n_nets,
++			    wl_scan_inds, wl_sigs);
++			wl_publish("on", wl_status);
++		}
++		if (scan_req && !scanning) {
++			scan_req = 0;
++			send_scan();
++		}
++		if (rd(shm, panic_off) | rd(shm, panic_off + 12)) {
++			snprintf(d, sizeof(d), "radio firmware crashed while Wi-Fi was starting (boot step %#x, record %08x %08x)",
++			    rd(mbox2, ISSR(0)), rd(shm, panic_off + 8), rd(shm, panic_off + 12));
++			wl_publish("off", d);
++			printf("SWEET A8 WIFI: %s\n", d);
++			return;
++		}
++		sleep_ms(20);
++	}
++}
++
 +static void
 +wlbt_thread(void *arg, wait_result_t wr_)
 +{
@@ -1061,6 +1562,7 @@ index f638996..e45fe27 100644
 +		snprintf(d, sizeof(d), "radio core started; power flag %s (err %d)", fe == 0 ? "accepted" : "refused", fe);
 +		app_state("starting", d);
 +	}
++	int started = 0;
 +	for (int t = 1; t <= 20; t++) {
 +		char when[80], d[200];
 +
@@ -1075,12 +1577,18 @@ index f638996..e45fe27 100644
 +			    rd(mbox2, ISSR(0)), p0, p1, p2, p3, fe);
 +			app_state("off", d);
 +		} else if (mw) {
-+			snprintf(d, sizeof(d), "radio firmware running, %u messages from the core (Wi-Fi scan not built yet)", mw);
++			snprintf(d, sizeof(d), "radio firmware running, %u messages from the core; starting Wi-Fi", mw);
 +			app_state("on", d);
++			started = 1;
++			break;
 +		} else {
 +			snprintf(d, sizeof(d), "radio core started, waiting for its first message (%d of 20)", t);
 +			app_state("starting", d);
 +		}
++	}
++	if (started) {
++		wifi_run(panic_off);
++		goto out;
 +	}
 +	final_dump(panic_off);
 +	wr(pmu, EXT_REG_OPTION, rd(pmu, EXT_REG_OPTION) & ~0x4u);
