@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..3bb380d 100644
+index f638996..ec4c06f 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,977 @@
+@@ -1,411 +1,978 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1077,7 +1077,8 @@ index f638996..3bb380d 100644
 +	for (uint32_t o = 0; o < 20u + sbuf + dbuf + 4u; o += 4) {
 +		wr(shm, m + o, 0);
 +	}
-+	wr8(m + 4, 1);                          /* MBULK_F_SIG */
++	wr8(m + 4, 1 | 4);                      /* MBULK_F_SIG | MBULK_F_OBOUND: the firmware asserts (0x84afb/0x2a01,
++	                                         * ios87) unless (flag & 0x24) == 0x04; Linux sets it last in skb_to_mbulk */
 +	wr8(m + 5, 1);                          /* MBULK_CLASS_FROM_HOST_CTL */
 +	wr8(m + 6, 1);                          /* host control pool */
 +	wr8(m + 7, data_len ? 1 : 0);
