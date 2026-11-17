@@ -1079,3 +1079,21 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
     212-byte record, then provide an mxconf.
   - **Gestalt spoof:** no `com.apple.MobileGestalt.plist` exists anywhere on this root (iOS never wrote the cache), so
     `_tmp/wsl/gestalt.py` skipped. Plan instead: an MGCopyAnswer hook for the island/AOD keys.
+
+## 2026-11-16: ABOX firmware boot, WLBT SET_FLAG, Sweet Connect
+
+- **ABOX (speaker/headphones):** RDMA only moves through the CA7 "Calliope" firmware (IPC_PCMPLAYBACK), so 0138 now
+  boots it: `tools/mkaboxfw.py` packs the phone's own calliope/ext bins (not in git) and `mkpayload.py --blob
+  SweetABOX=FILE` puts them after the kernel (`/chosen/memory-map`), read with IODTGetLoaderInfo.
+  - ios76 panicked in kmem_alloc mapping 12 MB with ml_io_map. ios77 (1 MB windows) panicked in ml_io_unmap: **io
+    mappings are permanent on this kernel** ("Attempting to remove permanent VM map entry").
+  - Fix 3869987: the 12 MB firmware + page table + ring come from `kmem_alloc_contig` (1 MB aligned), written through
+    the kernel mapping and cleaned with `dc cvac` (the CA7 is not coherent). Untested.
+  - ios77 observed before the panic: blob 2,157,224 bytes / 5 parts at 0x8824a0000, TFA9872 started with 0 I2C
+    errors (CLKS/PLLS/AMPS 1), COD3035 init without errors.
+- **WLBT:** firmware still panics (R4 record `2, 0xd4, ..., 4`) with 0139's ACPM SET_FLAG before reset release; the
+  4c result line scrolled out of ramoops, so 8c05571 repeats it in every watch line.
+- **Sweet Connect** (`apps/SweetConnect`, apps.yml on macos-15-intel, run 44017142349 green; artifact on the PC
+  `_tmp/sweetconnect/SweetConnect.tar`): Wi-Fi / Bluetooth tabs over xnu 0140's `kern.sweet_wifi` / `kern.sweet_bt`
+  text sysctls (EAGAIN = "radio not running" until a driver registers). Not installed in the root yet (needs a clean
+  shutdown + root edit).
