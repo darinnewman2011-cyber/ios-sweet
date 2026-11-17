@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,1221 @@
+@@ -0,0 +1,1226 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -833,6 +833,8 @@ new file mode 100644
 +#define FW_IOVA         0x80000000u
 +#define FW_SIZE         0xc00000u
 +#define RING_IOVA       0x81000000u
++#define VSS_IOVA        0xa0000000u     /* run 79: the firmware reads here at boot (SysMMU fault 0xa0670000); Samsung maps the modem's VSS shared memory (7 MB). A zeroed 1 MB scratch block stands in, mapped 7 times. */
++#define FW_ALLOC        (FW_SIZE + 0x300000u)   /* firmware, page table (+12 MB), ring (+13 MB), VSS scratch (+14 MB) */
 +#define IPC_TX          0x22000u
 +#define IPC_TX_ACK      0x222fcu
 +#define IPC_RX          0x22300u
@@ -1030,15 +1032,15 @@ new file mode 100644
 +		return -1;
 +	}
 +	{
-+		kern_return_t kr = kmem_alloc_contig(kernel_map, &fw_va, FW_SIZE + 0x200000u, 0,
++		kern_return_t kr = kmem_alloc_contig(kernel_map, &fw_va, FW_ALLOC, 0,
 +		    (ppnum_t)(0x1000000000ull >> PAGE_SHIFT), (ppnum_t)((0x100000u >> PAGE_SHIFT) - 1),
 +		    KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT);
 +		if (kr != KERN_SUCCESS || fw_va == 0) {
-+			printf("SWEET AUDIO: 7 calliope: no contiguous %u MB (kr %d)\n", (FW_SIZE + 0x200000u) >> 20, kr);
++			printf("SWEET AUDIO: 7 calliope: no contiguous %u MB (kr %d)\n", (FW_ALLOC) >> 20, kr);
 +			return -1;
 +		}
 +		fw_pa = (uint64_t)ml_vtophys(fw_va);
-+		for (i = 0; i < FW_SIZE + 0x200000u; i += 0x100000u) {
++		for (i = 0; i < FW_ALLOC; i += 0x100000u) {
 +			if ((uint64_t)ml_vtophys(fw_va + i) != fw_pa + i) {
 +				printf("SWEET AUDIO: 7 calliope: memory not contiguous at +%#x\n", i);
 +				return -1;
@@ -1051,7 +1053,7 @@ new file mode 100644
 +		ptab = fw_va + FW_SIZE;
 +		cring = fw_va + FW_SIZE + 0x100000u;
 +		printf("SWEET AUDIO: 7 calliope: firmware memory %u MB of XNU RAM at PA %#llx\n",
-+		    (FW_SIZE + 0x200000u) >> 20, (unsigned long long)fw_pa);
++		    (FW_ALLOC) >> 20, (unsigned long long)fw_pa);
 +	}
 +	printf("SWEET AUDIO: 7 calliope: CA7 status %#x option %#x config %#x, TIMER0_CTRL1 %#x, PC %#x\n",
 +	    rd(pmu, 0x2524), rd(pmu, 0x2528), rd(pmu, 0x2520), rd(abox, 0x604), rd(abox, 0x2c3c));
@@ -1102,6 +1104,9 @@ new file mode 100644
 +		wr32(ptab, 4u * ((FW_IOVA >> 20) + i), (uint32_t)((fw_pa + (i << 20)) >> 4) | 2u);
 +	}
 +	wr32(ptab, 4u * (RING_IOVA >> 20), (uint32_t)((fw_pa + FW_SIZE + 0x100000u) >> 4) | 2u);
++	for (i = 0; i < 7; i++) {
++		wr32(ptab, 4u * ((VSS_IOVA >> 20) + i), (uint32_t)((fw_pa + FW_SIZE + 0x200000u) >> 4) | 2u);
++	}
 +	wr32(ptab, 4u * (0x11c80000u >> 20), (0x11c00000u >> 4) | 2u);
 +	wr32(ptab, 4u * (0x12090000u >> 20), (0x12000000u >> 4) | 2u);
 +	__asm__ volatile ("dsb sy" ::: "memory");
@@ -1135,7 +1140,7 @@ new file mode 100644
 +			}
 +		}
 +	}
-+	dc_clean(fw_va, FW_SIZE);
++	dc_clean(fw_va, FW_ALLOC);     /* also the zeroing of the scratch/ring pages, done through the cache */
 +	for (i = 0; i < count; i++) {
 +		const uint32_t *e = blob + 2 + 4 * i;
 +		if (e[0] == 0) {
