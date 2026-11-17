@@ -1,8 +1,19 @@
 diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
-index 2f4a199..7cdc4ca 100644
+index 2f4a199..066514a 100644
 --- a/bsd/dev/sweet_a8acpm.c
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -106,6 +106,58 @@ chan_setup(int i)
+@@ -53,7 +53,9 @@ int sweet_a8_acpm_codec_write(uint8_t reg, uint8_t val);
+ #define INTCR1          0x20u
+ #define INTSR1          0x28u
+ #define CH_MFD          2
+-#define CH_DVFS         4       /* the "acpm" node's channel (cal-if); 5 is ACPM->AP notices, queue of 1 (run 59) */
++#define CH_CORE         4       /* the "acpm" node: owned by the ACPM framework (run 81: owner 1); loopback, plugin attach */
++#define CH_FVP          5       /* the "acpm_dvfs" node: owned by plugin 3 exynos7885_acpm_fvp (run 81: owner 8) */
++static int ch_dvfs = CH_CORE;  /* DVFS requests; CH_FVP once that plugin is attached and its queue looks sane */
+ #define FREQ_REQ        0
+ #define FREQ_GET        1
+ #define TYPE_CODEC      7
+@@ -106,6 +108,128 @@ chan_setup(int i)
  	return 0;
  }
  
@@ -53,23 +64,109 @@ index 2f4a199..7cdc4ca 100644
 +		printf("SWEET ACPM: channel entry %u: id %u field %#x owner %d type %u ap_poll %u\n", i, s_rd(c), s_rd(c + 4),
 +		    (int)s_rd(c + 8), s_rd(c + 12), s_rd(c + 68));
 +	}
-+	e = acpm_send(CH_DVFS, cmd);
-+	printf("SWEET ACPM: loopback test on channel %d: error %d, reply %#x %#x %#x %#x\n", CH_DVFS, e, cmd[0], cmd[1],
++	e = acpm_send(CH_CORE, cmd);
++	printf("SWEET ACPM: loopback test on channel %d: error %d, reply %#x %#x %#x %#x\n", CH_CORE, e, cmd[0], cmd[1],
 +	    cmd[2], cmd[3]);
++}
++
++extern int IODTGetLoaderInfo(const char *key, void **infoAddr, int *infoSize);
++
++/*
++ * Run 81: plugin 3 'exynos7885_acpm_fvp.fw' (stay 1, attached 0, base 0x7801, size 0x3000) owns the DVFS channels
++ * (0, 1, 5, 6, 8: owner 8), so every DVFS request on the framework's channel 4 was refused (fw_ipc -1) and the WLBT
++ * firmware never got SET_FLAG. Samsung's acpm.c plugins_init(): copy the plugin's firmware to SRAM + (base & ~1), then
++ * attach it on the "acpm" channel with cmd0 = 1 << 25 (DP_A) | id << 26. The firmware is built into Samsung's kernel
++ * (CONFIG_EXTRA_FIRMWARE, 12288 bytes); our boot image carries it as the blob "SweetACPMFVP" (mkpayload --blob, never
++ * in git). DVFS requests then go to channel 5 (the "acpm_dvfs" node), if its queue looks sane after the attach.
++ */
++static void
++acpm_attach_plugins(void)
++{
++	uint32_t np = s_rd(INITDATA + 4), pl = s_rd(INITDATA);
++	void *bpa = NULL;
++	int bsz = 0;
++	const uint8_t *blob = NULL;
++
++	if (IODTGetLoaderInfo("SweetACPMFVP", &bpa, &bsz) == 0 && bsz > 0) {
++		blob = (const uint8_t *)ml_static_ptovirt((vm_offset_t)bpa);
++	}
++	for (uint32_t i = 0; i < np && i < 16 && pl && pl + 44 * (i + 1) <= SRAM_SIZE; i++) {
++		uint32_t p = pl + 44 * i, id = s_rd(p), base = s_rd(p + 4) & ~1u, size = s_rd(p + 32), fn = s_rd(p + 40);
++		uint32_t cmd[16] = { 0 };
++		char name[33];
++		unsigned n = 0;
++		int e;
++
++		if (!(s_rd8(p + 28) == 0 && s_rd8(p + 36) == 1)) {
++			continue;
++		}
++		if (fn && fn < SRAM_SIZE - 32) {
++			for (; n < 32; n++) {
++				uint8_t c = s_rd8(fn + n);
++				if (c == 0) {
++					break;
++				}
++				name[n] = (c >= 32 && c < 127) ? (char)c : '?';
++			}
++		}
++		name[n] = 0;
++		if (strstr(name, "fvp") == NULL) {
++			printf("SWEET ACPM: plugin %u '%s' wants loading; no firmware for it here\n", i, name);
++			continue;
++		}
++		if (blob == NULL) {
++			printf("SWEET ACPM: plugin %u '%s' wants loading; no SweetACPMFVP blob in this boot image\n", i, name);
++			continue;
++		}
++		if (base == 0 || (bsz & 3) != 0 || (uint32_t)bsz > size || base + (uint32_t)bsz > SRAM_SIZE) {
++			printf("SWEET ACPM: plugin %u '%s': blob %d bytes does not fit (base %#x size %#x)\n", i, name, bsz, base, size);
++			continue;
++		}
++		for (uint32_t o = 0; o < (uint32_t)bsz; o += 4) {
++			uint32_t w;
++			memcpy(&w, blob + o, 4);
++			s_wr(base + o, w);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		cmd[0] = (1u << 25) | (id << 26);
++		e = acpm_send(CH_CORE, cmd);
++		printf("SWEET ACPM: plugin %u '%s': %d bytes loaded at %#x, attach (id %u): error %d, reply %#x %#x; attached now %u\n",
++		    i, name, bsz, base, id, e, cmd[0], cmd[1], s_rd8(p + 28));
++	}
++	if (chan_setup(CH_FVP) == 0) {
++		ch_dvfs = CH_FVP;
++	}
++	printf("SWEET ACPM: DVFS requests go to channel %d\n", ch_dvfs);
 +}
 +
  static int
  acpm_init(void)
  {
-@@ -125,6 +177,7 @@ acpm_init(void)
+@@ -121,10 +245,13 @@ acpm_init(void)
+ 	}
+ 	printf("SWEET ACPM: framework: plugins %u, channels %u, ap channels %u, INTSR1 %#x\n",
+ 	    s_rd(INITDATA + 4), s_rd(INITDATA + 12), s_rd(INITDATA + 24), *(volatile uint32_t *)(mbox + INTSR1));
+-	if (chan_setup(CH_MFD) || chan_setup(CH_DVFS)) {
++	if (chan_setup(CH_MFD) || chan_setup(CH_CORE)) {
  		return ENXIO;
  	}
  	acpm_ready = 1;
 +	acpm_dump_plugins();
++	acpm_attach_plugins();
++	acpm_dump_plugins();
  	return 0;
  }
  
-@@ -360,4 +413,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
+@@ -195,7 +322,7 @@ static int
+ dvfs(uint32_t domain, uint32_t khz, uint32_t func, uint32_t *out)
+ {
+ 	uint32_t cmd[16] = { domain, khz, func, 0 };
+-	int e = acpm_send(CH_DVFS, cmd);
++	int e = acpm_send(ch_dvfs, cmd);
+ 	if (out != NULL) {
+ 		*out = cmd[1];
+ 	}
+@@ -360,4 +487,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
  	}
  	return (cmd[1] >> 24) & 0xff ? EIO : 0;
  }
@@ -87,7 +184,7 @@ index 2f4a199..7cdc4ca 100644
 +	if (acpm_init()) {
 +		return ENXIO;
 +	}
-+	e = acpm_send(CH_DVFS, cmd);
++	e = acpm_send(ch_dvfs, cmd);
 +	for (int i = 0; i < 4; i++) {
 +		reply[i] = cmd[i];
 +	}
