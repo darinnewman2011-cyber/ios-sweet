@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,798 @@
+@@ -0,0 +1,802 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -106,7 +106,8 @@ new file mode 100644
 +#define CMU_PA          0x14800000u
 +#define GPIO_PA         0x148f0000u
 +#define MMU_PA          0x14a30000u
-+#define RMEM_PA         0xe9400000u
++#define RMEM_PA         ring_pa         /* run 74: abox_rmem 0xe9400000 never read; default now the framebuffer region's tail */
++static uint32_t ring_pa = 0xed3f0000u;   /* fb_handover 0xEC000000 + 20 MB - 64 KB: plain DRAM the display DMA reads; a8ringpa= */
 +
 +#define SYSPOWER        0x10u
 +#define QCH_DISABLE     0x38u
@@ -396,6 +397,7 @@ new file mode 100644
 +		(void)wr(mmu, "SysMMU CTRL (translating: off, addresses physical)", 0x0, 0);
 +	}
 +	(void)wr_bits(abox, "SYSPOWER_CTRL (on)", SYSPOWER, 1, 1);
++	(void)wr_bits(abox, "DYN_CLOCK_OFF (all of ABOX's internal clocks held on)", 0x34, 0x7fffffffu, 0x7fffffffu);
 +	/* ABOX never gates its bus clock or UAIF0's BCLK while it plays (Scion: ACLK and BCLK_UAIF1 = bit 3; so
 +	 * BCLK_UAIF0 = bit 2 and ACLK = bit 0 here, INFERRED from the S9's layout) */
 +	(void)wr_bits(abox, "QCHANNEL_DISABLE (ACLK, BCLK_UAIF0; inferred bits)", QCH_DISABLE, 0x5, 0x5);
@@ -473,7 +475,7 @@ new file mode 100644
 +rdma_probe(void)
 +{
 +	static const uint32_t limits[6] = { 0, 4, 4u << 8, 4u << 16, 4u << 24, 0x7f };
-+	unsigned on = 1, tries = 0;
++	unsigned on = 0, tries = 0;   /* run 74: never found anything; a8rdmaprobe=1 */
 +
 +	(void)PE_parse_boot_argn("a8rdmaprobe", &on, sizeof(on));
 +	if (!on) {
@@ -518,6 +520,8 @@ new file mode 100644
 +
 +	(void)PE_parse_boot_argn("a8audiosecs", &secs, sizeof(secs));
 +	(void)PE_parse_boot_argn("a8audiovol", &vol, sizeof(vol));
++	(void)PE_parse_boot_argn("a8ringpa", &ring_pa, sizeof(ring_pa));
++	printf("SWEET AUDIO: 6 tone: ring at %#x (%u bytes)\n", ring_pa, (unsigned)RING_BYTES);
 +	secs = secs < 1 ? 1 : secs > 10 ? 10 : secs;
 +	vol = vol < 0x30 ? 0x30 : vol > 0xff ? 0xff : vol;      /* never louder than 0x30 */
 +	if (ring == 0) {
