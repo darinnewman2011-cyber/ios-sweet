@@ -1110,3 +1110,9 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
 - **WLBT:** SET_FLAG on ACPM channel 4 gets no reply (err 60, ETIMEDOUT) on every boot. Channel (the `acpm` node, as
   cal-if's exynos_acpm_set_device) and protocol (seq bits 16-21, INTGR0 (1<<id)<<16) match Samsung's acpm_ipc.c.
   The firmware panic (code 4) is unchanged. Next idea: whether APM's DVFS service needs an init/handshake first.
+- **CONFIRMED by Darin 2026-11-17 ~09:30 (ios81, xnu #111): the boot test phrase plays from the speaker.** Path: Calliope
+  firmware (boot blob) → IPC_PCMPLAYBACK on RDMA0 → SIFS1 → UAIF3 → TFA9872. Next for audio: an iOS-side output
+  (AudioHAL/IOAudio driver feeding the RDMA ring) so iOS sounds play.
+- Sweet Connect installed in the iOS 16 root (9 chunks, root `5be11273...`, LaunchServices stores reset; backup in WSL
+  `/opt/sweet/phone-root.pre-sc.img`). USB installer: `tools/mka8installer.py`, drive `D:\A8-iOS\` holds iPadOS 17.7
+  (not installed).
