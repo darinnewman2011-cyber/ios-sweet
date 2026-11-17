@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,1220 @@
+@@ -0,0 +1,1221 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -939,9 +939,10 @@ new file mode 100644
 +static void
 +mmu_report(const char *when)
 +{
-+	printf("SWEET AUDIO: 7 SysMMU %s: ver %#x ctrl %#x cfg %#x status %#x pt %#x/%#x int %#x fault AR %#x (%#x) AW %#x (%#x)\n",
++	/* run 78: reading +0x80 is a synchronous external abort on this SysMMU (kernel panic): only 0x0..0x78, 0x1020 */
++	printf("SWEET AUDIO: 7 SysMMU %s: ver %#x ctrl %#x cfg %#x status %#x pt %#x/%#x int %#x fault %#x %#x\n",
 +	    when, rd(mmu, 0x34), rd(mmu, 0x0), rd(mmu, 0x4), rd(mmu, 0x8), rd(mmu, 0xc), rd(mmu, 0x1020), rd(mmu, 0x60),
-+	    rd(mmu, 0x70), rd(mmu, 0x78), rd(mmu, 0x80), rd(mmu, 0x88));
++	    rd(mmu, 0x70), rd(mmu, 0x78));
 +}
 +
 +/* 16-bit sine, Bhaskara's approximation; phase: 2^32 = one cycle */
