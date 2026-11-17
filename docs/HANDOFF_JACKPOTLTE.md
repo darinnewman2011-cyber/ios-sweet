@@ -1097,3 +1097,16 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
   `_tmp/sweetconnect/SweetConnect.tar`): Wi-Fi / Bluetooth tabs over xnu 0140's `kern.sweet_wifi` / `kern.sweet_bt`
   text sysctls (EAGAIN = "radio not running" until a driver registers). Not installed in the root yet (needs a clean
   shutdown + root edit).
+- **MILESTONE 2026-11-17 ~00:20: the ABOX Calliope firmware boots and RDMA moves (ios80t, xnu #110, 97c551c).**
+  - ios78t: SysMMU +0x80 read = synchronous external abort (mmu_report now stops at 0x78).
+  - ios79t: CA7 runs the firmware (PC 0x80051f92), then a SysMMU fault at 0xa0670000 (IOVA_VSS_FIRMWARE, which
+    Samsung maps to the modem's VSS shmem = 0xF5400000 + cp_size 0x7900000, 7 MB) and sits at PC 0x20.
+  - ios80t: VSS window mapped 7x onto a zeroed 1 MB block → `BOOT DONE after 89 ms`, no fault, OPEN/SET_BUFFER/
+    HW_PARAMS/PREPARE/CLOSE acked in 1 us, `RDMA0 ctrl 0x400921`, count 32 → 272 over 3 s, offset moving, UAIF3
+    0x1000005. Whether the speaker sounded: not observed (nobody listening). The SMC 0x82000501 is unknown to EL3
+    (returns its own id, magic never set) and is not needed.
+  - Everyday image **`a8-ios80-boot.img` `1a9c880d...f535`** (ios77 cmdline, sweetreboot=0) flashed 00:27; the
+    phrase plays ~68 s after boot. Test images: ios80t `965b7b9a...3964` (sweetreboot=420).
+- **WLBT:** SET_FLAG on ACPM channel 4 gets no reply (err 60, ETIMEDOUT) on every boot. Channel (the `acpm` node, as
+  cal-if's exynos_acpm_set_device) and protocol (seq bits 16-21, INTGR0 (1<<id)<<16) match Samsung's acpm_ipc.c.
+  The firmware panic (code 4) is unchanged. Next idea: whether APM's DVFS service needs an init/handshake first.
