@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,798 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -567,7 +567,7 @@ new file mode 100644
 +	c_wr(MAIN, 0x51, 0xff);
 +	c_wr(MAIN, 0x52, 0xff);
 +	(void)wr_bits(abox, "RDMA0 CTRL0 (off)", RDMA0(R_CTRL0), 1, 0);
-+	printf("SWEET AUDIO: 6 tone: done; did you hear it in the headphones?\n");
++	printf("SWEET AUDIO: 6 tone: done; did you hear it (headphones, speaker)?\n");
 +}
 +
 +/*
@@ -648,6 +648,118 @@ new file mode 100644
 +	return 0;
 +}
 +
++static int
++tfa_write(uint8_t reg, uint16_t val)
++{
++	const uint8_t b[3] = { reg, (uint8_t)(val >> 8), (uint8_t)val };
++
++	*(volatile uint32_t *)(i2c + IICDS) = TFA_ADDR << 1;
++	*(volatile uint32_t *)(i2c + IICSTAT) = 0xf0;
++	if (i2c_wait() || (rd(i2c, IICSTAT) & 1)) {
++		i2c_stop(0xd0);
++		return ENXIO;
++	}
++	for (int k = 0; k < 3; k++) {
++		*(volatile uint32_t *)(i2c + IICDS) = b[k];
++		i2c_go(1);
++		if (i2c_wait() || (rd(i2c, IICSTAT) & 1)) {
++			i2c_stop(0xd0);
++			return EIO;
++		}
++	}
++	i2c_stop(0xd0);
++	return 0;
++}
++
++/* NXP bitfield id: register << 8 | position << 4 | (length - 1) (tfa9872_tfafieldnames.h, facts only) */
++static int
++tfa_bf(uint16_t bf, uint16_t v)
++{
++	uint8_t reg = (uint8_t)(bf >> 8);
++	unsigned pos = (bf >> 4) & 15, len = (bf & 15) + 1;
++	uint16_t mask = (uint16_t)(((1u << len) - 1) << pos), old = 0;
++	int e = tfa_read(reg, &old);
++
++	return e ? e : tfa_write(reg, (uint16_t)((old & ~mask) | ((v << pos) & mask)));
++}
++
++/*
++ * Speaker, step 2: UAIF3 (gpb2-0..3, CMU_DISPAUD DIV 0x1824, MUX 0x1014, gates 0x201c/0x20c4, Q 0x3018) from SIFS1
++ * (ROUTE_CTRL0 [15:12] = 2), 2 x 16-bit I2S master as UAIF0; then the TFA9872 started from Samsung's Tfa9872.cnt
++ * (vendor/firmware): the device's 23 bitfields and the "music" profile's (AUDFS 48 kHz, AMPE, LPM1MODE, LNMODE, DCA),
++ * without the speaker-protection DSP (it runs in ABOX on Android). MANSCONF, then PWDN 0 once BCK runs.
++ */
++static const uint16_t tfa_dev_bf[23][2] = {
++	{ 0x20c3, 0x0 }, { 0x2144, 0xf }, { 0x2224, 0xf }, { 0x2103, 0x1 }, { 0x2330, 0x1 }, { 0x2340, 0x1 },
++	{ 0x2603, 0x0 }, { 0x26c3, 0x0 }, { 0x2703, 0x1 }, { 0x6801, 0x2 }, { 0x6821, 0x1 }, { 0x6841, 0x2 },
++	{ 0x6110, 0x1 }, { 0x6365, 0x1b }, { 0x6565, 0x0 }, { 0x7033, 0xc }, { 0x6163, 0x6 }, { 0x7444, 0x7 },
++	{ 0x7534, 0x5 }, { 0x7402, 0x4 }, { 0x7002, 0x5 }, { 0x0580, 0x0 }, { 0x0560, 0x0 },
++};
++static int spk_on;
++
++static void
++step_speaker_start(void)
++{
++	vm_offset_t aud = gpio;
++	uint16_t st = 0, st13 = 0;
++	int errs = 0;
++
++	if (!i2c) {
++		return;
++	}
++	(void)wr_bits(cmu, "spk: DIV_UAIF3 (/16: 1.536 MHz)", 0x1824, 0x1f, 15);
++	(void)wr_bits(cmu, "spk: MUX_UAIF3 (the divider)", 0x1014, 1, 0);
++	(void)wr_bits(cmu, "spk: gate BCLK_UAIF3", 0x201c, GATE_ON, GATE_ON);
++	(void)wr_bits(cmu, "spk: gate RSTNSYNC UAIF3", 0x20c4, GATE_ON, GATE_ON);
++	(void)wr_bits(cmu, "spk: QCH UAIF3", 0x3018, 3, 2);
++	(void)wr_bits(aud, "spk: gpb2 CON (0..3 function 2)", 0x40, 0xffff, 0x2222);
++	(void)wr_bits(aud, "spk: gpb2 PUD (0..3 as the DT: 1)", 0x48, 0xffff, 0x1111);
++	(void)wr_bits(abox, "spk: QCHANNEL_DISABLE (+ BCLK_UAIF3; inferred bit 5)", QCH_DISABLE, 1u << 5, 1u << 5);
++	(void)wr_bits(abox, "spk: ROUTE_CTRL0 (UAIF3 from SIFS1)", ROUTE0, 0xfu << 12, 2u << 12);
++	(void)wr(abox, "spk: UAIF3 CTRL1 (2 x 16 bit I2S)", UAIF(3, 4), 0x0984f000);
++	(void)wr(abox, "spk: UAIF3 CTRL0 (master, data mode)", UAIF(3, 0), 0x1000014);
++	(void)wr_bits(abox, "spk: UAIF3 CTRL0 (SPK_ENABLE)", UAIF(3, 0), 1, 1);
++	delay(20000);
++
++	errs += tfa_write(0x00, 0x0002) != 0;                   /* I2CR: registers to their defaults */
++	delay(10000);
++	errs += tfa_write(0x0f, 0x5a6b) != 0;                   /* hidden-register key */
++	for (unsigned i = 0; i < 23; i++) {
++		errs += tfa_bf(tfa_dev_bf[i][0], tfa_dev_bf[i][1]) != 0;
++	}
++	errs += tfa_write(0x0f, 0) != 0;
++	errs += tfa_bf(0x0203, 8) != 0;                         /* AUDFS 48 kHz */
++	errs += tfa_bf(0x64e1, 1) != 0;                         /* LPM1MODE */
++	errs += tfa_bf(0x62e1, 0) != 0;                         /* LNMODE */
++	errs += tfa_bf(0x0030, 1) != 0;                         /* AMPE */
++	errs += tfa_bf(0x0040, 1) != 0;                         /* DCA */
++	errs += tfa_bf(0x0120, 1) != 0;                         /* MANSCONF */
++	errs += tfa_bf(0x0000, 0) != 0;                         /* PWDN 0: power up */
++	for (int t = 0; t < 50; t++) {                          /* up to 500 ms for AMPS (status bit 12) */
++		(void)tfa_read(0x10, &st);
++		if (st & (1u << 12)) {
++			break;
++		}
++		delay(10000);
++	}
++	(void)tfa_read(0x13, &st13);
++	spk_on = 1;
++	printf("SWEET AUDIO: spk: TFA9872 started (%d I2C errors); status 0x10 %#x (CLKS %u PLLS %u AMPS %u), 0x13 %#x "
++	    "(MANOPER %u)\n", errs, st, (st >> 5) & 1, (st >> 1) & 1, (st >> 12) & 1, st13, st13 >> 15);
++}
++
++static void
++step_speaker_stop(void)
++{
++	if (!spk_on) {
++		return;
++	}
++	(void)tfa_bf(0x0030, 0);                                /* AMPE off */
++	(void)tfa_bf(0x0000, 1);                                /* PWDN */
++	(void)wr_bits(abox, "spk: UAIF3 CTRL0 (off)", UAIF(3, 0), 1, 0);
++	spk_on = 0;
++}
++
 +static void
 +step_speaker_look(void)
 +{
@@ -718,7 +830,13 @@ new file mode 100644
 +		return;
 +	}
 +	if (n >= 6) {
++		unsigned spk = 1;
++		(void)PE_parse_boot_argn("a8spk", &spk, sizeof(spk));
++		if (spk) {
++			step_speaker_start();
++		}
 +		step_tone();
++		step_speaker_stop();
 +	}
 +	step_look();
 +}
