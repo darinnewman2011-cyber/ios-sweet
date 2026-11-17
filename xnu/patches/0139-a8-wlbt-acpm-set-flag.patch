@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
-index 2f4a199..066514a 100644
+index 2f4a199..c89542c 100644
 --- a/bsd/dev/sweet_a8acpm.c
 +++ b/bsd/dev/sweet_a8acpm.c
 @@ -53,7 +53,9 @@ int sweet_a8_acpm_codec_write(uint8_t reg, uint8_t val);
@@ -13,7 +13,7 @@ index 2f4a199..066514a 100644
  #define FREQ_REQ        0
  #define FREQ_GET        1
  #define TYPE_CODEC      7
-@@ -106,6 +108,128 @@ chan_setup(int i)
+@@ -106,6 +108,134 @@ chan_setup(int i)
  	return 0;
  }
  
@@ -110,7 +110,13 @@ index 2f4a199..066514a 100644
 +			}
 +		}
 +		name[n] = 0;
-+		if (strstr(name, "fvp") == NULL) {
++		int fvp = 0;
++		for (unsigned k = 0; k + 3 <= n; k++) {     /* no strstr in the kernel (build #113) */
++			if (name[k] == 'f' && name[k + 1] == 'v' && name[k + 2] == 'p') {
++				fvp = 1;
++			}
++		}
++		if (!fvp) {
 +			printf("SWEET ACPM: plugin %u '%s' wants loading; no firmware for it here\n", i, name);
 +			continue;
 +		}
@@ -142,7 +148,7 @@ index 2f4a199..066514a 100644
  static int
  acpm_init(void)
  {
-@@ -121,10 +245,13 @@ acpm_init(void)
+@@ -121,10 +251,13 @@ acpm_init(void)
  	}
  	printf("SWEET ACPM: framework: plugins %u, channels %u, ap channels %u, INTSR1 %#x\n",
  	    s_rd(INITDATA + 4), s_rd(INITDATA + 12), s_rd(INITDATA + 24), *(volatile uint32_t *)(mbox + INTSR1));
@@ -157,7 +163,7 @@ index 2f4a199..066514a 100644
  	return 0;
  }
  
-@@ -195,7 +322,7 @@ static int
+@@ -195,7 +328,7 @@ static int
  dvfs(uint32_t domain, uint32_t khz, uint32_t func, uint32_t *out)
  {
  	uint32_t cmd[16] = { domain, khz, func, 0 };
@@ -166,7 +172,7 @@ index 2f4a199..066514a 100644
  	if (out != NULL) {
  		*out = cmd[1];
  	}
-@@ -360,4 +487,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
+@@ -360,4 +493,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
  	}
  	return (cmd[1] >> 24) & 0xff ? EIO : 0;
  }
