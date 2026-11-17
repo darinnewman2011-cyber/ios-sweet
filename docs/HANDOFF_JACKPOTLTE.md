@@ -1116,3 +1116,23 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
 - Sweet Connect installed in the iOS 16 root (9 chunks, root `5be11273...`, LaunchServices stores reset; backup in WSL
   `/opt/sweet/phone-root.pre-sc.img`). USB installer: `tools/mka8installer.py`, drive `D:\A8-iOS\` holds iPadOS 17.7
   (not installed).
+
+## 2026-11-17 evening: ACPM fvp plugin, SET_FLAG accepted, Sweet Connect status
+
+- **ACPM fvp plugin (ios82, d54657e's parent):** `exynos7885_acpm_fvp.fw` (12288 bytes, pulled from the stock BOOT.img
+  kernel's built-in firmware table; not in git) is passed as boot blob `SweetACPMFVP`, copied to SRAM 0x7800 and attached
+  on channel 4 (`cmd0 = 1<<25 | id<<26`): reply 0xe020000, `attached now 1`.
+- **Channel 5 was the wrong DVFS channel:** type 2, queue length 1, so `front + 1 == rear` always ("queue full").
+  d54657e uses the plugin's own type-1 channels (owner == 1 << 3): channel 0 (10 x 16) and 1 (3 x 16).
+- **ios84 (`45bcc6dd...4260`, xnu #116, a8dvfs=1, a8wlbt=1, sweetreboot=0): SET_FLAG {7,1,6,0} on channel 0 → error 0,
+  reply 0xa0000 0x1.** The WLBT firmware still panics with the same record, so BUCK2 was not (only) the cause.
+  Note: with a working DVFS channel, `a8dvfs=2` will really set MIF/CPU clocks; it was not tested yet.
+- **Sweet Connect status works (ebd158f):** the WLBT probe publishes `state waiting/starting/on/off <detail>` to both
+  `kern.sweet_wifi` and `kern.sweet_bt`; the app showed "off: radio firmware crashed ... power flag err 0" on ios84.
+  (The "after N s" in that text is the last watch, not the crash time: fix the wording.)
+- **WLBT panic record (R4 v2, 53 words, xor checksum OK):** word 2 = 0x75c5f (likely a 1 MHz timestamp, ~0.48 s),
+  word 3 = 4. Words 28/31/44 = 0x800049b3 / 0x800001b7 / 0x800001bb: Thumb addresses in the firmware's 0x80000000
+  view of the shared memory (file offset = address - 0x80000000; entry 0x1a9 starts with a boot-progress write
+  `0x11110001` and the mode-stack setup at 0x1b8). The v1 register order (R0..R12, SP, LR, SPSR, PC, CPSR at word 4)
+  does NOT fit (it gives PC 0x7496e in 802.11 IE code). Next: work out the v2 layout (per-mode banked registers?) and
+  read the fault address; `_tmp/wlbt-dis/fw.elf` + llvm-objdump `--triple=thumbv7r-none-eabi --mcpu=cortex-r4`.
