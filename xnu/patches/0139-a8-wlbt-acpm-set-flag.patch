@@ -1,19 +1,20 @@
 diff --git a/bsd/dev/sweet_a8acpm.c b/bsd/dev/sweet_a8acpm.c
-index 2f4a199..c89542c 100644
+index 2f4a199..00614b7 100644
 --- a/bsd/dev/sweet_a8acpm.c
 +++ b/bsd/dev/sweet_a8acpm.c
-@@ -53,7 +53,9 @@ int sweet_a8_acpm_codec_write(uint8_t reg, uint8_t val);
+@@ -53,7 +53,10 @@ int sweet_a8_acpm_codec_write(uint8_t reg, uint8_t val);
  #define INTCR1          0x20u
  #define INTSR1          0x28u
  #define CH_MFD          2
 -#define CH_DVFS         4       /* the "acpm" node's channel (cal-if); 5 is ACPM->AP notices, queue of 1 (run 59) */
 +#define CH_CORE         4       /* the "acpm" node: owned by the ACPM framework (run 81: owner 1); loopback, plugin attach */
 +#define CH_FVP          5       /* the "acpm_dvfs" node: owned by plugin 3 exynos7885_acpm_fvp (run 81: owner 8) */
-+static int ch_dvfs = CH_CORE;  /* DVFS requests; CH_FVP once that plugin is attached and its queue looks sane */
++static int ch_dvfs = CH_CORE;  /* DVFS requests; the fvp plugin's first request channel once it is attached */
++static int fvp_ch[4], n_fvp_ch;
  #define FREQ_REQ        0
  #define FREQ_GET        1
  #define TYPE_CODEC      7
-@@ -106,6 +108,134 @@ chan_setup(int i)
+@@ -106,6 +109,143 @@ chan_setup(int i)
  	return 0;
  }
  
@@ -139,16 +140,25 @@ index 2f4a199..c89542c 100644
 +		printf("SWEET ACPM: plugin %u '%s': %d bytes loaded at %#x, attach (id %u): error %d, reply %#x %#x; attached now %u\n",
 +		    i, name, bsz, base, id, e, cmd[0], cmd[1], s_rd8(p + 28));
 +	}
-+	if (chan_setup(CH_FVP) == 0) {
-+		ch_dvfs = CH_FVP;
++	/* ios82 (run 66): the fvp plugin attached, but channel 5 is type 2 with a 1-entry queue, so front + 1 == rear always
++	 * ("queue full"). Use the plugin's own type-1 (AP request, polled) channels instead: owner == 1 << plugin id. */
++	uint32_t chans = s_rd(INITDATA + 8), apmax = s_rd(INITDATA + 24);
++	for (uint32_t i = 0; i < apmax && i < 8 && n_fvp_ch < 4 && chans && chans + 72 * (i + 1) <= SRAM_SIZE; i++) {
++		uint32_t c = chans + 72 * i;
++		if (s_rd(c + 8) == (1u << 3) && s_rd(c + 12) == 1 && chan_setup((int)i) == 0 && ch[i].len > 1) {
++			fvp_ch[n_fvp_ch++] = (int)i;
++		}
 +	}
-+	printf("SWEET ACPM: DVFS requests go to channel %d\n", ch_dvfs);
++	if (n_fvp_ch) {
++		ch_dvfs = fvp_ch[0];
++	}
++	printf("SWEET ACPM: DVFS requests go to channel %d (%d fvp request channels)\n", ch_dvfs, n_fvp_ch);
 +}
 +
  static int
  acpm_init(void)
  {
-@@ -121,10 +251,13 @@ acpm_init(void)
+@@ -121,10 +261,13 @@ acpm_init(void)
  	}
  	printf("SWEET ACPM: framework: plugins %u, channels %u, ap channels %u, INTSR1 %#x\n",
  	    s_rd(INITDATA + 4), s_rd(INITDATA + 12), s_rd(INITDATA + 24), *(volatile uint32_t *)(mbox + INTSR1));
@@ -163,7 +173,7 @@ index 2f4a199..c89542c 100644
  	return 0;
  }
  
-@@ -195,7 +328,7 @@ static int
+@@ -195,7 +338,7 @@ static int
  dvfs(uint32_t domain, uint32_t khz, uint32_t func, uint32_t *out)
  {
  	uint32_t cmd[16] = { domain, khz, func, 0 };
@@ -172,7 +182,7 @@ index 2f4a199..c89542c 100644
  	if (out != NULL) {
  		*out = cmd[1];
  	}
-@@ -360,4 +493,24 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
+@@ -360,4 +503,36 @@ sweet_a8_acpm_mfd(unsigned type, uint8_t reg, int write, uint8_t *val)
  	}
  	return (cmd[1] >> 24) & 0xff ? EIO : 0;
  }
@@ -191,6 +201,18 @@ index 2f4a199..c89542c 100644
 +		return ENXIO;
 +	}
 +	e = acpm_send(ch_dvfs, cmd);
++	for (int k = 0; e != 0 && k < n_fvp_ch; k++) {       /* which fvp channel cal-if uses is not known yet: try each */
++		if (fvp_ch[k] == ch_dvfs) {
++			continue;
++		}
++		uint32_t c2[16] = { 7, 1, 6, 0 };
++		e = acpm_send(fvp_ch[k], c2);
++		printf("SWEET ACPM: SET_FLAG on channel %d: error %d, reply %#x %#x %#x %#x\n", fvp_ch[k], e, c2[0], c2[1],
++		    c2[2], c2[3]);
++		if (e == 0) {
++			memcpy(cmd, c2, sizeof(c2));
++		}
++	}
 +	for (int i = 0; i < 4; i++) {
 +		reply[i] = cmd[i];
 +	}
