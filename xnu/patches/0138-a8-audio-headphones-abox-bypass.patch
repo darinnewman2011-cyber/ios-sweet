@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,680 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -409,6 +409,21 @@ new file mode 100644
 +		(void)wr_bits(abox, "SPUS_SBANK_RDMA0 (512 bytes)", 0x220, 0x3ffu << 20, (512u / 16u) << 20);
 +	}
 +	(void)wr_bits(abox, "SPUS_CTRL1 (SIFS1 from SPUS OUT0)", SPUS1, 7u << 16, 0);
++	/*
++	 * Run 73: RDMA0 still read nothing with ABOX's memory path clocked. SIFS's output counters (CTRL_SIFS_CNT0/1,
++	 * +0x280/+0x284, two 16-bit fields each before ABOX 2.0) pace how often a SIFS takes a sample; at 0 nothing pulls
++	 * from SPUS and so from RDMA. Samsung's abox.h: CNT_VAL = 2 * ACLK / rate - 7. ACLK = PLL_AUD / (DIV_AUD_BUS + 1)
++	 * (CMU_DISPAUD 0x1804). Every field gets it (only SIFS1 is used here).
++	 */
++	{
++		uint32_t div = (rd(cmu, 0x1804) & 0xf) + 1, aclk = 1179648000u / div, cnt = 2u * (aclk / RATE) - 7u;
++		printf("SWEET AUDIO: SIFS counts read %#x %#x; ACLK %u Hz (DIV_AUD_BUS %u), CNT_VAL %u\n",
++		    rd(abox, 0x280), rd(abox, 0x284), aclk, div - 1, cnt);
++		if (cnt > 7 && cnt <= 0xffff) {
++			(void)wr(abox, "CTRL_SIFS_CNT0", 0x280, cnt << 16 | cnt);
++			(void)wr(abox, "CTRL_SIFS_CNT1", 0x284, cnt << 16 | cnt);
++		}
++	}
 +	(void)wr_bits(abox, "ROUTE_CTRL0 (UAIF0 from SIFS1)", ROUTE0, 0xf, 2);
 +	(void)wr(abox, "UAIF0 CTRL1 (2 x 16 bit I2S)", UAIF(0, 4), (0x9u << 24) | (1u << 23) | (1u << 18) | (15u << 12));
 +	(void)wr(abox, "UAIF0 CTRL0 (master, data mode, FIFO diff 1)", UAIF(0, 0), (1u << 24) | (1u << 4) | (1u << 2));
@@ -661,6 +676,15 @@ new file mode 100644
 +		n += snprintf(line + n, sizeof(line) - n, e ? " %02x:err%d" : " %02x:%04x", regs[i], e ? e : v);
 +	}
 +	printf("SWEET AUDIO: spk: TFA9872 at 0x34 (0x03 is the revision; 0x..72 is a TFA9872):%s\n", line);
++	/* run 73: it answers (0x03 = 0x3b72). Whole map 0x00-0x8f, read only, 8 a line, for planning its power-up. */
++	for (unsigned r = 0; r < 0x90; r += 8) {
++		n = 0;
++		for (unsigned k = 0; k < 8; k++) {
++			uint16_t v = 0;
++			n += snprintf(line + n, sizeof(line) - n, tfa_read((uint8_t)(r + k), &v) ? " ----" : " %04x", v);
++		}
++		printf("SWEET AUDIO: spk: TFA %02x:%s\n", r, line);
++	}
 +}
 +
 +void
