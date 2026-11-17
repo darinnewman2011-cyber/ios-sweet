@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f00eb15..7eaf11c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -99,6 +99,12 @@ enum {
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++/*
++ * Boot-arg sweetfb_ipad=1: iPad 7 (iPad7,11) iPadOS userland. Report its 1620x2160 panel
++ * (810x1080 points @2x) whatever the real panel is; with sweetfb_fit=1 it is scaled to fit.
++ */
++#define SWEET_FB_IPAD_W                 1620
++#define SWEET_FB_IPAD_H                 2160
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -200,7 +206,12 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	int ipad = 0;
++	PE_parse_boot_argn("sweetfb_ipad", &ipad, sizeof(ipad));
++	if (!native && ipad) {
++		fLogicalW = SWEET_FB_IPAD_W;
++		fLogicalH = SWEET_FB_IPAD_H;
++	} else if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 20e4161..d719372 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -441,8 +441,10 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
++	int ipad = 0;   /* sweetfb_ipad=1: same 1620x2160 logical size as SweetFramebuffer */
++	PE_parse_boot_argn("sweetfb_ipad", &ipad, sizeof(ipad));
++	fLogicalW = native ? 1080 : (ipad ? 1620 : 1125);
++	fLogicalH = native ? SWEET_TOUCH_PANEL_H : (ipad ? 2160 : 2436);
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	int fit = 0;
