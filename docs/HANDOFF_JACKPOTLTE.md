@@ -1136,3 +1136,21 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
   `0x11110001` and the mode-stack setup at 0x1b8). The v1 register order (R0..R12, SP, LR, SPSR, PC, CPSR at word 4)
   does NOT fit (it gives PC 0x7496e in 802.11 IE code). Next: work out the v2 layout (per-mode banked registers?) and
   read the fault address; `_tmp/wlbt-dis/fw.elf` + llvm-objdump `--triple=thumbv7r-none-eabi --mcpu=cortex-r4`.
+
+## MILESTONE 2026-11-17 ~21:35: WLBT firmware runs (ios86, xnu #119, 7255858)
+
+- **Root cause of the R4 panic (code 4 = data abort):** our mxconf used Samsung's struct layout literally as packed
+  (22-byte mxstreamconf, 162 bytes). Samsung writes `__packed struct ...` (attribute before `struct`, ignored by GCC), so
+  the real streams are 24 bytes (bits at +0x14/+0x15, 2 pad) and mxconf is 176 bytes: to_ap +8, from_ap +0x20, gdb R4
+  +0x38/+0x50, gdb M4 +0x68/+0x80, log +0x98. The firmware's gdb-transport setup (after boot marker 0x22220006) then
+  memcpy'd 16 bytes to NULL.
+- **How it was decoded (keep for the next crash):**
+  - Boot markers: the firmware writes 0x1111000N (early boot, from 0x1a8) and 0x2222000N (`bl 0xd7aa4(N)`, main init at
+    ~0x54370) to its mailbox index 4 = AP MAILBOX block 0x120e0000 ISSR0 (firmware sees 0x120c0000 at 0xa20c0000).
+    Panics also leave {code, hash} in 0x120e0000 ISSR0/1 and ISSR4/5.
+  - Code at 0x80000000 + file offset; TCM at 0 is a copy of file 0x100850 (vectors: dabt stub code 4, pabt 3, ...).
+  - R4 panic record v2 (writer 0x528b8, context save at file 0xf60): w2 = assert id, w3 = code, w4/w5 = r2/r3,
+    w8-20 = r0-r12, w21-22 SYS sp/lr, 23-25 SVC sp/lr/spsr, 26-28 ABT sp/lr/spsr, 29-31 UND, 32-34 IRQ, 35-42 FIQ
+    r8-r12/sp/lr/spsr, 43-44 und pc/spsr, **45 DFAR, 46 DFSR, 47 ADFSR, 48 IFAR, 49 IFSR, 50 AIFSR**, 52 xor cksum.
+- **ios86 (`f3b960b4...8eee`):** Sweet Connect shows "on: radio firmware running, 1 messages from the core"
+  (MM_START_IND). Next: WLAN service start + mx140_wlan.hcf, HIP, scan; then BT service + HCI.
