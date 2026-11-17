@@ -28,7 +28,7 @@ index 2f4a199..74c3d68 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..f7c156a 100644
+index f638996..983395f 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
 @@ -48,6 +48,7 @@
@@ -39,18 +39,30 @@ index f638996..f7c156a 100644
  void sweet_a8_wlbt_init(void);
  
  #define SHM_PA          0xe9000000u
-@@ -375,6 +376,14 @@ wlbt_thread(void *arg, wait_result_t wr_)
+@@ -375,16 +376,24 @@ wlbt_thread(void *arg, wait_result_t wr_)
  	    rd(pmu, MEM_CONFIG1), rd(mbox, ISSR(0)), rd(mbox, ISSR(1)), rd(mbox, ISSR(2)), rd(mbox, ISSR(3)));
  	report("before start", runtime, panic_off);
  
-+	{
-+		/* Stage 3c (xnu 0139): runs 61-63 panicked ~250 ms after start (R4 record v2, checksum good, panic code 4).
-+		 * Samsung sends ACPM SET_FLAG right before reset release so BUCK2 is at WLBT's voltage; do the same. */
-+		uint32_t r[4] = { 0 };
-+		int e = sweet_a8_acpm_wlbt_flag(r);
-+		printf("SWEET A8 WLBT: 4c ACPM SET_FLAG (BUCK2 for WLBT): error %d, reply %#x %#x %#x %#x\n", e, r[0], r[1],
-+		    r[2], r[3]);
-+	}
++	/* Stage 3c (xnu 0139): runs 61-63 panicked ~250 ms after start (R4 record v2, checksum good, panic code 4).
++	 * Samsung sends ACPM SET_FLAG right before reset release so BUCK2 is at WLBT's voltage; do the same.
++	 * The result is repeated in every watch line: the one-off line scrolls out of the 16 KB ramoops window (run 77). */
++	uint32_t fr[4] = { 0 };
++	int fe = sweet_a8_acpm_wlbt_flag(fr);
++	printf("SWEET A8 WLBT: 4c ACPM SET_FLAG (BUCK2 for WLBT): error %d, reply %#x %#x %#x %#x\n", fe, fr[0], fr[1],
++	    fr[2], fr[3]);
  	wr(pmu, EXT_REG_OPTION, rd(pmu, EXT_REG_OPTION) | 0x4u);
  	wr(pmu, WIFI_CTRL_NS, rd(pmu, WIFI_CTRL_NS) | (1u << 1));
  	wr(pmu, WIFI_CTRL_NS, rd(pmu, WIFI_CTRL_NS) & ~(1u << 2));
+ 	wr(pmu, WIFI_CTRL_S, rd(pmu, WIFI_CTRL_S) | (1u << 3));
+ 	printf("SWEET A8 WLBT: 5 started (PWRON, reset released, START)\n");
+ 	for (int t = 1; t <= 20; t++) {
+-		char when[24];
++		char when[80];
+ 
+ 		sleep_ms(t <= 4 ? 250 : 1000);
+-		snprintf(when, sizeof(when), "watch %d", t);
++		snprintf(when, sizeof(when), "watch %d (SET_FLAG err %d, reply %#x %#x %#x %#x)", t, fe, fr[0], fr[1],
++		    fr[2], fr[3]);
+ 		report(when, runtime, panic_off);
+ 	}
+ 	final_dump(panic_off);
