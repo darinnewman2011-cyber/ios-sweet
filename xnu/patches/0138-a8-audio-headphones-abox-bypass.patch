@@ -42,7 +42,7 @@ diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a8audio.c
-@@ -0,0 +1,1216 @@
+@@ -0,0 +1,1217 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 (2018, jackpotlte) audio, headphones first: ABOX (the Exynos 7885's audio block) driven from the AP with
@@ -823,6 +823,7 @@ new file mode 100644
 + *     +0x225fc, polled (its SPI is not wired into XNU).
 + */
 +extern int IODTGetLoaderInfo(const char *key, void **infoAddr, int *infoSize);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);   /* osfmk/arm64/machine_routines.c; not in the BSD view of the header */
 +
 +#define PMU_PA          0x11c80000u
 +#define SRAM_PA         0x14b00000u
