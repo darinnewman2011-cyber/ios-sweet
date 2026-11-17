@@ -1079,3 +1079,69 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
     212-byte record, then provide an mxconf.
   - **Gestalt spoof:** no `com.apple.MobileGestalt.plist` exists anywhere on this root (iOS never wrote the cache), so
     `_tmp/wsl/gestalt.py` skipped. Plan instead: an MGCopyAnswer hook for the island/AOD keys.
+
+## 2026-11-16: A8 kernel patches ported to the iPadOS 17 / 18 xnu (kernel only)
+
+Side session. Nothing here changes the 13.5 (xnu-8796) build on `jackpotlte`. The phone was not touched.
+
+- **Versions:** `macos_version=14.6` → xnu-10063.141.1 (iPadOS 17 era) and `macos_version=15.6` → xnu-11417.140.69
+  (iPadOS 18 era). These are the newest 14.x/15.x tags blacktop knows. They match the WSL sources in
+  `/opt/sweet/xnu-src/` and the iPadOS 17.7 / 18.7.12 roots. 14.0 (xnu-10002) and 15.0 (xnu-11215) are older drops of the same lines.
+- **Branches:** `jackpotlte-xnu17` builds 14.6, `jackpotlte-xnu18` builds 15.6. Both were cut from `jackpotlte`, and
+  neither is merged. The 14.6 overlay on `jackpotlte-xnu18` is an early copy; use the one on `jackpotlte-xnu17`.
+- **Mechanism (`.github/workflows/xnu.yml`):**
+  - Fetch picks blacktop's patch dir for the version (`dxb/patches`, `/14.4` or `/15.0`) and copies `xnu/patches/*` there.
+  - It then lays `xnu/patches-<macOS>/` on top: a same-named `NNNN-*.patch` replaces the base one, `NAME.patch.drop` removes it,
+    and `09xx-*` adds new ones.
+  - Any version other than 13.5 needs an overlay dir.
+  - Build now fails if `build.sh` prints `Skipping patch` for one of our `NNNN-` patches (it used to only warn).
+  - Artifacts get a `-<macOS>` suffix off 13.5.
+  - The stage scripts `0019`/`0026` pin libpthread and hfs per version: 13.5 = 514.100.2 / 627.100.6, 14.6 = 519.120.4 / 650.140.2,
+    15.6 = 536 / 683.120.3.
+- **Runs:**
+  - 14.6: **#92 (43952239687, 11193a3): success**, ISA 0, A8 payload OK. **#97 (43984504586, c85a456, + 0904): success**,
+    ISA 0, kernel `a3a25f6c…645f`. Artifacts `xnu-kernel-jackpotlte-14.6`, `xnu-buildtree-jackpotlte-14.6`.
+  - 15.6: **#99 (43988503071, d994750): success**, ISA 0 (`ARMv8.1+ instructions: 0`), A8 payload OK (virt_base
+    `0xfffffff006000000`). Artifacts `xnu-kernel-jackpotlte-15.6`, `xnu-buildtree-jackpotlte-15.6`. Not booted.
+  - Earlier failures: 14.6 #85/#88 (AMCC stubs, then lldbmacros); 15.6 #87/#89/#93/#96 (split headers and rtsock,
+    `vm_map_region_recurse_64`, the KDK `libSWEET.os` force-load, Tightbeam exports).
+- **Patches that needed real changes** (everything else in the overlays is a context refresh):
+  - Both kernels:
+    - `0001` and `0002` dropped (already upstream in clang/xnu).
+    - `0007`: the task.c KPC guard is upstream as `CONFIG_CPU_COUNTERS`.
+    - `0008`: kpc stub dropped, because the real kpc.c ships. MASTER sets `CPU_COUNTERS_BASE = [ ]` instead, since kpc.c programs the Apple PMU.
+    - `0014`: entropy.c part dropped (xnu uses SHA512 through libkern now).
+    - `0086`: SHA2 feature test rewritten to `CC_ARM_FEATURE_SHA2`.
+    - `0015`, `0047`, `0094`: hunks re-placed by hand.
+    - New `0900`: MASTER.arm64.sweet rebased on that version's MASTER.arm64.MacOSX, with the same three SWEET edits.
+    - New `0901`: empty `amcc_rorgn_ppl_{amcc,ctrr3}.c`; files.arm64 lists them, but they ship only in Apple's closed per-SoC library.
+    - New `0904`: boot-arg `sweetfb_ipad=1` reports the iPad 7 canvas (1620x2160) in SweetFramebuffer and SweetHID, like
+      the K88's 0140 but switchable, so one kernel serves the iPhone and the iPad root.
+  - 14.6 only: new `0903` runs lldbmacros `core/syntax_checker.py` with `python3 -I`. Otherwise `core/collections.py`
+    shadows the stdlib and the dSYM install fails.
+  - 15.6 also:
+    - `0003`: fbcon fitted into the restructured pe_serial.c.
+    - `0004`: SWEET goes next to VMAPPLE, because BCM2837 is gone.
+    - `0009`: export removals redone line by line.
+    - `0065`: cluster-id code reordered.
+    - `0070`: pid_hibernate moved to kern_proc.c.
+    - `0080`: route log moved next to `switch (RTM->rtm_type)`.
+    - `0089`: zone map `#if` spelling.
+    - `0900`: also adds `config_pmap_ppl` back, because 11417 macOS builds the SPTM pmap.
+    - New `0903` (makedefs): force-load the KDK's `lib$(MACHINE).os.$(CONFIG).a` only if it exists (no libSWEET), and no
+      Tightbeam exports for SWEET (no Tightbeam library is linked).
+    - New `0902`: includes for the split VM headers (`vm_kern_xnu.h`, `vm_shared_region_xnu.h`, `vm_map_internal.h`) and `apple_arm64_regs.h` in `apple_arm64_cpu.h`.
+- **iPadOS 17 boot, prepared, NOT flashed** (the phone was busy with the audio tests). Everything is in
+  `_tmp/ipad17/` (PC only), with the steps in `_tmp/ipad17/README-ipad17.md`:
+  - Boot image `a8-ipad17a-boot.img` SHA-256 `56663d97b15becb2658f535da4ecdfae70cbc11767cdeeafe4db3d29fcf9fdd9`: the #97
+    kernel, plus the ADT `jackpotlte-ipad7.adt` (`tools/adt-ipad.py`: A8 hardware with J171AP / iPad7,11 identity and
+    `/product` from the 17.7 DeviceTree). Built by `mkboot.sh` from a private snapshot of the A8 shim/tools (0bc4448).
+    The cmdline is ios72's minus GPU/Metal/inject/audio, plus `sweetfb_ipad=1`.
+  - Root: WSL `/opt/sweet/ipadroot/a8-ipad17-root.img`, 16 GiB, 3.7 GB free, SHA-256 `41756493…8c79`. Built fresh
+    from the 21H16 IPSW parts with mkiosroot + sweet-root-tweaks from the k88 branch (`_tmp/wsl/mka8ipad17root.sh`).
+  - Storage: `/data` has ~1 GB free, so `_tmp/ipad17/switch.sh` first pulls the iOS 16 `root.img` into WSL
+    (`backup`), then writes the iPadOS image into the same file in place (`write`; inode 913922 kept, so the
+    `sweetrootino` is unchanged), then flashes BOOT (`flash`). The way back is `write` of the backup plus ios72.
+  - Not done: the AMFI extensions.plist dsc patch for 17.7 (the 16.x pattern does not match;
+    `-[EXExtensionPointEnumerator initWithSDKDictionary:urls:config:]` is at 0x19602c558 in the cache, `.07`
+    +0x1770558). Without it there are no widgets or wallpapers. No GPU userland is on this root.
