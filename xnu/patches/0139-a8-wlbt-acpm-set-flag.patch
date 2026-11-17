@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..1b3fe2f 100644
+index f638996..e45fe27 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,463 @@
+@@ -1,411 +1,469 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -871,6 +871,12 @@ index f638996..1b3fe2f 100644
 +	put32(s->widx);
 +	conf[conf_len++] = s->rbit;
 +	conf[conf_len++] = s->wbit;
++	/* Samsung's mxconf.h writes "__packed struct ..." (the attribute before `struct` is ignored), so the real
++	 * mxstreamconf is 24 bytes: mx140 reads the bits at +0x14/+0x15 and the gdb streams at +0x38/+0x50/+0x68/+0x80.
++	 * The packed 22-byte layout made it memcpy to NULL (ios85: data abort DFSR 0x80d DFAR 0 after marker
++	 * 0x22220006, in the gdb-transport setup). */
++	conf[conf_len++] = 0;
++	conf[conf_len++] = 0;
 +}
 +
 +/* Builds the configuration in the heap and returns its offset (mailbox 1). */
