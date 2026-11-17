@@ -1,0 +1,93 @@
+#!/sbin/sh
+# Galaxy A8 (jackpotlte) system installer for TWRP. Installs the system on a USB drive (NTFS or FAT, folder A8-iOS)
+# described by A8-iOS/install.txt:
+#   NAME=iPadOS 17.7          shown in the menu
+#   ROOT=ipad17-root.img      HFS+ root image, written IN PLACE over /data/sweet/root.img (same inode, same blocks)
+#   ROOT_SHA=<sha256>
+#   BOOT=ipad17-boot.img      boot image for the BOOT partition (mmcblk0p12)
+#   BOOT_SHA=<sha256>
+#   INODE=913922              the sweetrootino= baked into BOOT; root.img must still have this inode
+# Volume Up installs, Volume Down cancels. Nothing is formatted; USERDATA's other files are untouched. Does not reboot.
+# Made for the ios-sweet A8 port (tools/mka8installer.py builds the zip and install.txt).
+
+OUTFD=$2
+ZIP=$3
+BAK_SHA=c87a1336e8e6ca031b402cce84add38c9ec24172e3293de868cd7b05d6c9a59d
+MNT=/mnt/a8usb
+ROOTIMG=/data/sweet/root.img
+
+ui() { echo "ui_print $1" > /proc/self/fd/$OUTFD; echo "ui_print" > /proc/self/fd/$OUTFD; }
+die() { ui "ERROR: $1"; ui "Nothing more was written."; umount $MNT 2>/dev/null; exit 1; }
+key() {     # prints up / down / none (30 s)
+	timeout 30 getevent -lqc 1 2>/dev/null | grep -q "KEY_VOLUMEUP" && { echo up; return; }
+	echo down
+}
+wait_release() { sleep 1; }
+
+ui "=============================="
+ui " Galaxy A8 system installer"
+ui "=============================="
+
+[ "$(getprop ro.product.device)" = jackpotlte ] || die "this is not a Galaxy A8 (jackpotlte)"
+BOOTDEV=$(readlink -f /dev/block/by-name/BOOT)
+[ "$BOOTDEV" = /dev/block/mmcblk0p12 ] || die "BOOT is $BOOTDEV, expected mmcblk0p12"
+mount | grep -q " /data " || mount /data
+[ -f $ROOTIMG ] || die "$ROOTIMG not found (the iOS system file)"
+
+# the USB drive: first partition that mounts read-only and has A8-iOS/install.txt
+mkdir -p $MNT
+umount $MNT 2>/dev/null
+found=
+for d in /dev/block/sd[a-z][0-9] /dev/block/sd[a-z]; do
+	[ -b "$d" ] || continue
+	mount.ntfs "$d" $MNT -o ro 2>/dev/null || mount -t vfat -o ro "$d" $MNT 2>/dev/null || mount -t exfat -o ro "$d" $MNT 2>/dev/null || continue
+	[ -f $MNT/A8-iOS/install.txt ] && { found=$d; break; }
+	umount $MNT 2>/dev/null
+done
+[ -n "$found" ] || die "no USB drive with A8-iOS/install.txt (plug it in with an OTG adapter)"
+ui "USB drive: $found"
+
+get() { sed -n "s/^$1=//p" $MNT/A8-iOS/install.txt | head -1 | tr -d '\r'; }
+NAME=$(get NAME); ROOT=$(get ROOT); ROOT_SHA=$(get ROOT_SHA); BOOT=$(get BOOT); BOOT_SHA=$(get BOOT_SHA); INODE=$(get INODE)
+[ -n "$NAME" ] && [ -n "$ROOT" ] && [ -n "$ROOT_SHA" ] && [ -n "$BOOT" ] && [ -n "$BOOT_SHA" ] && [ -n "$INODE" ] || die "install.txt is incomplete"
+[ -f "$MNT/A8-iOS/$ROOT" ] || die "$ROOT missing on the drive"
+[ -f "$MNT/A8-iOS/$BOOT" ] || die "$BOOT missing on the drive"
+NEWSIZE=$(stat -c %s "$MNT/A8-iOS/$ROOT"); OLDSIZE=$(stat -c %s $ROOTIMG); INO=$(stat -c %i $ROOTIMG)
+[ "$INO" = "$INODE" ] || die "root.img has inode $INO, this system's boot image expects $INODE"
+[ "$NEWSIZE" -le "$OLDSIZE" ] || die "$ROOT ($NEWSIZE bytes) is bigger than root.img ($OLDSIZE bytes)"
+[ $((NEWSIZE % 1048576)) = 0 ] || die "$ROOT size is not a whole number of MiB"
+
+ui "System on the drive: $NAME"
+ui "It REPLACES the system now on the phone"
+ui "(back it up on the PC first if you want it)."
+ui ""
+ui "Volume UP   = install $NAME"
+ui "Volume DOWN = cancel"
+[ "$(key)" = up ] || die "cancelled"
+wait_release
+
+ui "Checking the files on the drive (several minutes)..."
+[ "$(sha256sum "$MNT/A8-iOS/$BOOT" | cut -d' ' -f1)" = "$BOOT_SHA" ] || die "$BOOT does not match its SHA-256"
+[ "$(sha256sum "$MNT/A8-iOS/$ROOT" | cut -d' ' -f1)" = "$ROOT_SHA" ] || die "$ROOT does not match its SHA-256"
+[ "$(sha256sum /sdcard/a8bak/BOOT.img 2>/dev/null | cut -d' ' -f1)" = "$BAK_SHA" ] || die "/sdcard/a8bak/BOOT.img (Android boot backup) is missing or changed"
+ui "Files OK."
+
+MB=$((NEWSIZE / 1048576))
+ui "Writing the system ($MB MiB, about 10-15 minutes)..."
+dd if="$MNT/A8-iOS/$ROOT" of=$ROOTIMG bs=1048576 count=$MB conv=notrunc 2>/dev/null || die "writing root.img failed"
+sync
+[ "$(stat -c %i $ROOTIMG)" = "$INODE" ] || die "root.img changed inode (not expected)"
+ui "Verifying what was written..."
+[ "$(dd if=$ROOTIMG bs=1048576 count=$MB 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$ROOT_SHA" ] || die "the written system does not read back right: install again"
+ui "System OK."
+
+ui "Writing BOOT..."
+dd if="$MNT/A8-iOS/$BOOT" of=/dev/block/mmcblk0p12 bs=1048576 2>/dev/null; sync
+if [ "$(dd if=/dev/block/mmcblk0p12 bs=1048576 count=32 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$BOOT_SHA" ]; then
+	dd if=/sdcard/a8bak/BOOT.img of=/dev/block/mmcblk0p12 bs=1048576 2>/dev/null; sync
+	die "BOOT did not read back right; the Android boot backup was put back"
+fi
+umount $MNT 2>/dev/null
+ui "Done: $NAME is installed."
+ui "Reboot > System. The first boot is slow (20-30 min)."
+exit 0
