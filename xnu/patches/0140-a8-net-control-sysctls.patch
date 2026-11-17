@@ -1,0 +1,137 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_a8power.c			standard
+ bsd/dev/sweet_a8wlbt.c			standard
+ bsd/dev/sweet_a8acpm.c			standard
+ bsd/dev/sweet_a8audio.c			standard
++bsd/dev/sweet_a8net.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_a8net.c b/bsd/dev/sweet_a8net.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a8net.c
+@@ -0,0 +1,121 @@
++/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
++/*
++ * Galaxy A8 (jackpotlte) Wi-Fi / Bluetooth control surface for the Sweet Connect app (apps/SweetConnect), xnu 0140.
++ *
++ * Two text sysctls, readable and writable by any process (the app runs as mobile):
++ *
++ *   kern.sweet_wifi   read:  "state <word> <detail>\n" then one "net <ssid>\t<rssi dBm>\t<secure 0|1>\t<connected 0|1>\n"
++ *                            per network found
++ *                     write: "on" | "off" | "scan" | "join <ssid>\t<passphrase>" | "leave"
++ *   kern.sweet_bt     read:  "state <word> <detail>\n" then one
++ *                            "dev <aa:bb:cc:dd:ee:ff>\t<name>\t<rssi dBm>\t<paired 0|1>\t<connected 0|1>\n" per device
++ *                     write: "on" | "off" | "scan" | "pair <addr>" | "connect <addr>" | "disconnect <addr>" | "forget <addr>"
++ *
++ * The radio (Samsung's WLBT core, sweet_a8wlbt.c) does not run yet, so for now this file only keeps the state text and
++ * the last command; the Wi-Fi and Bluetooth services will register their handlers here (sweet_a8net_set_handler) and
++ * publish results with sweet_a8net_publish. Passphrases are never logged.
++ */
++#if defined(SWEET_JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++
++#define NET_TEXT        8192
++#define NET_CMD         256
++
++typedef int (*sweet_a8net_handler_t)(const char *cmd);
++
++struct net_surface {
++	const char *name;
++	char text[NET_TEXT];
++	char last[NET_CMD];
++	sweet_a8net_handler_t handler;
++};
++
++static struct net_surface surf[2] = {
++	{ "wifi", "state off radio core not running yet (WLBT firmware does not start)\n", "", NULL },
++	{ "bt", "state off radio core not running yet (WLBT firmware does not start)\n", "", NULL },
++};
++static LCK_GRP_DECLARE(net_grp, "sweet_a8net");
++static LCK_MTX_DECLARE(net_mtx, &net_grp);
++
++void sweet_a8net_set_handler(int which, sweet_a8net_handler_t h);
++void sweet_a8net_publish(int which, const char *text);
++
++/* which: 0 Wi-Fi, 1 Bluetooth */
++void
++sweet_a8net_set_handler(int which, sweet_a8net_handler_t h)
++{
++	if (which == 0 || which == 1) {
++		lck_mtx_lock(&net_mtx);
++		surf[which].handler = h;
++		lck_mtx_unlock(&net_mtx);
++	}
++}
++
++void
++sweet_a8net_publish(int which, const char *text)
++{
++	if (which == 0 || which == 1) {
++		lck_mtx_lock(&net_mtx);
++		strlcpy(surf[which].text, text, sizeof(surf[which].text));
++		lck_mtx_unlock(&net_mtx);
++	}
++}
++
++static int
++net_sysctl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
++{
++	struct net_surface *s = &surf[arg2];
++	char cmd[NET_CMD];
++	sweet_a8net_handler_t h;
++	int error;
++
++	(void)oidp;
++	(void)arg1;
++	if (req->newptr == USER_ADDR_NULL) {
++		char *copy = kalloc_data(NET_TEXT, Z_WAITOK);
++		size_t len;
++		if (copy == NULL) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&net_mtx);
++		strlcpy(copy, s->text, NET_TEXT);
++		lck_mtx_unlock(&net_mtx);
++		len = strlen(copy) + 1;
++		error = SYSCTL_OUT(req, copy, len);
++		kfree_data(copy, NET_TEXT);
++		return error;
++	}
++	if (req->newlen == 0 || req->newlen >= sizeof(cmd)) {
++		return EINVAL;
++	}
++	memset(cmd, 0, sizeof(cmd));
++	error = SYSCTL_IN(req, cmd, req->newlen);
++	if (error) {
++		return error;
++	}
++	cmd[sizeof(cmd) - 1] = '\0';
++	lck_mtx_lock(&net_mtx);
++	strlcpy(s->last, cmd, sizeof(s->last));
++	h = s->handler;
++	lck_mtx_unlock(&net_mtx);
++	if (strncmp(cmd, "join ", 5) == 0) {
++		printf("SWEET A8 NET: %s: join (passphrase not logged)\n", s->name);
++	} else {
++		printf("SWEET A8 NET: %s: %s\n", s->name, cmd);
++	}
++	if (h == NULL) {
++		return EAGAIN;  /* the app shows "radio not running" from the state line */
++	}
++	return h(cmd);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wifi, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, net_sysctl, "A", "Galaxy A8 Wi-Fi control (Sweet Connect)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bt, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 1, net_sysctl, "A", "Galaxy A8 Bluetooth control (Sweet Connect)");
++#endif /* SWEET_JACKPOTLTE */

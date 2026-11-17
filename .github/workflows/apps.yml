@@ -1,0 +1,21 @@
+name: apps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'apps/**'
+      - '.github/workflows/apps.yml'
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sweet Connect
+        run: bash apps/SweetConnect/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweetConnect
+          path: |
+            apps/SweetConnect/out/SweetConnect.tar
