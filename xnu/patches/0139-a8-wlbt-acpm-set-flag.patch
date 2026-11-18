@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..80517ba 100644
+index f638996..5cb695f 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,2127 @@
+@@ -1,411 +1,2133 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -2377,11 +2377,17 @@ index f638996..80517ba 100644
 +	wr16(bt_proto + 0x1a, BT_TH_FG);
 +	wr16(bt_proto + 0xbc, BT_FH_INFO);
 +	wr16(bt_proto + 0xbe, BT_TH_INFO);
-+	/* address: the SoC's unique id as Samsung's setup_bhcs uses it (CHIPID 0x10000000 +0x14/+0x18), else made up */
++	/*
++	 * address: the Wi-Fi address + 1. (Samsung's setup_bhcs reads the SoC unique id at CHIPID 0x10000000 +0x14/+0x18,
++	 * but from here that read is a synchronous external abort: it panicked the kernel on ios96/ios97.)
++	 */
 +	{
-+		vm_offset_t chip = ml_io_map(0x10000000u, 0x1000);
-+		uint64_t uid = chip ? ((uint64_t)rd(chip, 0x18) << 32 | rd(chip, 0x14)) : 0;
-+		if ((uid & 0xffffffffffffull) == 0) {
++		uint64_t uid = 0;
++		for (int i = 0; i < 6; i++) {
++			uid = uid << 8 | wl_mac[i];
++		}
++		uid += 1;
++		if ((uid & 0xffffffffffffull) <= 1) {
 +			uid = mach_absolute_time() ^ 0x5eed00a8a8ull;
 +		}
 +		for (int i = 0; i < 8; i++) {
