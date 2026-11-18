@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..2199334 100644
+index f638996..52546f7 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1755 @@
+@@ -1,411 +1,1768 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1552,6 +1552,12 @@ index f638996..2199334 100644
 +			if (q == Q_TH_DAT) {
 +				rx_frames++;
 +				if ((flag & 1) && sbuf >= 4 + 14 && rd16(ref + 24) == 0x1300) {
++					if (rx_frames <= 12) {
++						printf("SWEET A8 WIFI: rx %u: dud %u, %u bytes, to %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x, peer %u\n",
++						    rx_frames, rd16(ref + 24 + 12), n, n > 5 ? rxb[0] : 0, n > 5 ? rxb[1] : 0, n > 5 ? rxb[2] : 0,
++						    n > 5 ? rxb[3] : 0, n > 5 ? rxb[4] : 0, n > 5 ? rxb[5] : 0, n > 13 ? rxb[12] : 0, n > 13 ? rxb[13] : 0,
++						    rd16(ref + 24 + 18));
++					}
 +					net_rx(rd16(ref + 24 + 12), rxb, n);
 +				}
 +			}
@@ -1629,6 +1635,7 @@ index f638996..2199334 100644
 +static unsigned txq_w, txq_r, dat_slot;
 +static uint16_t host_tag;
 +static uint32_t tx_frames, tx_drops, rx_other;
++static uint16_t tx_prio = 0x8000;
 +static uint32_t dh_xid;
 +static uint64_t dh_t;
 +static volatile int net_note_new;
@@ -1693,7 +1700,7 @@ index f638996..2199334 100644
 +	sig_hdr(s, 0x1000, 1);                  /* MA_UNITDATA_REQ on vif 1 */
 +	host_tag = (uint16_t)(host_tag + 4);
 +	put16(s + 12, host_tag);
-+	put16(s + 14, 0x8000);                  /* FAPI_PRIORITY_CONTENTION */
++	put16(s + 14, tx_prio);                 /* FAPI_PRIORITY_CONTENTION, or QoS UP0 on odd DHCP tries (experiment) */
 +	put16(s + 16, 1);                       /* peer index: the AP */
 +	put16(s + 18, 1);                       /* FAPI_DATAUNITDESCRIPTOR_IEEE802_3_FRAME */
 +	for (uint32_t o = 0; o < 20u + sbuf + headroom; o += 4) {
@@ -1719,6 +1726,10 @@ index f638996..2199334 100644
 +		return ENOSPC;
 +	}
 +	tx_frames++;
++	if (tx_frames <= 12) {
++		printf("SWEET A8 WIFI: tx %u: %u bytes to %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x, slot %u, FH_DAT w %u r %u\n",
++		    tx_frames, len, f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13], dat_slot, q_idx(Q_FH_DAT, 0), q_idx(Q_FH_DAT, 1));
++	}
 +	return 0;
 +}
 +
@@ -2087,6 +2098,8 @@ index f638996..2199334 100644
 +			net_note_new = 1;
 +			return;
 +		}
++		tx_prio = (dh_tries & 1) ? 0x8000 : 0;   /* try 1 contention, 2 UP0, 3 contention, ... */
++		printf("SWEET A8 WIFI: DHCP try %d, priority %#x, %u in / %u out so far\n", dh_tries, tx_prio, rx_frames, tx_frames);
 +		dh_xid = (uint32_t)mach_absolute_time() ^ 0x5a3c0000u;
 +		dh_state = 1;
 +		dhcp_send(1);
