@@ -185,16 +185,7 @@ static NSString *SCPublishNetwork(NSString *text)
 
 - (void)send:(NSString *)cmd
 {
-	if (self.bluetooth && ([cmd hasPrefix:@"pair "] || [cmd hasPrefix:@"connect "] || [cmd hasPrefix:@"disconnect "] ||
-	    [cmd hasPrefix:@"forget "])) {
-		/* Bluetooth stage 1 (xnu 0139): on and scan work; pairing and audio are the next stages. */
-		UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Bluetooth"
-		                                                           message:@"Pairing isn't working yet. For now Bluetooth can turn on and find devices."
-		                                                    preferredStyle:UIAlertControllerStyleAlert];
-		[a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-		[self presentViewController:a animated:YES completion:nil];
-		return;
-	}
+	/* Bluetooth stage 2 (xnu 0139): pair / connect / disconnect / forget go to the kernel (classic devices; no audio yet) */
 	NSString *err = SCWrite(self.node, cmd);
 	if (err) {
 		UIAlertController *a = [UIAlertController alertControllerWithTitle:self.title message:err

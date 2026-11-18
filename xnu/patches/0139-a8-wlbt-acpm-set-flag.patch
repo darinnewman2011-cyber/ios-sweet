@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..5cb695f 100644
+index f638996..58bcbcd 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,2133 @@
+@@ -1,411 +1,2458 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -2175,9 +2175,22 @@ index f638996..5cb695f 100644
 +	uint8_t a[6];
 +	int8_t rssi;
 +	char name[40];
++	uint8_t le;             /* seen only as an LE advertiser (no classic paging data) */
++	uint8_t psrm;           /* page scan repetition mode, from the inquiry result */
++	uint16_t clkoff;        /* clock offset | 0x8000 when known */
++	uint8_t name_asked;
++	uint8_t paired, haskey, connected;
++	uint8_t key[16];        /* BR/EDR link key (kept for this boot only) */
++	uint16_t handle;
 +} bt_dev[BT_MAXDEV];
 +static int bt_ndev;
 +static char bt_status[160];
++/* pair / connect / disconnect / forget: asked from the sysctl thread, done in the radio thread */
++static volatile int bt_req_op;          /* 1 pair, 2 connect, 3 disconnect, 4 forget */
++static uint8_t bt_req_addr[6];          /* HCI order (little-endian) */
++static int bt_pairing = -1;             /* device being paired (authentication asked once connected) */
++static int bt_name_dev = -1;            /* remote name request outstanding for this device */
++static uint64_t bt_name_t0;
 +
 +static void
 +bt_publish(const char *word, const char *detail)
@@ -2187,8 +2200,9 @@ index f638996..5cb695f 100644
 +
 +	for (int i = 0; i < bt_ndev && n < (int)sizeof(text) - 80; i++) {
 +		const uint8_t *a = bt_dev[i].a;          /* HCI order: little-endian */
-+		n += snprintf(text + n, sizeof(text) - (size_t)n, "dev %02X:%02X:%02X:%02X:%02X:%02X\t%s\t%d\t0\t0\n", a[5], a[4],
-+		    a[3], a[2], a[1], a[0], bt_dev[i].name[0] ? bt_dev[i].name : "(no name)", bt_dev[i].rssi);
++		n += snprintf(text + n, sizeof(text) - (size_t)n, "dev %02X:%02X:%02X:%02X:%02X:%02X\t%s\t%d\t%d\t%d\n", a[5], a[4],
++		    a[3], a[2], a[1], a[0], bt_dev[i].name[0] ? bt_dev[i].name : "(no name)", bt_dev[i].rssi,
++		    bt_dev[i].paired, bt_dev[i].connected);
 +	}
 +	sweet_a8net_publish(1, text);
 +}
@@ -2235,16 +2249,26 @@ index f638996..5cb695f 100644
 +	}
 +}
 +
-+static void
++static int
++bt_find(const uint8_t *a)
++{
++	for (int i = 0; i < bt_ndev; i++) {
++		if (memcmp(bt_dev[i].a, a, 6) == 0) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static int
 +bt_found(const uint8_t *a, int8_t rssi, const uint8_t *eir, uint32_t eirlen)
 +{
-+	int i;
++	int i = bt_find(a);
 +
-+	for (i = 0; i < bt_ndev && memcmp(bt_dev[i].a, a, 6) != 0; i++) {
-+	}
-+	if (i == bt_ndev) {
++	if (i < 0) {
++		i = bt_ndev;
 +		if (bt_ndev == BT_MAXDEV) {
-+			return;
++			return -1;
 +		}
 +		bzero(&bt_dev[i], sizeof(bt_dev[i]));
 +		memcpy(bt_dev[i].a, a, 6);
@@ -2254,6 +2278,86 @@ index f638996..5cb695f 100644
 +	if (eir != NULL && eirlen > 0) {
 +		bt_name_from(eir, eirlen, bt_dev[i].name, sizeof(bt_dev[i].name));
 +	}
++	return i;
++}
++
++/* A new scan: forget what was only seen, keep paired and connected devices (and their keys). */
++static void
++bt_scan_reset(void)
++{
++	int k = 0;
++
++	for (int i = 0; i < bt_ndev; i++) {
++		if (bt_dev[i].paired || bt_dev[i].connected || bt_dev[i].haskey) {
++			if (k != i) {
++				bt_dev[k] = bt_dev[i];
++			}
++			bt_dev[k].name_asked = 0;
++			k++;
++		}
++	}
++	bt_ndev = k;
++	bt_name_dev = -1;
++}
++
++/* A command whose parameters start with a BD_ADDR (HCI order) */
++static void
++bt_cmd_addr(uint16_t op, const uint8_t *a, const uint8_t *more, uint8_t nmore)
++{
++	uint8_t p[32];
++
++	memcpy(p, a, 6);
++	if (nmore > 0) {
++		memcpy(p + 6, more, nmore);
++	}
++	bt_cmd_send(op, p, (uint8_t)(6 + nmore));
++}
++
++static void
++bt_cmd_handle(uint16_t op, uint16_t h, const uint8_t *more, uint8_t nmore)
++{
++	uint8_t p[8] = { (uint8_t)h, (uint8_t)(h >> 8) };
++
++	if (nmore > 0) {
++		memcpy(p + 2, more, nmore);
++	}
++	bt_cmd_send(op, p, (uint8_t)(2 + nmore));
++}
++
++static int
++bt_by_handle(uint16_t h)
++{
++	for (int i = 0; i < bt_ndev; i++) {
++		if (bt_dev[i].connected && bt_dev[i].handle == h) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static void
++bt_say(const char *what, int i)
++{
++	const char *nm = (i >= 0 && bt_dev[i].name[0]) ? bt_dev[i].name : "device";
++
++	snprintf(bt_status, sizeof(bt_status), "%s: %s", nm, what);
++	printf("SWEET A8 BT: %s\n", bt_status);
++	bt_publish("on", bt_status);
++}
++
++/* Page the device (Create Connection); pairing, if asked, follows on Connection Complete. */
++static void
++bt_page(int i)
++{
++	uint8_t more[7] = { 0x18, 0xcc,                         /* DM1 DH1 DM3 DH3 DM5 DH5 */
++		                bt_dev[i].psrm, 0,
++		                (uint8_t)bt_dev[i].clkoff, (uint8_t)(bt_dev[i].clkoff >> 8), 1 };       /* role switch allowed */
++
++	if (bt_scanning) {
++		bt_cmd_send(0x0402, NULL, 0);           /* Inquiry Cancel: paging works badly while inquiring */
++	}
++	bt_cmd_addr(0x0405, bt_dev[i].a, more, 7);
++	bt_say("connecting...", i);
 +}
 +
 +static void
@@ -2289,18 +2393,130 @@ index f638996..5cb695f 100644
 +			bt_le = 1;
 +		}
 +	} else if (code == 0x0f && n >= 6 && e[2] != 0) {       /* Command Status with an error */
-+		printf("SWEET A8 BT: command %#x refused, status %#x\n", e[4] | e[5] << 8, e[2]);
-+	} else if (code == 0x02 && n >= 3) {            /* Inquiry Result */
-+		for (uint32_t k = 0, cnt = e[2]; k < cnt && 3 + 14 * (k + 1) <= n; k++) {
-+			bt_found(e + 3 + 6 * k, 0, NULL, 0);
++		uint16_t op = (uint16_t)(e[4] | e[5] << 8);
++		printf("SWEET A8 BT: command %#x refused, status %#x\n", op, e[2]);
++		if (op == 0x0405 && bt_pairing >= 0) {
++			bt_say("could not connect (refused by the radio)", bt_pairing);
++			bt_pairing = -1;
++		} else if (op == 0x0419) {
++			bt_name_dev = -1;
++		}
++	} else if (code == 0x02 && n >= 3) {            /* Inquiry Result: fields as arrays of e[2] entries */
++		uint32_t cnt = e[2];
++		for (uint32_t k = 0; k < cnt && 3 + 14 * cnt <= n; k++) {
++			int i = bt_found(e + 3 + 6 * k, 0, NULL, 0);
++			if (i >= 0) {
++				/* addrs 6, psrm 1, reserved 2, class 3, clock offset 2 (each times cnt) */
++				const uint8_t *c = e + 3 + 12 * cnt + 2 * k;
++				bt_dev[i].le = 0;
++				bt_dev[i].psrm = e[3 + 6 * cnt + k];
++				bt_dev[i].clkoff = (uint16_t)((c[0] | c[1] << 8) | 0x8000);
++			}
 +		}
 +		bt_publish("on", bt_status);
-+	} else if (code == 0x22 && n >= 17) {           /* Inquiry Result with RSSI */
-+		bt_found(e + 3, (int8_t)e[16], NULL, 0);
++	} else if ((code == 0x22 || code == 0x2f) && n >= 17) { /* with RSSI / extended: addr 3, psrm 9, cod 11, clk 14, rssi 16, EIR 17 */
++		int i = bt_found(e + 3, (int8_t)e[16], code == 0x2f ? e + 17 : NULL, code == 0x2f ? n - 17 : 0);
++		if (i >= 0) {
++			bt_dev[i].le = 0;
++			bt_dev[i].psrm = e[9];
++			bt_dev[i].clkoff = (uint16_t)((e[14] | e[15] << 8) | 0x8000);
++		}
 +		bt_publish("on", bt_status);
-+	} else if (code == 0x2f && n >= 17) {           /* Extended Inquiry Result: addr, ..., rssi @16, EIR @17 */
-+		bt_found(e + 3, (int8_t)e[16], e + 17, n - 17);
++	} else if (code == 0x07 && n >= 9) {            /* Remote Name Request Complete: status, addr, name[248] */
++		int i = bt_find(e + 3);
++		if (i >= 0 && e[2] == 0) {
++			uint32_t k = 0;
++			for (; k < sizeof(bt_dev[i].name) - 1 && 9 + k < n && e[9 + k] != 0; k++) {
++				char ch = (char)e[9 + k];
++				bt_dev[i].name[k] = ((unsigned char)ch < 0x20) ? ' ' : ch;
++			}
++			bt_dev[i].name[k] = 0;
++		}
++		bt_name_dev = -1;
 +		bt_publish("on", bt_status);
++	} else if (code == 0x03 && n >= 12) {           /* Connection Complete: status, handle, addr, link type */
++		int i = bt_find(e + 5);
++		if (i >= 0) {
++			if (e[2] == 0) {
++				bt_dev[i].connected = 1;
++				bt_dev[i].handle = (uint16_t)((e[3] | e[4] << 8) & 0xfff);
++				if (bt_pairing == i || !bt_dev[i].haskey) {
++					bt_cmd_handle(0x0411, bt_dev[i].handle, NULL, 0);      /* Authentication Requested */
++					bt_say("connected, pairing...", i);
++				} else {
++					bt_say("connected", i);
++				}
++			} else {
++				snprintf(bt_status, sizeof(bt_status), "could not connect (error %#x)", e[2]);
++				bt_say(bt_status, i);
++				if (bt_pairing == i) {
++					bt_pairing = -1;
++				}
++			}
++		}
++	} else if (code == 0x04 && n >= 11) {           /* Connection Request: accept known devices, stay peripheral */
++		int i = bt_find(e + 2);
++		uint8_t role = 1;
++		if (i >= 0 && (bt_dev[i].paired || bt_dev[i].haskey)) {
++			bt_cmd_addr(0x0409, e + 2, &role, 1);
++		} else {
++			uint8_t why = 0x0f;                     /* unacceptable BD_ADDR */
++			bt_cmd_addr(0x040a, e + 2, &why, 1);
++		}
++	} else if (code == 0x31 && n >= 8) {            /* IO Capability Request: no display, no keyboard, bonding */
++		static const uint8_t cap[3] = { 3, 0, 0x02 };
++		bt_cmd_addr(0x042b, e + 2, cap, 3);
++	} else if (code == 0x33 && n >= 8) {            /* User Confirmation Request: Just Works, accept */
++		bt_cmd_addr(0x042c, e + 2, NULL, 0);
++	} else if (code == 0x16 && n >= 8) {            /* PIN Code Request (legacy pairing): 0000 */
++		uint8_t pin[17] = { 4, '0', '0', '0', '0' };
++		bt_cmd_addr(0x040d, e + 2, pin, 17);
++	} else if (code == 0x17 && n >= 8) {            /* Link Key Request */
++		int i = bt_find(e + 2);
++		if (i >= 0 && bt_dev[i].haskey) {
++			bt_cmd_addr(0x040b, e + 2, bt_dev[i].key, 16);
++		} else {
++			bt_cmd_addr(0x040c, e + 2, NULL, 0);
++		}
++	} else if (code == 0x18 && n >= 24) {           /* Link Key Notification: addr, key[16], type */
++		int i = bt_find(e + 2);
++		if (i >= 0) {
++			memcpy(bt_dev[i].key, e + 8, 16);
++			bt_dev[i].haskey = 1;
++			bt_dev[i].paired = 1;
++		}
++	} else if (code == 0x06 && n >= 5) {            /* Authentication Complete: status, handle */
++		int i = bt_by_handle((uint16_t)((e[3] | e[4] << 8) & 0xfff));
++		if (i >= 0) {
++			if (e[2] == 0) {
++				static const uint8_t on = 1;
++				bt_dev[i].paired = 1;
++				bt_cmd_handle(0x0413, bt_dev[i].handle, &on, 1);       /* Set Connection Encryption */
++				bt_say("paired", i);
++			} else {
++				snprintf(bt_status, sizeof(bt_status), "pairing failed (error %#x)", e[2]);
++				bt_say(bt_status, i);
++				if (e[2] == 0x06) {                     /* PIN or key missing: the device forgot us */
++					bt_dev[i].haskey = 0;
++					bt_dev[i].paired = 0;
++				}
++			}
++			if (bt_pairing == i) {
++				bt_pairing = -1;
++			}
++		}
++	} else if (code == 0x08 && n >= 6) {            /* Encryption Change */
++		int i = bt_by_handle((uint16_t)((e[3] | e[4] << 8) & 0xfff));
++		if (i >= 0 && e[2] == 0 && e[5]) {
++			bt_say("paired and connected (encrypted)", i);
++		}
++	} else if (code == 0x05 && n >= 6) {            /* Disconnection Complete: status, handle, reason */
++		int i = bt_by_handle((uint16_t)((e[3] | e[4] << 8) & 0xfff));
++		if (i >= 0 && e[2] == 0) {
++			bt_dev[i].connected = 0;
++			snprintf(bt_status, sizeof(bt_status), "disconnected (reason %#x)", e[5]);
++			bt_say(bt_status, i);
++		}
 +	} else if (code == 0x01) {                      /* Inquiry Complete */
 +		snprintf(bt_status, sizeof(bt_status), "scan done: %d devices", bt_ndev);
 +		bt_publish("on", bt_status);
@@ -2311,7 +2527,10 @@ index f638996..5cb695f 100644
 +			if (at + 9 + dl + 1 > n) {
 +				break;
 +			}
-+			bt_found(e + at + 2, (int8_t)e[at + 9 + dl], e + at + 9, dl);
++			int i = bt_found(e + at + 2, (int8_t)e[at + 9 + dl], e + at + 9, dl);
++			if (i >= 0 && bt_dev[i].clkoff == 0) {
++				bt_dev[i].le = 1;               /* never seen by the classic inquiry */
++			}
 +			at += 10 + dl;
 +		}
 +		bt_publish("on", bt_status);
@@ -2442,6 +2661,15 @@ index f638996..5cb695f 100644
 +		bt_cmd_send(0x0c45, mode, 1);
 +	}
 +	bt_cmd_send(0x1009, NULL, 0);                   /* Read BD_ADDR */
++	sleep_ms(100);                                  /* let the radio take the first commands (ring of 8) */
++	{
++		static const uint8_t ssp[1] = { 1 };                    /* Secure Simple Pairing on */
++		static const uint8_t cod[3] = { 0x0c, 0x02, 0x5a };     /* class: phone, smartphone; audio, telephony */
++		static const uint8_t scan[1] = { 2 };                   /* page scan: paired headphones can reconnect */
++		bt_cmd_send(0x0c56, ssp, 1);
++		bt_cmd_send(0x0c24, cod, 3);
++		bt_cmd_send(0x0c1a, scan, 1);
++	}
 +}
 +
 +static void
@@ -2461,7 +2689,7 @@ index f638996..5cb695f 100644
 +		bt_scan_req = 0;
 +		bt_scanning = 1;
 +		bt_scan_t0 = now;
-+		bt_ndev = 0;
++		bt_scan_reset();
 +		snprintf(bt_status, sizeof(bt_status), "scanning...");
 +		bt_publish("on", bt_status);
 +		bt_cmd_send(0x0401, inq, 5);
@@ -2478,16 +2706,113 @@ index f638996..5cb695f 100644
 +		bt_publish("on", bt_status);
 +		printf("SWEET A8 BT: %s, %u events\n", bt_status, bt_events);
 +	}
++	/* after the scan, ask each classic device without a name for it, one at a time */
++	if (bt_on && !bt_scanning && bt_pairing < 0) {
++		if (bt_name_dev >= 0 && now - bt_name_t0 > lim15 / 2) {
++			bt_name_dev = -1;                       /* no answer: go on with the next one */
++		}
++		if (bt_name_dev < 0) {
++			for (int i = 0; i < bt_ndev; i++) {
++				if (!bt_dev[i].name[0] && !bt_dev[i].le && !bt_dev[i].name_asked && !bt_dev[i].connected) {
++					uint8_t more[4] = { bt_dev[i].psrm, 0, (uint8_t)bt_dev[i].clkoff, (uint8_t)(bt_dev[i].clkoff >> 8) };
++					bt_dev[i].name_asked = 1;
++					bt_name_dev = i;
++					bt_name_t0 = now;
++					bt_cmd_addr(0x0419, bt_dev[i].a, more, 4);
++					break;
++				}
++			}
++		}
++	}
++	if (bt_req_op != 0 && bt_on) {
++		int op = bt_req_op, i = bt_find(bt_req_addr);
++		bt_req_op = 0;
++		if (i < 0) {
++			snprintf(bt_status, sizeof(bt_status), "that device is gone; scan again");
++			bt_publish("on", bt_status);
++		} else if (op == 1 || op == 2) {                /* pair / connect */
++			if (bt_dev[i].le) {
++				bt_say("is a Bluetooth LE device; only classic devices (headphones, speakers) can pair for now", i);
++			} else if (bt_dev[i].connected) {
++				if (!bt_dev[i].paired) {
++					bt_pairing = i;
++					bt_cmd_handle(0x0411, bt_dev[i].handle, NULL, 0);
++				}
++			} else {
++				if (op == 1) {
++					bt_pairing = i;
++				}
++				if (bt_name_dev >= 0) {
++					bt_cmd_send(0x041a, bt_dev[bt_name_dev].a, 6);  /* Remote Name Request Cancel */
++					bt_name_dev = -1;
++				}
++				bt_page(i);
++			}
++		} else if (op == 3 || op == 4) {                /* disconnect / forget */
++			if (bt_dev[i].connected) {
++				static const uint8_t why = 0x13;        /* remote user terminated */
++				bt_cmd_handle(0x0406, bt_dev[i].handle, &why, 1);
++			}
++			if (op == 4) {
++				bt_dev[i].paired = 0;
++				bt_dev[i].haskey = 0;
++				bzero(bt_dev[i].key, sizeof(bt_dev[i].key));
++				bt_say("forgotten", i);
++			}
++		}
++	}
++}
++
++/* "AA:BB:CC:DD:EE:FF" (as shown, most significant first) -> HCI order */
++static int
++bt_parse_addr(const char *s, uint8_t a[6])
++{
++	for (int k = 0; k < 6; k++) {
++		int v = 0;
++		for (int d = 0; d < 2; d++) {
++			char c = *s++;
++			v <<= 4;
++			if (c >= '0' && c <= '9') {
++				v |= c - '0';
++			} else if (c >= 'A' && c <= 'F') {
++				v |= c - 'A' + 10;
++			} else if (c >= 'a' && c <= 'f') {
++				v |= c - 'a' + 10;
++			} else {
++				return -1;
++			}
++		}
++		a[5 - k] = (uint8_t)v;
++		if (k < 5 && *s++ != ':') {
++			return -1;
++		}
++	}
++	return 0;
 +}
 +
 +static int
 +bt_cmd(const char *cmd)
 +{
++	static const struct { const char *w; int op; } ops[] = {
++		{ "pair ", 1 }, { "connect ", 2 }, { "disconnect ", 3 }, { "forget ", 4 },
++	};
++
 +	if (strncmp(cmd, "on", 2) == 0) {
 +		bt_want = 1;
 +	} else if (strncmp(cmd, "scan", 4) == 0) {
 +		bt_want = 1;
 +		bt_scan_req = 1;
++	} else {
++		for (size_t k = 0; k < sizeof(ops) / sizeof(ops[0]); k++) {
++			size_t l = strlen(ops[k].w);
++			if (strncmp(cmd, ops[k].w, l) == 0) {
++				if (bt_parse_addr(cmd + l, bt_req_addr) != 0) {
++					return EINVAL;
++				}
++				bt_req_op = ops[k].op;
++				return 0;
++			}
++		}
 +	}
 +	return 0;
 +}
