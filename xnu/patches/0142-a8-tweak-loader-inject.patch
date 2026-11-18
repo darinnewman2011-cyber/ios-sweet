@@ -1,0 +1,107 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 778c7b8..89750f1 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5584,27 +5584,86 @@ static char sweet_inject_name[32];
+ static int sweet_inject_read;
+ static uint32_t sweet_inject_count;
+ 
++/*
++ * Boot-arg sweettweaks=1 (xnu 0142, the A8's jailbreak): programs started from an app bundle or SpringBoard also get
++ * ElleKit's tweak loader, /var/jb/usr/lib/TweakLoader.dylib (rootless Procursus + ElleKit, set up by
++ * /sweet/jb/setup.sh). That is what Dopamine's systemhook does for every process; here only for SpringBoard and apps
++ * at first (a bad tweak in a daemon could keep iOS from booting). The loader then reads the tweaks' filter plists in
++ * /var/jb/usr/lib/TweakInject. Only while the loader file exists. sweettweaks=2: every process but launchd.
++ */
++#define SWEET_TWEAK_LIBRARY     "/var/jb/usr/lib/TweakLoader.dylib"
++
++static unsigned sweet_tweaks;
++static uint32_t sweet_tweak_count;
++
++static bool
++sweet_tweak_wanted(struct image_params *imgp)
++{
++	static const char *const where[] = {
++		"/System/Library/CoreServices/SpringBoard.app/", "/Applications/", "/private/var/containers/Bundle/Application/",
++		"/var/containers/Bundle/Application/", "/private/var/jb/Applications/", "/var/jb/Applications/",
++	};
++	char path[MAXPATHLEN];
++	int len = sizeof(path);
++	vnode_t lib = NULLVP;
++
++	if (sweet_tweaks == 0 || imgp->ip_vp == NULLVP || proc_getpid(current_proc()) == 1) {
++		return false;
++	}
++	if (vn_getpath(imgp->ip_vp, path, &len) != 0) {
++		return false;
++	}
++	if (sweet_tweaks < 2) {
++		bool ok = false;
++		for (unsigned i = 0; i < sizeof(where) / sizeof(where[0]) && !ok; i++) {
++			ok = strncmp(path, where[i], strlen(where[i])) == 0;
++		}
++		if (!ok) {
++			return false;
++		}
++	}
++	if (vnode_lookup(SWEET_TWEAK_LIBRARY, 0, &lib, vfs_context_kernel()) != 0) {
++		return false;
++	}
++	vnode_put(lib);
++	if (sweet_tweak_count++ < 16) {
++		printf("SWEET TWEAKS: %s gets the tweak loader\n", path);
++	}
++	return true;
++}
++
+ static bool
+ sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
+ {
+ 	size_t namelen;
++	bool gl = false, tweak;
+ 
+ 	if (!sweet_inject_read) {
+ 		if (!PE_parse_boot_argn("sweetinject", sweet_inject_name, sizeof(sweet_inject_name))) {
+ 			sweet_inject_name[0] = 0;
+ 		}
++		if (!PE_parse_boot_argn("sweettweaks", &sweet_tweaks, sizeof(sweet_tweaks))) {
++			sweet_tweaks = 0;
++		}
+ 		sweet_inject_read = 1;
+ 	}
+-	if (sweet_inject_name[0] == 0 || imgp->ip_ndp == NULL) {
+-		return false;
++	if (sweet_inject_name[0] != 0 && imgp->ip_ndp != NULL) {
++		namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++		gl = namelen != 0 && namelen == strnlen(sweet_inject_name, sizeof(sweet_inject_name)) &&
++		    strncmp(imgp->ip_ndp->ni_cnd.cn_nameptr, sweet_inject_name, namelen) == 0;
+ 	}
+-	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
+-	if (namelen == 0 || namelen != strnlen(sweet_inject_name, sizeof(sweet_inject_name)) ||
+-	    strncmp(imgp->ip_ndp->ni_cnd.cn_nameptr, sweet_inject_name, namelen) != 0) {
++	tweak = sweet_tweak_wanted(imgp);
++	if (!gl && !tweak) {
+ 		return false;
+ 	}
+-	strlcpy(env, "DYLD_INSERT_LIBRARIES=" SWEET_INJECT_LIBRARY, size);
+-	if (sweet_inject_count++ < 8) {
++	strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
++	if (gl) {
++		strlcat(env, SWEET_INJECT_LIBRARY, size);
++	}
++	if (tweak) {
++		strlcat(env, gl ? ":" SWEET_TWEAK_LIBRARY : SWEET_TWEAK_LIBRARY, size);
++	}
++	if (gl && sweet_inject_count++ < 8) {
+ 		printf("SWEET INJECT: %s started with %s\n", sweet_inject_name, env);
+ 	}
+ 	return true;
+@@ -5787,7 +5846,7 @@ exec_extract_strings(struct image_params *imgp)
+ #if defined(SWEET_JACKPOTLTE)
+ 	/* one more variable for the program named by sweetinject (see sweet_exec_inject) */
+ 	{
+-		char inject_env[96];
++		char inject_env[160];
+ 
+ 		if (sweet_exec_inject(imgp, inject_env, sizeof(inject_env))) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
