@@ -1,8 +1,31 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 6a894ab..4ad8134 100644
+index 6a894ab..7a395df 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -1985,6 +1985,60 @@ void sweet_a8_snapshot(void);
+@@ -1065,6 +1065,7 @@ extern processor_t thread_bind(processor_t processor);
+ extern unsigned int real_ncpus;
+ extern void sweet_a8_dvfs_init(void);                  /* xnu 0137, sweet_a8acpm.c */
+ extern void sweet_a8_audio_run(void);                  /* xnu 0138, sweet_a8audio.c */
++extern void sweet_a8_audio_node(void);                 /* xnu 0143: /dev/sweet-audio early */
+ 
+ /*
+  * The clock of the CPU this runs on, in MHz: its PMU cycle counter against the 26 MHz generic timer for 5 ms.
+@@ -1119,6 +1120,14 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ #if defined(SWEET_JACKPOTLTE)
+ 	int clocks = 0;
++	{
++		/* /dev/sweet-audio before mediaserverd starts (its HAL plug-in opens it once, early); sound follows later */
++		uint64_t deadline;
++		clock_interval_to_deadline(3, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&wst_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		sweet_a8_audio_node();
++	}
+ #endif
+ 	for (;;) {
+ 		uint64_t deadline;
+@@ -1985,6 +1994,60 @@ void sweet_a8_snapshot(void);
  void sweet_a8_reboot_recovery(void) __dead2;
  void sweet_a8_panic_reboot(void);
  
@@ -63,7 +86,7 @@ index 6a894ab..4ad8134 100644
  /* Process context, once (before any snapshot or reboot). */
  void
  sweet_a8_channel_init(void)
-@@ -1995,6 +2049,7 @@ sweet_a8_channel_init(void)
+@@ -1995,6 +2058,7 @@ sweet_a8_channel_init(void)
  	if (!a8_pmu) {
  		a8_pmu = (volatile uint32_t *)ml_io_map(A8_PMU_PA, 0x1000);
  	}

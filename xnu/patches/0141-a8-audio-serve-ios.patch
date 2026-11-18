@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
-index 5c0a5ad..a540494 100644
+index 5c0a5ad..ae6319c 100644
 --- a/bsd/dev/sweet_a8audio.c
 +++ b/bsd/dev/sweet_a8audio.c
 @@ -41,6 +41,7 @@
@@ -26,7 +26,7 @@ index 5c0a5ad..a540494 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern void delay(int usec);
-@@ -1176,6 +1186,252 @@ step_calliope_play(void)
+@@ -1176,6 +1186,287 @@ step_calliope_play(void)
  	printf("SWEET AUDIO: 7 play: done; did you hear it?\n");
  }
  
@@ -107,7 +107,7 @@ index 5c0a5ad..a540494 100644
 +static int
 +sa_open(dev_t dev, int flags, int devtype, struct proc *p)
 +{
-+	return sa_serving ? 0 : ENXIO;
++	return 0;                       /* opens before the speaker is up too: writes are dropped until then */
 +}
 +
 +static int
@@ -122,6 +122,12 @@ index 5c0a5ad..a540494 100644
 +	int16_t buf[1024];
 +	int err = 0;
 +
++	if (!sa_serving) {              /* the speaker is not up yet: take the sound and drop it */
++		user_ssize_t r = uio_resid(uio);
++		sa_dropped += (uint64_t)r;
++		uio_update(uio, (user_size_t)r);
++		return 0;
++	}
 +	while (uio_resid(uio) >= 4 && err == 0) {
 +		uint32_t len = (uint32_t)MIN((user_ssize_t)sizeof(buf), uio_resid(uio)) & ~3u;
 +		uint32_t g;
@@ -235,6 +241,38 @@ index 5c0a5ad..a540494 100644
 +	}
 +}
 +
++static int sa_major = -1;
++
++static void
++sa_make_node(void)
++{
++	if (sa_major >= 0) {
++		return;
++	}
++	sa_major = cdevsw_add(-1, &sa_cdevsw);
++	if (sa_major < 0) {
++		printf("SWEET AUDIO: serve: no character device major\n");
++		return;
++	}
++	if (devfs_make_node(makedev(sa_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-audio") == NULL) {
++		printf("SWEET AUDIO: serve: devfs_make_node failed\n");
++	}
++}
++
++/* xnu 0143: from wst_thread a few seconds after the root mounts, before mediaserverd's HAL plug-in opens it */
++void sweet_a8_audio_node(void);
++void
++sweet_a8_audio_node(void)
++{
++	unsigned n = 0;
++
++	if (!PE_parse_boot_argn("a8audio", &n, sizeof(n)) || n < 8) {
++		return;
++	}
++	sa_make_node();
++	printf("SWEET AUDIO: /dev/sweet-audio made early (major %d); sound starts once the speaker is up\n", sa_major);
++}
++
 +static void
 +step_serve(void)
 +{
@@ -260,13 +298,10 @@ index 5c0a5ad..a540494 100644
 +	s1 = rd(abox, RDMA0(R_STATUS));
 +	printf("SWEET AUDIO: serve: RDMA0 status %#x -> %#x over 100 ms (expect ~1200 units), ceiling %u/32768\n", s0, s1,
 +	    sa_cap);
-+	major = cdevsw_add(-1, &sa_cdevsw);
++	sa_make_node();
++	major = sa_major;
 +	if (major < 0) {
-+		printf("SWEET AUDIO: serve: no character device major\n");
 +		return;
-+	}
-+	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-audio") == NULL) {
-+		printf("SWEET AUDIO: serve: devfs_make_node failed\n");
 +	}
 +	sa_serving = 1;
 +	if (kernel_thread_start(sa_thread, NULL, &t) == KERN_SUCCESS) {
@@ -279,7 +314,7 @@ index 5c0a5ad..a540494 100644
  void
  sweet_a8_audio_run(void)
  {
-@@ -1206,6 +1462,11 @@ sweet_a8_audio_run(void)
+@@ -1206,6 +1497,11 @@ sweet_a8_audio_run(void)
  	if (n < 5 || !step_uaif()) {
  		return;
  	}
