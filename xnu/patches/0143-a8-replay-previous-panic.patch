@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6a894ab..4ad8134 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1985,6 +1985,60 @@ void sweet_a8_snapshot(void);
+ void sweet_a8_reboot_recovery(void) __dead2;
+ void sweet_a8_panic_reboot(void);
+ 
++/*
++ * Before the first snapshot overwrites it: if the ramoops record left by the previous boot holds a panic, copy the
++ * panic and the lines before it into this boot's kernel log, so it reaches /sweet/runs.log even when the phone was
++ * booted into iOS again without stopping in TWRP.
++ */
++static void
++sweet_a8_replay_panic(void)
++{
++	static int done;
++	char *buf;
++	uint32_t n, at = UINT32_MAX, from, line;
++
++	if (done++ || !a8_oops || a8_oops[0] != A8_OOPS_SIG) {
++		return;
++	}
++	n = a8_oops[2];
++	if (n == 0 || n > A8_OOPS_SIZE - 12) {
++		return;
++	}
++	buf = kalloc_data(n + 1, Z_WAITOK);
++	if (buf == NULL) {
++		return;
++	}
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t v = a8_oops[3 + i / 4];
++		for (uint32_t k = 0; k < 4 && i + k < n; k++) {
++			char c = (char)(v >> (8 * k));
++			buf[i + k] = (c == 0) ? ' ' : c;
++		}
++	}
++	buf[n] = 0;
++	for (uint32_t i = 0; i + 6 <= n; i++) {
++		if (memcmp(buf + i, "panic(", 6) == 0) {
++			at = i;
++			break;
++		}
++	}
++	if (at != UINT32_MAX) {
++		from = at > 2048 ? at - 2048 : 0;
++		while (from > 0 && from < at && buf[from - 1] != '\n') {
++			from++;
++		}
++		printf("SWEET A8: the previous boot panicked; its last log lines follow\n");
++		for (uint32_t i = from; i < n; i = line + 1) {
++			for (line = i; line < n && buf[line] != '\n'; line++) {
++			}
++			buf[line < n ? line : n] = 0;
++			printf("SWEET A8 PREV: %s\n", buf + i);
++		}
++		printf("SWEET A8: end of the previous boot's panic\n");
++	}
++	kfree_data(buf, n + 1);
++}
++
+ /* Process context, once (before any snapshot or reboot). */
+ void
+ sweet_a8_channel_init(void)
+@@ -1995,6 +2049,7 @@ sweet_a8_channel_init(void)
+ 	if (!a8_pmu) {
+ 		a8_pmu = (volatile uint32_t *)ml_io_map(A8_PMU_PA, 0x1000);
+ 	}
++	sweet_a8_replay_panic();
+ }
+ 
+ /*
