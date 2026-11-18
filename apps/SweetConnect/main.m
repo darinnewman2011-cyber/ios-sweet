@@ -6,6 +6,13 @@
  */
 #import <UIKit/UIKit.h>
 #include <sys/sysctl.h>
+
+/* SystemConfiguration exports these on iOS, but its headers mark them unavailable there. */
+typedef const struct __SCDynamicStore *SCDynamicStoreRef;
+extern SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef allocator, CFStringRef name, void *callout, void *context);
+extern Boolean SCDynamicStoreSetMultiple(SCDynamicStoreRef store, CFDictionaryRef set, CFArrayRef remove, CFArrayRef notify);
+extern int SCError(void);
+extern const char *SCErrorString(int status);
 #include <errno.h>
 #include <string.h>
 
@@ -59,6 +66,59 @@ static void SCParse(NSString *text, NSString *tag, NSString **state, NSString **
 
 static UIImage *SCSymbol(NSString *name) { return [UIImage systemImageNamed:name]; }
 
+/*
+ * Internet for iOS: the kernel's en2 interface is not an IOKit network interface, so configd never makes a network
+ * service for it. When kern.sweet_wifi carries "ip ADDR\tMASK\tROUTER\tDNS\tIF", post that as a state-only service
+ * (IPMonitor accepts services without a Setup: entry, like VPN agents do): IPv4 + DNS, so iOS routes through en2 and
+ * apps can resolve names. Needs com.apple.SystemConfiguration.SCDynamicStore-write-access. Returns a note or nil.
+ */
+static NSString *SCPosted;
+
+static NSString *SCPublishNetwork(NSString *text)
+{
+	NSString *ip = nil;
+	for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+		if ([line hasPrefix:@"ip "]) {
+			ip = [line substringFromIndex:3];
+		}
+	}
+	if ([(ip ?: @"") isEqualToString:(SCPosted ?: @"")]) {
+		return nil;
+	}
+	SCDynamicStoreRef st = SCDynamicStoreCreate(NULL, CFSTR("SweetConnect"), NULL, NULL);
+	if (st == NULL) {
+		return [NSString stringWithFormat:@"configd: %s", SCErrorString(SCError())];
+	}
+	NSString *svc = @"State:/Network/Service/com.iossweet.wifi";
+	NSString *k4 = [svc stringByAppendingString:@"/IPv4"], *kd = [svc stringByAppendingString:@"/DNS"];
+	Boolean ok;
+	if (ip) {
+		NSArray<NSString *> *f = [ip componentsSeparatedByString:@"\t"];
+		if (f.count < 5) {
+			CFRelease(st);
+			return nil;
+		}
+		NSMutableArray *dns = [NSMutableArray array];
+		if (![f[3] isEqualToString:@"0.0.0.0"]) {
+			[dns addObject:f[3]];
+		}
+		[dns addObjectsFromArray:@[ @"1.1.1.1", @"8.8.8.8" ]];
+		NSDictionary *v4 = @{ @"Addresses": @[ f[0] ], @"SubnetMasks": @[ f[1] ], @"Router": f[2], @"InterfaceName": f[4] };
+		NSDictionary *d = @{ @"ServerAddresses": dns };
+		ok = SCDynamicStoreSetMultiple(st, (__bridge CFDictionaryRef)@{ k4: v4, kd: d }, NULL, NULL);
+	} else {
+		ok = SCDynamicStoreSetMultiple(st, NULL, (__bridge CFArrayRef)@[ k4, kd ], NULL);
+	}
+	NSString *note = nil;
+	if (ok) {
+		SCPosted = ip ?: @"";
+	} else {
+		note = [NSString stringWithFormat:@"iOS refused the network settings: %s", SCErrorString(SCError())];
+	}
+	CFRelease(st);
+	return note;
+}
+
 /* ---- a list screen shared by Wi-Fi and Bluetooth ---- */
 
 @interface SCListController : UITableViewController
@@ -101,7 +161,22 @@ static UIImage *SCSymbol(NSString *name) { return [UIImage systemImageNamed:name
 {
 	NSString *s, *d;
 	NSArray *items;
-	SCParse(SCRead(self.node), self.bluetooth ? @"dev" : @"net", &s, &d, &items);
+	NSString *text = SCRead(self.node);
+	SCParse(text, self.bluetooth ? @"dev" : @"net", &s, &d, &items);
+	if (!self.bluetooth) {
+		static NSString *lastNote;
+		NSString *note = SCPublishNetwork(text);
+		if (note) {
+			lastNote = note;
+		} else if (SCPosted.length) {
+			lastNote = nil;
+		}
+		if (lastNote) {
+			d = [d stringByAppendingFormat:@" (%@)", lastNote];
+		} else if (SCPosted.length) {
+			d = [d stringByAppendingString:@" · iOS is online through Wi-Fi"];
+		}
+	}
 	self.state = s;
 	self.detail = d;
 	self.items = items;

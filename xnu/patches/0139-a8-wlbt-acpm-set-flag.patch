@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..ad4388d 100644
+index f638996..5bd2b3b 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1671 @@
+@@ -1,411 +1,1687 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -689,6 +689,7 @@ index f638996..ad4388d 100644
 +#include <net/if.h>
 +#include <net/if_dl.h>
 +#include <net/if_types.h>
++#include <net/if_media.h>
 +#include <net/if_ether.h>
 +#include <net/kpi_interface.h>
 +#include <net/kpi_protocol.h>
@@ -1047,6 +1048,7 @@ index f638996..ad4388d 100644
 +static ifnet_t wl_ifp;
 +static int dh_state, dh_tries;  /* DHCP: 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 ACKed, 4 configured, 5 gave up */
 +static char net_note[96];
++static uint8_t dh_ip[4], dh_srv[4], dh_mask[4], dh_gw[4], dh_dns[4];
 +static void net_attach(void);
 +static void net_rx(uint16_t dud, const uint8_t *f, uint32_t n);
 +
@@ -1158,6 +1160,12 @@ index f638996..ad4388d 100644
 +	static char text[4096];
 +	uint8_t done[48] = { 0 };
 +	int n = snprintf(text, sizeof(text), "state %s %s\n", word, detail);
++
++	if (connected && dh_state == 4) {       /* for Sweet Connect to hand to configd: address, mask, router, DNS */
++		n += snprintf(text + n, sizeof(text) - (size_t)n, "ip %u.%u.%u.%u\t%u.%u.%u.%u\t%u.%u.%u.%u\t%u.%u.%u.%u\ten2\n",
++		    dh_ip[0], dh_ip[1], dh_ip[2], dh_ip[3], dh_mask[0], dh_mask[1], dh_mask[2], dh_mask[3],
++		    dh_gw[0], dh_gw[1], dh_gw[2], dh_gw[3], dh_dns[0], dh_dns[1], dh_dns[2], dh_dns[3]);
++	}
 +
 +	/* strongest first, one line per SSID */
 +	for (;;) {
@@ -1563,7 +1571,6 @@ index f638996..ad4388d 100644
 +static unsigned txq_w, txq_r, dat_slot;
 +static uint16_t host_tag;
 +static uint32_t tx_frames, tx_drops, rx_other;
-+static uint8_t dh_ip[4], dh_srv[4], dh_mask[4], dh_gw[4], dh_dns[4];
 +static uint32_t dh_xid;
 +static uint64_t dh_t;
 +static volatile int net_note_new;
@@ -1598,6 +1605,15 @@ index f638996..ad4388d 100644
 +	case SIOCDELMULTI:
 +	case SIOCSIFMTU:
 +		return 0;
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = data;         /* the fields before ifm_ulist are the same in both forms */
++		ifmr->ifm_current = ifmr->ifm_active = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (connected ? IFM_ACTIVE : 0);
++		ifmr->ifm_count = 0;
++		return 0;
++	}
 +	default:
 +		return ether_ioctl(ifp, (u_int32_t)cmd, data);
 +	}

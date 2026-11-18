@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 rm -rf out && mkdir -p out/SweetConnect.app
 xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter \
-	-framework UIKit -framework Foundation -framework CoreGraphics -o out/SweetConnect.app/SweetConnect main.m
+	-framework UIKit -framework Foundation -framework CoreGraphics -framework SystemConfiguration -o out/SweetConnect.app/SweetConnect main.m
 cp Info.plist out/SweetConnect.app/Info.plist
 plutil -convert binary1 out/SweetConnect.app/Info.plist
 codesign -s - --force --entitlements entitlements.plist out/SweetConnect.app
