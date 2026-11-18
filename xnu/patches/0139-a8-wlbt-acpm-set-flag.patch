@@ -220,7 +220,7 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..ec4c06f 100644
+index f638996..e96733c 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
 @@ -1,411 +1,978 @@
@@ -1210,7 +1210,7 @@ index f638996..ec4c06f 100644
 +	uint32_t dl = 0, ch;
 +	int e;
 +
-+	sig_hdr(s, SIG_ADD_SCAN_REQ, 1);
++	sig_hdr(s, SIG_ADD_SCAN_REQ, 0);        /* scans go on vif 0; vif 1 exists only after MLME_ADD_VIF at connect */
 +	put16(s + 12, 0x0100);                  /* scan id: ifnum 1 << 8 | SLSI_SCAN_HW_ID */
 +	put16(s + 14, 2);                       /* FAPI_SCANTYPE_FULL_SCAN */
 +	memcpy(s + 16, wl_mac, 6);
