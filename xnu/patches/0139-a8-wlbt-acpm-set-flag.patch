@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..ede12ec 100644
+index f638996..2199334 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1750 @@
+@@ -1,411 +1,1755 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1428,6 +1428,11 @@ index f638996..ede12ec 100644
 +			t[k] = 0;
 +			printf("SWEET A8 WIFI: fw %04x %04x %04x: %s\n", rd16(sig + 10), rd16(sig + 12), rd16(sig + 14), t);
 +		}
++		return;
++	}
++	if (id == 0x8302) {                     /* DEBUG_FAULT_IND: the arg names the firmware's check (movs r1, #arg) */
++		printf("SWEET A8 WIFI: firmware fault %#x arg %#x count %u cpu %u vif %u\n", rd16(sig + 12), (uint32_t)rd16(sig + 20) | (uint32_t)rd16(sig + 22) << 16,
++		    rd16(sig + 14), rd16(sig + 24), rd16(sig + 10));
 +		return;
 +	}
 +	if (++log_sigs <= 300 && id != SIG_SCAN_IND) {
