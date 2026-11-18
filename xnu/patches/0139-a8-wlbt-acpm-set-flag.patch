@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..e96733c 100644
+index f638996..18ea90d 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,978 @@
+@@ -1,411 +1,1148 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -992,6 +992,16 @@ index f638996..e96733c 100644
 +#define SIG_ADD_SCAN_CFM        0x2105
 +#define SIG_SCAN_IND            0x2300
 +#define SIG_SCAN_DONE_IND       0x2301
++#define SIG_ADD_VIF_REQ         0x2007
++#define SIG_ADD_VIF_CFM         0x2107
++#define SIG_DEL_VIF_REQ         0x2008
++#define SIG_CONNECT_REQ         0x200b
++#define SIG_CONNECT_CFM         0x210b
++#define SIG_CONNECT_RES         0x2200
++#define SIG_CONNECT_IND         0x2303
++#define SIG_CONNECTED_IND       0x2304
++#define SIG_DISCONNECTED_IND    0x2309
++#define SIG_PROC_STARTED_IND    0x230a
 +enum { Q_FH_CTRL, Q_FH_DAT, Q_FH_RFB, Q_TH_CTRL, Q_TH_DAT, Q_TH_RFB };
 +static const uint8_t q_layout[6][2] = { { 0, 64 }, { 1, 65 }, { 66, 2 }, { 67, 3 }, { 68, 4 }, { 5, 69 } };
 +
@@ -1017,6 +1027,10 @@ index f638996..e96733c 100644
 +static uint64_t scan_t0;
 +static uint32_t wl_sigs, wl_scan_inds;
 +static char wl_status[160];
++static char join_ssid[33];
++static volatile int join_req;
++static int vif_up, joining, connected;  /* station vif 1 added; join in progress; associated */
++static uint32_t rx_frames;
 +
 +static inline void wl_dmb(void) { __asm__ volatile ("dmb sy" ::: "memory"); }
 +static inline void wl_dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
@@ -1149,8 +1163,8 @@ index f638996..e96733c 100644
 +			continue;
 +		}
 +		done[best] = 2;
-+		n += snprintf(text + n, sizeof(text) - (size_t)n, "net %s\t%d\t%d\t0\n", nets[best].ssid, nets[best].rssi,
-+		    nets[best].secure ? 1 : 0);
++		n += snprintf(text + n, sizeof(text) - (size_t)n, "net %s\t%d\t%d\t%d\n", nets[best].ssid, nets[best].rssi,
++		    nets[best].secure ? 1 : 0, connected && same_ssid(nets[best].ssid, join_ssid) ? 1 : 0);
 +	}
 +	sweet_a8net_publish(0, text);
 +}
@@ -1244,6 +1258,101 @@ index f638996..e96733c 100644
 +	wl_publish("on", e ? "scan request could not be queued" : "scanning...");
 +}
 +
++/* A signal with no body beyond vif + 3 spares (MLME_CONNECT_RES, MLME_DEL_VIF_REQ). */
++static int
++short_sig(uint16_t id)
++{
++	uint8_t s[64];
++
++	sig_hdr(s, id, 1);
++	return sig_send(s, 24, NULL, 0);
++}
++
++static void
++del_vif(void)
++{
++	if (vif_up) {
++		(void)short_sig(SIG_DEL_VIF_REQ);
++		vif_up = 0;
++	}
++	connected = 0;
++}
++
++static int join_idx = -1;
++static uint64_t join_t0;
++
++static void
++send_add_vif(void)
++{
++	uint8_t s[64];
++	int e;
++
++	sig_hdr(s, SIG_ADD_VIF_REQ, 1);
++	memcpy(s + 12, wl_mac, 6);              /* interface address */
++	put16(s + 18, 2);                       /* FAPI_VIFTYPE_STATION; device address stays zero (no P2P) */
++	e = sig_send(s, 38, NULL, 0);
++	printf("SWEET A8 WIFI: add station vif: error %d\n", e);
++}
++
++static void
++send_connect(void)
++{
++	uint8_t s[64], d[40];
++	uint32_t l = (uint32_t)strlen(nets[join_idx].ssid);
++	int e;
++
++	sig_hdr(s, SIG_CONNECT_REQ, 1);
++	memcpy(s + 12, nets[join_idx].bssid, 6);
++	put16(s + 18, 0);                       /* NL80211_AUTHTYPE_OPEN_SYSTEM */
++	put16(s + 20, (uint16_t)(nets[join_idx].mhz * 2));
++	d[0] = 0;                               /* SSID element; no RSN element for an open network */
++	d[1] = (uint8_t)l;
++	memcpy(d + 2, nets[join_idx].ssid, l);
++	e = sig_send(s, 34, d, 2 + l);
++	printf("SWEET A8 WIFI: connect request to %s on %u MHz: error %d\n", nets[join_idx].ssid, nets[join_idx].mhz, e);
++}
++
++static void
++start_join(void)
++{
++	join_idx = -1;
++	for (int i = 0; i < n_nets; i++) {
++		if (same_ssid(nets[i].ssid, join_ssid) && (join_idx < 0 || nets[i].rssi > nets[join_idx].rssi)) {
++			join_idx = i;
++		}
++	}
++	if (join_idx < 0) {
++		wl_publish("on", "that network was not in the last scan; scan again and retry");
++		return;
++	}
++	if (nets[join_idx].secure) {
++		wl_publish("on", "password networks come in the next build; open networks work now");
++		return;
++	}
++	if (connected) {
++		del_vif();
++	}
++	joining = 1;
++	join_t0 = mach_absolute_time();
++	snprintf(wl_status, sizeof(wl_status), "joining %s...", join_ssid);
++	wl_publish("on", wl_status);
++	if (vif_up) {
++		send_connect();
++	} else {
++		send_add_vif();
++	}
++}
++
++static void
++join_failed(const char *what, uint16_t res)
++{
++	joining = 0;
++	snprintf(wl_status, sizeof(wl_status), "%s (result %#x)", what, res);
++	printf("SWEET A8 WIFI: %s\n", wl_status);
++	del_vif();
++	wl_publish("on", wl_status);
++}
++
 +static void
 +wl_signal(uint32_t sig, uint32_t sig_len, uint32_t dat, uint32_t dat_len)
 +{
@@ -1272,6 +1381,41 @@ index f638996..e96733c 100644
 +		printf("SWEET A8 WIFI: scan done: %u results, %d networks\n", wl_scan_inds, n_nets);
 +		wl_publish("on", wl_status);
 +		break;
++	case SIG_ADD_VIF_CFM:
++		if (rd16(sig + 12) != 0) {
++			join_failed("could not create the station interface", rd16(sig + 12));
++		} else {
++			vif_up = 1;
++			if (joining) {
++				send_connect();
++			}
++		}
++		break;
++	case SIG_CONNECT_CFM:
++		if (rd16(sig + 12) != 0) {
++			join_failed("join refused", rd16(sig + 12));
++		}
++		break;
++	case SIG_CONNECT_IND:
++		if (rd16(sig + 12) != 0) {
++			join_failed("join failed", rd16(sig + 12));
++		} else {
++			(void)short_sig(SIG_CONNECT_RES);
++			joining = 0;
++			connected = 1;
++			rx_frames = 0;
++			snprintf(wl_status, sizeof(wl_status), "connected to %s", join_ssid);
++			printf("SWEET A8 WIFI: %s\n", wl_status);
++			wl_publish("on", wl_status);
++		}
++		break;
++	case SIG_DISCONNECTED_IND:
++		snprintf(wl_status, sizeof(wl_status), "disconnected from %s (reason %u)", join_ssid, rd16(sig + 18));
++		printf("SWEET A8 WIFI: %s\n", wl_status);
++		joining = 0;
++		del_vif();
++		wl_publish("on", wl_status);
++		break;
 +	default:
 +		break;
 +	}
@@ -1290,6 +1434,9 @@ index f638996..e96733c 100644
 +			uint8_t flag = rd8(ref + 4);
 +			if (q == Q_TH_CTRL && (flag & 1) && sbuf >= 4 + 10) {
 +				wl_signal(ref + 24, sbuf - 4u, ref + 20u + head, len);
++			}
++			if (q == Q_TH_DAT) {
++				rx_frames++;
 +			}
 +			(void)q_put(Q_TH_RFB, ref);
 +			if ((flag & 0xc0) == 0xc0) {
@@ -1313,8 +1460,13 @@ index f638996..e96733c 100644
 +		scan_req = 1;
 +	} else if (cmd[0] == 'o' && cmd[1] == 'n') {
 +		scan_req = 1;
-+	} else if (cmd[0] == 'j' && cmd[1] == 'o' && cmd[2] == 'i' && cmd[3] == 'n') {
-+		return ENOTSUP;
++	} else if (cmd[0] == 'j' && cmd[1] == 'o' && cmd[2] == 'i' && cmd[3] == 'n' && cmd[4] == ' ') {
++		int i;
++		for (i = 0; i < 32 && cmd[5 + i] && cmd[5 + i] != '\t' && cmd[5 + i] != '\n'; i++) {
++			join_ssid[i] = cmd[5 + i];
++		}
++		join_ssid[i] = 0;
++		join_req = i > 0;
 +	}
 +	return 0;
 +}
@@ -1379,7 +1531,7 @@ index f638996..e96733c 100644
 +	void *bpa = NULL;
 +	int bsz = 0, cfm = 0;
 +	uint32_t mib_sz = 0, ver, cfg;
-+	uint64_t now, lim15;
++	uint64_t now, lim15, lim2, pub_t0 = 0;
 +	char d[200];
 +
 +	heap_next = (heap_next + 0xfffu) & ~0xfffu;
@@ -1435,6 +1587,7 @@ index f638996..e96733c 100644
 +	sweet_a8net_set_handler(0, wl_cmd);
 +	scan_req = 1;
 +	nanoseconds_to_absolutetime(15ull * NSEC_PER_SEC, &lim15);
++	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &lim2);
 +	for (;;) {
 +		wl_drain(Q_TH_CTRL);
 +		wl_drain(Q_TH_DAT);
@@ -1446,9 +1599,26 @@ index f638996..e96733c 100644
 +			    wl_scan_inds, wl_sigs);
 +			wl_publish("on", wl_status);
 +		}
-+		if (scan_req && !scanning) {
++		if (join_req && !scanning && !joining) {
++			join_req = 0;
++			start_join();
++		}
++		if (joining && now - join_t0 > lim15) {
++			join_failed("join timed out", 0);
++		}
++		if (scan_req && !scanning && !joining) {
 +			scan_req = 0;
 +			send_scan();
++		}
++		if (connected && now - pub_t0 > lim2) {
++			static uint32_t last_rx;
++			pub_t0 = now;
++			if (rx_frames != last_rx) {
++				last_rx = rx_frames;
++				snprintf(wl_status, sizeof(wl_status), "connected to %s (%u packets received; internet is the next build)",
++				    join_ssid, rx_frames);
++				wl_publish("on", wl_status);
++			}
 +		}
 +		if (rd(shm, panic_off) | rd(shm, panic_off + 12)) {
 +			snprintf(d, sizeof(d), "radio firmware crashed while Wi-Fi was starting (boot step %#x, record %08x %08x)",
