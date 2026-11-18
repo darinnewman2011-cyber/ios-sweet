@@ -185,10 +185,11 @@ static NSString *SCPublishNetwork(NSString *text)
 
 - (void)send:(NSString *)cmd
 {
-	if (self.bluetooth) {
-		/* The Bluetooth side of the radio is not driven yet (ios91: a scan here upset the phone). */
+	if (self.bluetooth && ([cmd hasPrefix:@"pair "] || [cmd hasPrefix:@"connect "] || [cmd hasPrefix:@"disconnect "] ||
+	    [cmd hasPrefix:@"forget "])) {
+		/* Bluetooth stage 1 (xnu 0139): on and scan work; pairing and audio are the next stages. */
 		UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Bluetooth"
-		                                                           message:@"Bluetooth isn't working yet. It comes after Wi-Fi."
+		                                                           message:@"Pairing isn't working yet. For now Bluetooth can turn on and find devices."
 		                                                    preferredStyle:UIAlertControllerStyleAlert];
 		[a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
 		[self presentViewController:a animated:YES completion:nil];

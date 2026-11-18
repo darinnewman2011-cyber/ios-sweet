@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..a0d4aaf 100644
+index f638996..80517ba 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1774 @@
+@@ -1,411 +1,2127 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -2136,6 +2136,356 @@ index f638996..a0d4aaf 100644
 +	}
 +}
 +
++/*
++ * ---- Bluetooth, stage 1: the BT service on the same core, HCI over shared memory, device discovery ----
++ * Facts from Samsung's GPL scsc_bt driver (scsc_bt_module.c slsi_sm_bt_service_start/setup_bhcs, scsc_shm.c
++ * scsc_bt_shm_init/h4 write/read, include/scsc/api/bhcs.h, bsmhcp.h; Exynos7885-Dev lineage-18.1), no code copied:
++ *   service start: mgmt packet {chan 1, service 2 (BT), SM_MSG_START_REQ, ref of the BHCS}; confirm 0x010201.
++ *   BHCS v2 {version, protocol ref, protocol length, config ref, config length, LAP, UAP (u8), NAP (u16 @26)}; config =
++ *   the phone's mx140_bt.hcf as is (boot blob SweetBTHCF).
++ *   BSMHCP_PROTOCOL (0x165c0 bytes, 32-aligned): header magic = (1024 | 258 | 0x2aa0 << 15) ^ size; interrupt bit
++ *   numbers at +0x04 (AP->M4), +0x14/+0x16 (AP->R4 bg/fg), +0x18/+0x1a (R4->AP bg/fg), +0xbc/+0xbe (info);
++ *   HCI command ring (8 x {u16 len, 258 bytes}) at 0x100, write index +0x24 (ours), read +0x44 (firmware's); after a
++ *   write, ring the bg bit. Event ring (32 x {u16 len, u16 handle, u16 type, 258 bytes}) at 0xa2c0, write +0x48
++ *   (firmware's), read +0x28 (ours, then ring bg). Commands and events are HCI packets without the H4 type byte.
++ * kern.sweet_bt: "on" starts the service, "scan" runs 10 s of classic inquiry (extended results: names from EIR)
++ * plus LE scanning; the list is "dev <addr>\t<name>\t<rssi>\t0\t0". Pairing and audio are later stages.
++ */
++#define BT_PROTO_SIZE   0x165c0u
++#define BT_MAGIC        ((1024u | 258u | (0x2aa0u << 15)) ^ BT_PROTO_SIZE)
++#define BT_CMD_RING     0x100u
++#define BT_CMD_TD       260u
++#define BT_EVT_RING     0xa2c0u
++#define BT_EVT_TD       264u
++#define BT_FH_BG        6               /* from-host bits after the mxconf streams (0-4) and WLAN (5) */
++#define BT_FH_FG        7
++#define BT_FH_INFO      8
++#define BT_TH_BG        8               /* to-host bits after the mxconf streams (0-6) and WLAN (7); we poll */
++#define BT_TH_FG        9
++#define BT_TH_INFO      10
++#define BT_MAXDEV       24
++
++static uint32_t bt_proto;               /* shared-memory offset of BSMHCP_PROTOCOL, 0 = not started */
++static volatile int bt_want, bt_scan_req;
++static int bt_on, bt_scanning, bt_le;
++static uint64_t bt_scan_t0;
++static uint8_t bt_addr[6];
++static uint32_t bt_events;
++static struct {
++	uint8_t a[6];
++	int8_t rssi;
++	char name[40];
++} bt_dev[BT_MAXDEV];
++static int bt_ndev;
++static char bt_status[160];
++
++static void
++bt_publish(const char *word, const char *detail)
++{
++	static char text[BT_MAXDEV * 72 + 200];
++	int n = snprintf(text, sizeof(text), "state %s %s\n", word, detail);
++
++	for (int i = 0; i < bt_ndev && n < (int)sizeof(text) - 80; i++) {
++		const uint8_t *a = bt_dev[i].a;          /* HCI order: little-endian */
++		n += snprintf(text + n, sizeof(text) - (size_t)n, "dev %02X:%02X:%02X:%02X:%02X:%02X\t%s\t%d\t0\t0\n", a[5], a[4],
++		    a[3], a[2], a[1], a[0], bt_dev[i].name[0] ? bt_dev[i].name : "(no name)", bt_dev[i].rssi);
++	}
++	sweet_a8net_publish(1, text);
++}
++
++static void
++bt_cmd_send(uint16_t op, const uint8_t *p, uint8_t n)
++{
++	uint32_t w = rd(shm, bt_proto + 0x24) % 8, r = rd(shm, bt_proto + 0x44) % 8, td;
++
++	if ((w + 1) % 8 == r) {
++		printf("SWEET A8 BT: command ring full, %#x dropped\n", op);
++		return;
++	}
++	td = bt_proto + BT_CMD_RING + w * BT_CMD_TD;
++	wr8(td + 2, (uint8_t)op);
++	wr8(td + 3, (uint8_t)(op >> 8));
++	wr8(td + 4, n);
++	for (uint8_t i = 0; i < n; i++) {
++		wr8(td + 5 + i, p[i]);
++	}
++	wr16(td, (uint16_t)(3u + n));
++	wl_dsb();
++	wr(shm, bt_proto + 0x24, (w + 1) % 8);
++	ring_r4(BT_FH_BG);
++}
++
++/* EIR / LE advertising data: the (shortened or complete) local name */
++static void
++bt_name_from(const uint8_t *d, uint32_t len, char *out, size_t outsz)
++{
++	for (uint32_t i = 0; i + 1 < len && d[i] != 0; i += 1u + d[i]) {
++		uint8_t l = d[i], t = d[i + 1];
++		if ((t == 0x08 || t == 0x09) && l >= 2 && i + 1 + l <= len) {
++			size_t k = MIN((size_t)(l - 1), outsz - 1);
++			for (size_t j = 0; j < k; j++) {
++				char c = (char)d[i + 2 + j];
++				out[j] = (c == '\t' || c == '\n' || (unsigned char)c < 0x20) ? ' ' : c;
++			}
++			out[k] = 0;
++			if (t == 0x09) {
++				return;
++			}
++		}
++	}
++}
++
++static void
++bt_found(const uint8_t *a, int8_t rssi, const uint8_t *eir, uint32_t eirlen)
++{
++	int i;
++
++	for (i = 0; i < bt_ndev && memcmp(bt_dev[i].a, a, 6) != 0; i++) {
++	}
++	if (i == bt_ndev) {
++		if (bt_ndev == BT_MAXDEV) {
++			return;
++		}
++		bzero(&bt_dev[i], sizeof(bt_dev[i]));
++		memcpy(bt_dev[i].a, a, 6);
++		bt_ndev++;
++	}
++	bt_dev[i].rssi = rssi;
++	if (eir != NULL && eirlen > 0) {
++		bt_name_from(eir, eirlen, bt_dev[i].name, sizeof(bt_dev[i].name));
++	}
++}
++
++static void
++bt_event(const uint8_t *e, uint32_t n)
++{
++	uint8_t code = e[0];
++
++	if (n < 2) {
++		return;
++	}
++	if (bt_events++ < 40) {
++		printf("SWEET A8 BT: event %#x (%u bytes) %02x %02x %02x %02x %02x %02x\n", code, n, n > 2 ? e[2] : 0,
++		    n > 3 ? e[3] : 0, n > 4 ? e[4] : 0, n > 5 ? e[5] : 0, n > 6 ? e[6] : 0, n > 7 ? e[7] : 0);
++	}
++	if (code == 0x0e && n >= 6) {                   /* Command Complete: ncmd, opcode, status, ... */
++		uint16_t op = (uint16_t)(e[3] | e[4] << 8);
++		if (op == 0x1009 && e[5] == 0 && n >= 12) {     /* Read BD_ADDR */
++			memcpy(bt_addr, e + 6, 6);
++		}
++		if (op == 0x0c03) {
++			bt_on = 1;
++			snprintf(bt_status, sizeof(bt_status), "Bluetooth on (controller reset %s)", e[5] ? "failed" : "OK");
++			bt_publish("on", bt_status);
++		}
++		if (op == 0x1009) {
++			snprintf(bt_status, sizeof(bt_status), "Bluetooth on, address %02X:%02X:%02X:%02X:%02X:%02X", bt_addr[5],
++			    bt_addr[4], bt_addr[3], bt_addr[2], bt_addr[1], bt_addr[0]);
++			bt_publish("on", bt_status);
++		}
++		if (op == 0x200b && e[5] == 0) {                /* LE scan parameters set: start it */
++			static const uint8_t en[2] = { 1, 1 };  /* enable, filter duplicates */
++			bt_cmd_send(0x200c, en, 2);
++			bt_le = 1;
++		}
++	} else if (code == 0x0f && n >= 6 && e[2] != 0) {       /* Command Status with an error */
++		printf("SWEET A8 BT: command %#x refused, status %#x\n", e[4] | e[5] << 8, e[2]);
++	} else if (code == 0x02 && n >= 3) {            /* Inquiry Result */
++		for (uint32_t k = 0, cnt = e[2]; k < cnt && 3 + 14 * (k + 1) <= n; k++) {
++			bt_found(e + 3 + 6 * k, 0, NULL, 0);
++		}
++		bt_publish("on", bt_status);
++	} else if (code == 0x22 && n >= 17) {           /* Inquiry Result with RSSI */
++		bt_found(e + 3, (int8_t)e[16], NULL, 0);
++		bt_publish("on", bt_status);
++	} else if (code == 0x2f && n >= 17) {           /* Extended Inquiry Result: addr, ..., rssi @16, EIR @17 */
++		bt_found(e + 3, (int8_t)e[16], e + 17, n - 17);
++		bt_publish("on", bt_status);
++	} else if (code == 0x01) {                      /* Inquiry Complete */
++		snprintf(bt_status, sizeof(bt_status), "scan done: %d devices", bt_ndev);
++		bt_publish("on", bt_status);
++	} else if (code == 0x3e && n >= 4 && e[2] == 0x02) {    /* LE Advertising Report(s) */
++		uint32_t at = 4;
++		for (uint32_t k = 0; k < e[3] && at + 9 <= n; k++) {
++			uint32_t dl = e[at + 8];
++			if (at + 9 + dl + 1 > n) {
++				break;
++			}
++			bt_found(e + at + 2, (int8_t)e[at + 9 + dl], e + at + 9, dl);
++			at += 10 + dl;
++		}
++		bt_publish("on", bt_status);
++	}
++}
++
++static void
++bt_poll(void)
++{
++	uint32_t r = rd(shm, bt_proto + 0x28) % 32, w = rd(shm, bt_proto + 0x48) % 32, start = r;
++	uint8_t e[260];
++
++	while (r != w) {
++		uint32_t td = bt_proto + BT_EVT_RING + r * BT_EVT_TD, n = rd16(td);
++		if (n > 258) {
++			n = 258;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			e[i] = rd8(td + 6 + i);
++		}
++		bt_event(e, n);
++		r = (r + 1) % 32;
++	}
++	if (r != start) {
++		wl_dsb();
++		wr(shm, bt_proto + 0x28, r);
++		ring_r4(BT_FH_BG);
++	}
++}
++
++static void
++bt_start(void)
++{
++	void *bpa = NULL;
++	int bsz = 0;
++	uint32_t bhcs, cfg = 0, cfglen = 0, a, b;
++
++	heap_next = (heap_next + 31u) & ~31u;
++	bhcs = heap_alloc(32);
++	heap_next = (heap_next + 31u) & ~31u;
++	bt_proto = heap_alloc(BT_PROTO_SIZE);
++	if (IODTGetLoaderInfo("SweetBTHCF", &bpa, &bsz) == 0 && bsz > 0 && bsz < 4096) {
++		const uint8_t *h = (const uint8_t *)ml_static_ptovirt((vm_offset_t)bpa);
++		heap_next = (heap_next + 31u) & ~31u;
++		cfg = heap_alloc((uint32_t)bsz);
++		cfglen = (uint32_t)bsz;
++		for (uint32_t i = 0; i < cfglen; i++) {
++			wr8(cfg + i, h[i]);
++		}
++	}
++	if (heap_next > SHM_SIZE) {
++		bt_proto = 0;
++		bt_publish("off", "no room in the radio's shared memory for Bluetooth");
++		return;
++	}
++	for (uint32_t o = 0; o < BT_PROTO_SIZE; o += 4) {
++		wr(shm, bt_proto + o, 0);
++	}
++	wr(shm, bt_proto + 0x00, BT_MAGIC);
++	wr16(bt_proto + 0x14, BT_FH_BG);
++	wr16(bt_proto + 0x16, BT_FH_FG);
++	wr16(bt_proto + 0x18, BT_TH_BG);
++	wr16(bt_proto + 0x1a, BT_TH_FG);
++	wr16(bt_proto + 0xbc, BT_FH_INFO);
++	wr16(bt_proto + 0xbe, BT_TH_INFO);
++	/* address: the SoC's unique id as Samsung's setup_bhcs uses it (CHIPID 0x10000000 +0x14/+0x18), else made up */
++	{
++		vm_offset_t chip = ml_io_map(0x10000000u, 0x1000);
++		uint64_t uid = chip ? ((uint64_t)rd(chip, 0x18) << 32 | rd(chip, 0x14)) : 0;
++		if ((uid & 0xffffffffffffull) == 0) {
++			uid = mach_absolute_time() ^ 0x5eed00a8a8ull;
++		}
++		for (int i = 0; i < 8; i++) {
++			wr(shm, bhcs + 4u * (uint32_t)i, 0);
++		}
++		wr(shm, bhcs + 0, 2);                           /* BHCS_VERSION */
++		wr(shm, bhcs + 4, bt_proto);
++		wr(shm, bhcs + 8, BT_PROTO_SIZE);
++		wr(shm, bhcs + 12, cfg);
++		wr(shm, bhcs + 16, cfglen);
++		wr(shm, bhcs + 20, (uint32_t)((uid & 0xffffff000000ull) >> 24));       /* LAP */
++		wr8(bhcs + 24, (uint8_t)(uid & 0xff));                                  /* UAP */
++		wr16(bhcs + 26, (uint16_t)((uid & 0xffff00ull) >> 8));                  /* NAP */
++	}
++	printf("SWEET A8 BT: BHCS at %#x, protocol at %#x (%#x bytes, magic %#x), config %u bytes; sending SM_MSG_START_REQ\n",
++	    bhcs, bt_proto, BT_PROTO_SIZE, BT_MAGIC, cfglen);
++	bt_publish("starting", "starting the Bluetooth service");
++	mgmt_send(1, 2, 0, bhcs);
++	for (int t = 0; t < 300; t++) {
++		uint32_t ri = rd(shm, mgmt_in.ridx) % mgmt_in.num, wi = rd(shm, mgmt_in.widx) % mgmt_in.num;
++		int cfm = 0;
++		while (ri != wi) {
++			a = rd(shm, mgmt_in.buf + ri * 8);
++			b = rd(shm, mgmt_in.buf + ri * 8 + 4);
++			printf("SWEET A8 BT: mgmt packet %u: %08x %08x\n", ri, a, b);
++			cfm |= (a & 0xffffff) == 0x010201;
++			ri = (ri + 1) % mgmt_in.num;
++		}
++		wl_dsb();
++		wr(shm, mgmt_in.ridx, ri);
++		ring_r4(mgmt_in.rbit);
++		if (cfm) {
++			break;
++		}
++		if (t == 299) {
++			snprintf(bt_status, sizeof(bt_status), "Bluetooth service did not confirm (state %u, features %#x)",
++			    rd8(bt_proto + 0x56), rd(shm, bt_proto + 0x50));
++			printf("SWEET A8 BT: %s\n", bt_status);
++			bt_publish("off", bt_status);
++			bt_proto = 0;
++			return;
++		}
++		sleep_ms(10);
++	}
++	printf("SWEET A8 BT: service started: state %u, features %#x, controller flags %#x\n", rd8(bt_proto + 0x56),
++	    rd(shm, bt_proto + 0x50), rd(shm, bt_proto + 0x4c));
++	bt_cmd_send(0x0c03, NULL, 0);                   /* HCI Reset */
++	{
++		static const uint8_t mask[8] = { 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d };    /* incl. LE meta */
++		static const uint8_t mode[1] = { 2 };   /* inquiry results with RSSI or extended (EIR: names) */
++		bt_cmd_send(0x0c01, mask, 8);
++		bt_cmd_send(0x0c45, mode, 1);
++	}
++	bt_cmd_send(0x1009, NULL, 0);                   /* Read BD_ADDR */
++}
++
++static void
++bt_tick(uint64_t now, uint64_t lim15)
++{
++	if (bt_want && bt_proto == 0) {
++		bt_want = 0;
++		bt_start();
++	}
++	if (bt_proto == 0) {
++		return;
++	}
++	bt_poll();
++	if (bt_scan_req && bt_on && !bt_scanning) {
++		static const uint8_t inq[5] = { 0x33, 0x8b, 0x9e, 8, 0 };      /* GIAC, 8 x 1.28 s, unlimited */
++		static const uint8_t lep[7] = { 1, 0x60, 0, 0x30, 0, 0, 0 };   /* active, 60 ms / 30 ms, public, all */
++		bt_scan_req = 0;
++		bt_scanning = 1;
++		bt_scan_t0 = now;
++		bt_ndev = 0;
++		snprintf(bt_status, sizeof(bt_status), "scanning...");
++		bt_publish("on", bt_status);
++		bt_cmd_send(0x0401, inq, 5);
++		bt_cmd_send(0x200b, lep, 7);
++	}
++	if (bt_scanning && now - bt_scan_t0 > lim15) {
++		static const uint8_t off[2] = { 0, 0 };
++		bt_scanning = 0;
++		if (bt_le) {
++			bt_cmd_send(0x200c, off, 2);
++			bt_le = 0;
++		}
++		snprintf(bt_status, sizeof(bt_status), "scan done: %d devices", bt_ndev);
++		bt_publish("on", bt_status);
++		printf("SWEET A8 BT: %s, %u events\n", bt_status, bt_events);
++	}
++}
++
++static int
++bt_cmd(const char *cmd)
++{
++	if (strncmp(cmd, "on", 2) == 0) {
++		bt_want = 1;
++	} else if (strncmp(cmd, "scan", 4) == 0) {
++		bt_want = 1;
++		bt_scan_req = 1;
++	}
++	return 0;
++}
++
 +static void
 +wifi_run(uint32_t panic_off)
 +{
@@ -2196,6 +2546,8 @@ index f638996..a0d4aaf 100644
 +	}
 +	wl_publish("on", d);
 +	sweet_a8net_set_handler(0, wl_cmd);
++	sweet_a8net_set_handler(1, bt_cmd);
++	bt_publish("off", "radio running; turn Bluetooth on to start it");
 +	/* Unattended test: boot-arg a8join=SSID joins that open network after each scan, up to 3 attempts. */
 +	{
 +		char ssid[33] = "";
@@ -2235,6 +2587,7 @@ index f638996..a0d4aaf 100644
 +		if (connected) {
 +			net_tick(now, lim3);
 +		}
++		bt_tick(now, lim15);
 +		if (connected && (net_note_new || now - pub_t0 > lim2)) {
 +			static uint32_t last_rx;
 +			pub_t0 = now;
