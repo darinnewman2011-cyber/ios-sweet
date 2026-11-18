@@ -185,6 +185,15 @@ static NSString *SCPublishNetwork(NSString *text)
 
 - (void)send:(NSString *)cmd
 {
+	if (self.bluetooth) {
+		/* The Bluetooth side of the radio is not driven yet (ios91: a scan here upset the phone). */
+		UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Bluetooth"
+		                                                           message:@"Bluetooth isn't working yet. It comes after Wi-Fi."
+		                                                    preferredStyle:UIAlertControllerStyleAlert];
+		[a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+		[self presentViewController:a animated:YES completion:nil];
+		return;
+	}
 	NSString *err = SCWrite(self.node, cmd);
 	if (err) {
 		UIAlertController *a = [UIAlertController alertControllerWithTitle:self.title message:err

@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..5bd2b3b 100644
+index f638996..e9b51fa 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1687 @@
+@@ -1,411 +1,1733 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1312,6 +1312,26 @@ index f638996..5bd2b3b 100644
 +
 +static int join_idx = -1;
 +static uint64_t join_t0;
++static int fwlog_left, join_retry;
++static uint32_t log_sigs;
++
++/*
++ * Association-request elements, as Linux's slsi_mlme_connect_info_elements hands wpa_supplicant's over
++ * (MLME_ADD_INFO_ELEMENTS_REQ, purpose ASSOCIATION_REQUEST): Extended Capabilities with extended channel
++ * switching (bit 2) and operating mode notification (bit 62), wpa_supplicant's station defaults.
++ */
++static void
++send_assoc_ies(void)
++{
++	static const uint8_t ext_cap[] = { 0x7f, 8, 0x04, 0, 0, 0, 0, 0, 0, 0x40 };
++	uint8_t s[64];
++	int e;
++
++	sig_hdr(s, 0x2004, 1);
++	put16(s + 12, 0x0010);                  /* FAPI_PURPOSE_ASSOCIATION_REQUEST */
++	e = sig_send(s, 26, ext_cap, sizeof(ext_cap));
++	printf("SWEET A8 WIFI: association elements: error %d\n", e);
++}
 +
 +static void
 +send_add_vif(void)
@@ -1340,6 +1360,8 @@ index f638996..5bd2b3b 100644
 +	d[0] = 0;                               /* SSID element; no RSN element for an open network */
 +	d[1] = (uint8_t)l;
 +	memcpy(d + 2, nets[join_idx].ssid, l);
++	send_assoc_ies();
++	fwlog_left = 150;                       /* firmware debug text during the join */
 +	e = sig_send(s, 34, d, 2 + l);
 +	printf("SWEET A8 WIFI: connect request to %s on %u MHz: error %d\n", nets[join_idx].ssid, nets[join_idx].mhz, e);
 +}
@@ -1365,6 +1387,7 @@ index f638996..5bd2b3b 100644
 +		del_vif();
 +	}
 +	joining = 1;
++	join_retry = 0;
 +	join_t0 = mach_absolute_time();
 +	snprintf(wl_status, sizeof(wl_status), "joining %s...", join_ssid);
 +	wl_publish("on", wl_status);
@@ -1391,7 +1414,20 @@ index f638996..5bd2b3b 100644
 +	uint16_t id = rd16(sig);
 +
 +	wl_sigs++;
-+	if (wl_sigs <= 200 && id != SIG_SCAN_IND && id < 0x8000) {     /* 0x8301 = firmware debug text */
++	if (id == 0x8301) {                     /* firmware debug text: shown while a join is in progress */
++		if (fwlog_left > 0 && dat_len) {
++			char t[121];
++			uint32_t k = 0;
++			fwlog_left--;
++			for (uint32_t i = 0; i < dat_len && k < sizeof(t) - 1; i++) {
++				t[k++] = (dat[i] >= 32 && dat[i] < 127) ? (char)dat[i] : '.';
++			}
++			t[k] = 0;
++			printf("SWEET A8 WIFI: fw %04x %04x %04x: %s\n", rd16(sig + 10), rd16(sig + 12), rd16(sig + 14), t);
++		}
++		return;
++	}
++	if (++log_sigs <= 300 && id != SIG_SCAN_IND) {
 +		printf("SWEET A8 WIFI: signal %#x from the firmware (%u + %u bytes): %04x %04x %04x %04x\n", id, sig_len, dat_len,
 +		    rd16(sig + 10), rd16(sig + 12), rd16(sig + 14), rd16(sig + 16));
 +	}
@@ -1429,7 +1465,17 @@ index f638996..5bd2b3b 100644
 +		}
 +		break;
 +	case SIG_CONNECT_IND:
-+		if (rd16(sig + 12) != 0) {
++		if (dat_len) {                  /* the association response, when the AP sent one */
++			printf("SWEET A8 WIFI: connect frame %u bytes: fc %02x%02x status %02x%02x aid %02x%02x\n", dat_len,
++			    dat[0], dat[1], dat_len > 27 ? dat[27] : 0, dat_len > 26 ? dat[26] : 0, dat_len > 29 ? dat[29] : 0,
++			    dat_len > 28 ? dat[28] : 0);
++		}
++		if (rd16(sig + 12) == 0x800c && !join_retry && join_idx >= 0) {
++			join_retry = 1;         /* HOST_REQUEST_FAILED: try once more on the same vif */
++			printf("SWEET A8 WIFI: join result 0x800c, retrying once\n");
++			join_t0 = mach_absolute_time();
++			send_connect();
++		} else if (rd16(sig + 12) != 0) {
 +			join_failed("join failed", rd16(sig + 12));
 +		} else {
 +			(void)short_sig(SIG_CONNECT_RES);
