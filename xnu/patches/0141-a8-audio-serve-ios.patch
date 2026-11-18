@@ -1,0 +1,293 @@
+diff --git a/bsd/dev/sweet_a8audio.c b/bsd/dev/sweet_a8audio.c
+index 5c0a5ad..a540494 100644
+--- a/bsd/dev/sweet_a8audio.c
++++ b/bsd/dev/sweet_a8audio.c
+@@ -41,6 +41,7 @@
+  *   5 UAIF0    route SPUS 0 -> SIFS1 -> UAIF0, UAIF0 master 2 x 16 bits on, SYSPOWER on, SysMMU passing
+  *   6 tone     RDMA0 on a ring of 1 kHz at -20 dBFS for a8audiosecs (default 3, 1..10), unmuted at a low headphone
+  *              volume; RDMA0's STATUS sampled; then muted and stopped
++ *   8 serve    (xnu 0141) speaker on, Calliope firmware playing a ring that /dev/sweet-audio fills: iOS sound
+  * a8audiovol=N  headphone digital volume register (0x51/0x52) for the tone (default 0x6C, quieter than Samsung's
+  *               0x54; larger = quieter).
+  */
+@@ -53,6 +54,15 @@
+ #include <pexpert/pexpert.h>
+ #include <mach/vm_statistics.h>
+ #include <vm/vm_kern.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void delay(int usec);
+@@ -1176,6 +1186,252 @@ step_calliope_play(void)
+ 	printf("SWEET AUDIO: 7 play: done; did you hear it?\n");
+ }
+ 
++/*
++ * a8audio=8 (xnu 0141): iOS's sound through the speaker, for as long as the system runs.
++ *
++ * iOS's audio server gets its output device from a HAL plug-in of ours (apps/SweetAudio, after Scion's MIT
++ * audio_plugin.c), which writes what it has mixed to /dev/sweet-audio: 48 kHz, 16-bit stereo, whole frames, never
++ * blocking (the same interface as Scion's /dev/hakios-audio, so the plug-in's ioctls are the same numbers).
++ *
++ * Here the Calliope firmware plays RDMA0 round a ring of S_PERIODS x S_PERIOD_BYTES at IOVA RING_IOVA, without end
++ * (one PCM_PLTDAI_TRIGGER start). Where it reads: RDMA0 STATUS bits 27:16 count 16-byte units modulo 4096 (runs
++ * 82..85: 3000 at 250 ms, 1904 at 500 ms, 808 at 750 ms of 48 kHz stereo), so the thread below polls often enough
++ * (every 10 ms, far under the 341 ms that span lasts) and adds the differences into an absolute byte count. The
++ * ring is a multiple of 64 KB, so that count modulo the ring is the read position in it. Writes go a little ahead
++ * of it; what has been played is zeroed behind it, so a writer that stops leaves silence, not a loop.
++ */
++#define S_PERIOD_BYTES  4096u                           /* 1024 frames, 21.3 ms */
++#define S_PERIODS       64u
++#define S_RING          (S_PERIOD_BYTES * S_PERIODS)    /* 256 KB, 1.37 s */
++#define S_BYTES_MS(ms)  ((uint64_t)RATE * 4u * (ms) / 1000u)
++
++struct sweet_audio_volume {
++	uint32_t below;                 /* eighths of a dB under the loudest */
++	uint32_t muted;
++};
++struct sweet_audio_route {
++	uint32_t jack, headphones, generation;
++};
++#define SWEET_AUDIO_SET_VOLUME  _IOW('r', 1, struct sweet_audio_volume)
++#define SWEET_AUDIO_GET_ROUTE   _IOR('r', 2, struct sweet_audio_route)
++
++static LCK_GRP_DECLARE(sa_grp, "sweet_audio");
++static LCK_MTX_DECLARE(sa_mtx, &sa_grp);
++static uint64_t sa_hw, sa_wp, sa_zeroed;        /* absolute byte counts since the trigger */
++static uint32_t sa_unit_last;
++static uint32_t sa_gain = 32768;                /* Q15, from iOS's volume */
++/*
++ * The guard: stock runs NXP's speaker protection (tfadsp.bin) on ABOX's CPU; it does not run here. So the samples
++ * pass a first-order high-pass at about 200 Hz (the small speaker's excursion is in the lows) and never go above a
++ * ceiling, -10 dB by default (the boot phrase played at -11 dBFS peak, heard clearly).
++ */
++static uint32_t sa_cap = 10362;                 /* Q15 ceiling: -10 dB (a8audiocap=0..32768) */
++static int32_t sa_hp_x[2], sa_hp_y[2];          /* high-pass state, left and right */
++#define SA_HP_A         31932                   /* Q15: RC / (RC + dt), fc 200 Hz at 48 kHz */
++static uint32_t sa_muted;
++static uint64_t sa_bytes, sa_dropped, sa_underruns, sa_ticks;
++static int sa_serving;
++
++/* under sa_mtx */
++static void
++sa_poll(void)
++{
++	uint32_t unit = (rd(abox, RDMA0(R_STATUS)) >> 16) & 0xfffu;
++	sa_hw += (uint64_t)((unit - sa_unit_last) & 0xfffu) * 16u;
++	sa_unit_last = unit;
++}
++
++/* under sa_mtx: zero the ring from sa_zeroed up to (not past) `upto` */
++static void
++sa_zero_to(uint64_t upto)
++{
++	if (upto < sa_zeroed) {
++		return;
++	}
++	if (upto - sa_zeroed > S_RING) {
++		sa_zeroed = upto - S_RING;
++	}
++	while (sa_zeroed < upto) {
++		uint32_t at = (uint32_t)(sa_zeroed % S_RING);
++		uint32_t n = (uint32_t)MIN(upto - sa_zeroed, (uint64_t)(S_RING - at));
++		bzero((void *)(cring + at), n);
++		dc_clean(cring + at, n);
++		sa_zeroed += n;
++	}
++}
++
++static int
++sa_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	return sa_serving ? 0 : ENXIO;
++}
++
++static int
++sa_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	return 0;
++}
++
++static int
++sa_write(dev_t dev, struct uio *uio, int ioflag)
++{
++	int16_t buf[1024];
++	int err = 0;
++
++	while (uio_resid(uio) >= 4 && err == 0) {
++		uint32_t len = (uint32_t)MIN((user_ssize_t)sizeof(buf), uio_resid(uio)) & ~3u;
++		uint32_t g;
++		err = uiomove((caddr_t)buf, (int)len, uio);
++		if (err) {
++			break;
++		}
++		lck_mtx_lock(&sa_mtx);
++		g = sa_muted ? 0 : MIN(sa_gain, sa_cap);
++		for (uint32_t i = 0; i < len / 2; i++) {
++			int32_t x = ((int32_t)buf[i] * (int32_t)g) >> 15, c = (int32_t)(i & 1);
++			int32_t y = (int32_t)(((int64_t)SA_HP_A * (sa_hp_y[c] + x - sa_hp_x[c])) >> 15);
++			sa_hp_x[c] = x;
++			sa_hp_y[c] = y;
++			buf[i] = (int16_t)(y > 32767 ? 32767 : y < -32768 ? -32768 : y);
++		}
++		sa_poll();
++		if (sa_wp < sa_hw + S_BYTES_MS(5)) {            /* behind the DMA (a pause or the first write) */
++			if (sa_bytes != 0) {
++				sa_underruns++;
++			}
++			sa_wp = sa_hw + S_BYTES_MS(40);
++		}
++		if (sa_wp + len > sa_hw + S_BYTES_MS(400)) {    /* too far ahead: drop */
++			sa_dropped += len;
++			lck_mtx_unlock(&sa_mtx);
++			continue;
++		}
++		for (uint32_t done = 0; done < len;) {
++			uint32_t at = (uint32_t)(sa_wp % S_RING);
++			uint32_t n = MIN(len - done, S_RING - at);
++			memcpy((void *)(cring + at), (const uint8_t *)buf + done, n);
++			dc_clean(cring + at, n);
++			sa_wp += n;
++			done += n;
++		}
++		sa_bytes += len;
++		lck_mtx_unlock(&sa_mtx);
++	}
++	return err;
++}
++
++/* 10^(-k/160), k = 0..7 eighths of a dB, Q16 */
++static const uint32_t sa_eighths[8] = { 65536, 64599, 63676, 62767, 61870, 60986, 60115, 59256 };
++
++static int
++sa_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	if (cmd == SWEET_AUDIO_SET_VOLUME) {
++		const struct sweet_audio_volume *v = (const struct sweet_audio_volume *)data;
++		uint64_t g = (uint64_t)32768 * sa_eighths[v->below & 7] >> 16;
++		for (uint32_t db = v->below >> 3; db > 0 && g > 0; db--) {
++			g = g * 58409 >> 16;                    /* -1 dB */
++		}
++		if (v->below > 8 * 96) {
++			g = 0;
++		}
++		lck_mtx_lock(&sa_mtx);
++		sa_gain = (uint32_t)g;
++		sa_muted = v->muted;
++		lck_mtx_unlock(&sa_mtx);
++		printf("SWEET AUDIO: serve: volume %u.%u dB under the top%s -> gain %u/32768 (ceiling %u)\n", v->below / 8,
++		    (v->below % 8) * 125, v->muted ? ", muted" : "", (uint32_t)g, sa_cap);
++		return 0;
++	}
++	if (cmd == SWEET_AUDIO_GET_ROUTE) {
++		bzero(data, sizeof(struct sweet_audio_route));  /* the speaker; no jack detection yet */
++		return 0;
++	}
++	return ENOTTY;
++}
++
++static const struct cdevsw sa_cdevsw = {
++	.d_open       = sa_open,
++	.d_close      = sa_close,
++	.d_read       = eno_rdwrt,
++	.d_write      = sa_write,
++	.d_ioctl      = sa_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static int sa_chan;
++
++static void
++sa_thread(void *arg, wait_result_t wr)
++{
++	uint64_t said = 0;
++	for (;;) {
++		uint64_t deadline;
++		lck_mtx_lock(&sa_mtx);
++		sa_poll();
++		sa_zero_to(sa_hw);
++		lck_mtx_unlock(&sa_mtx);
++		(void)ipc_rx_poll();
++		if (++sa_ticks % 6000 == 0 && sa_bytes != said) {     /* a line a minute while something plays */
++			said = sa_bytes;
++			printf("SWEET AUDIO: serve: %llu KB played, %llu KB dropped, %llu underruns, DMA at %llu KB\n",
++			    sa_bytes >> 10, sa_dropped >> 10, sa_underruns, sa_hw >> 10);
++		}
++		clock_interval_to_deadline(10, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&sa_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static void
++step_serve(void)
++{
++	thread_t t;
++	int major;
++	uint32_t s0, s1;
++
++	(void)PE_parse_boot_argn("a8audiocap", &sa_cap, sizeof(sa_cap));
++	sa_cap = MIN(sa_cap, 32768u);
++	if (calliope_boot() < 0) {
++		return;
++	}
++	bzero((void *)cring, S_RING);
++	dc_clean(cring, S_RING);
++	(void)pcm("PCM_PLTDAI_OPEN", 11, 0, 0, 0, 1);
++	(void)pcm("PCM_SET_BUFFER", 20, RING_IOVA, S_PERIOD_BYTES, S_PERIODS, 1);
++	(void)pcm("PCM_PLTDAI_HW_PARAMS (48000 Hz, 16 bit, 2 ch)", 14, RATE, 16, 2, 1);
++	(void)pcm("PCM_PLTDAI_PREPARE", 16, 0, 0, 0, 1);
++	sa_unit_last = (rd(abox, RDMA0(R_STATUS)) >> 16) & 0xfffu;
++	(void)pcm("PCM_PLTDAI_TRIGGER (start)", 17, 1, 0, 0, 0);
++	s0 = rd(abox, RDMA0(R_STATUS));
++	delay(100000);
++	s1 = rd(abox, RDMA0(R_STATUS));
++	printf("SWEET AUDIO: serve: RDMA0 status %#x -> %#x over 100 ms (expect ~1200 units), ceiling %u/32768\n", s0, s1,
++	    sa_cap);
++	major = cdevsw_add(-1, &sa_cdevsw);
++	if (major < 0) {
++		printf("SWEET AUDIO: serve: no character device major\n");
++		return;
++	}
++	if (devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-audio") == NULL) {
++		printf("SWEET AUDIO: serve: devfs_make_node failed\n");
++	}
++	sa_serving = 1;
++	if (kernel_thread_start(sa_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++	printf("SWEET AUDIO: serve: /dev/sweet-audio ready (major %d), ring %u x %u bytes at IOVA %#x\n", major,
++	    S_PERIODS, S_PERIOD_BYTES, RING_IOVA);
++}
++
+ void
+ sweet_a8_audio_run(void)
+ {
+@@ -1206,6 +1462,11 @@ sweet_a8_audio_run(void)
+ 	if (n < 5 || !step_uaif()) {
+ 		return;
+ 	}
++	if (n >= 8) {                   /* xnu 0141: serve iOS; the speaker and the firmware stay on */
++		step_speaker_start();
++		step_serve();
++		return;
++	}
+ 	if (n >= 6) {
+ 		unsigned spk = 1;
+ 		(void)PE_parse_boot_argn("a8spk", &spk, sizeof(spk));

@@ -14,8 +14,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Sweet Connect
         run: bash apps/SweetConnect/build.sh
+      - name: Sweet Audio
+        run: bash apps/SweetAudio/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: SweetConnect
           path: |
             apps/SweetConnect/out/SweetConnect.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweetAudio
+          path: |
+            apps/SweetAudio/out/SweetAudio.tar
