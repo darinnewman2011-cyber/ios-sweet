@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..58bcbcd 100644
+index f638996..d8eed73 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,2458 @@
+@@ -1,411 +1,2462 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -2339,8 +2339,10 @@ index f638996..58bcbcd 100644
 +bt_say(const char *what, int i)
 +{
 +	const char *nm = (i >= 0 && bt_dev[i].name[0]) ? bt_dev[i].name : "device";
++	char w[sizeof(bt_status)];
 +
-+	snprintf(bt_status, sizeof(bt_status), "%s: %s", nm, what);
++	strlcpy(w, what, sizeof(w));                    /* `what` is often bt_status itself */
++	snprintf(bt_status, sizeof(bt_status), "%s: %s", nm, w);
 +	printf("SWEET A8 BT: %s\n", bt_status);
 +	bt_publish("on", bt_status);
 +}
@@ -2368,9 +2370,11 @@ index f638996..58bcbcd 100644
 +	if (n < 2) {
 +		return;
 +	}
-+	if (bt_events++ < 40) {
-+		printf("SWEET A8 BT: event %#x (%u bytes) %02x %02x %02x %02x %02x %02x\n", code, n, n > 2 ? e[2] : 0,
-+		    n > 3 ? e[3] : 0, n > 4 ? e[4] : 0, n > 5 ? e[5] : 0, n > 6 ? e[6] : 0, n > 7 ? e[7] : 0);
++	/* the first 40 events, then every event that is not a scan result (connections and pairing in full) */
++	if (bt_events++ < 40 || (code != 0x02 && code != 0x22 && code != 0x2f && code != 0x3e && code != 0x13)) {
++		printf("SWEET A8 BT: event %#x (%u bytes) %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", code, n,
++		    n > 2 ? e[2] : 0, n > 3 ? e[3] : 0, n > 4 ? e[4] : 0, n > 5 ? e[5] : 0, n > 6 ? e[6] : 0, n > 7 ? e[7] : 0,
++		    n > 8 ? e[8] : 0, n > 9 ? e[9] : 0, n > 10 ? e[10] : 0, n > 11 ? e[11] : 0);
 +	}
 +	if (code == 0x0e && n >= 6) {                   /* Command Complete: ncmd, opcode, status, ... */
 +		uint16_t op = (uint16_t)(e[3] | e[4] << 8);
