@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..db6304b 100644
+index f638996..ad4388d 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1162 @@
+@@ -1,411 +1,1671 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -682,6 +682,19 @@ index f638996..db6304b 100644
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_dl.h>
++#include <net/if_types.h>
++#include <net/if_ether.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/route.h>
++#include <netinet/in.h>
++#include <kern/locks.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -1031,6 +1044,11 @@ index f638996..db6304b 100644
 +static volatile int join_req;
 +static int vif_up, joining, connected;  /* station vif 1 added; join in progress; associated */
 +static uint32_t rx_frames;
++static ifnet_t wl_ifp;
++static int dh_state, dh_tries;  /* DHCP: 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 ACKed, 4 configured, 5 gave up */
++static char net_note[96];
++static void net_attach(void);
++static void net_rx(uint16_t dud, const uint8_t *f, uint32_t n);
 +
 +static inline void wl_dmb(void) { __asm__ volatile ("dmb sy" ::: "memory"); }
 +static inline void wl_dsb(void) { __asm__ volatile ("dsb sy" ::: "memory"); }
@@ -1278,6 +1296,10 @@ index f638996..db6304b 100644
 +		vif_up = 0;
 +	}
 +	connected = 0;
++	dh_state = 0;
++	if (wl_ifp) {
++		ifnet_set_flags(wl_ifp, 0, IFF_RUNNING);
++	}
 +}
 +
 +static int join_idx = -1;
@@ -1361,7 +1383,7 @@ index f638996..db6304b 100644
 +	uint16_t id = rd16(sig);
 +
 +	wl_sigs++;
-+	if (wl_sigs <= 40 && id != SIG_SCAN_IND) {
++	if (wl_sigs <= 200 && id != SIG_SCAN_IND && id < 0x8000) {     /* 0x8301 = firmware debug text */
 +		printf("SWEET A8 WIFI: signal %#x from the firmware (%u + %u bytes): %04x %04x %04x %04x\n", id, sig_len, dat_len,
 +		    rd16(sig + 10), rd16(sig + 12), rd16(sig + 14), rd16(sig + 16));
 +	}
@@ -1406,6 +1428,10 @@ index f638996..db6304b 100644
 +			joining = 0;
 +			connected = 1;
 +			rx_frames = 0;
++			dh_state = 0;
++			dh_tries = 0;
++			net_note[0] = 0;
++			net_attach();
 +			snprintf(wl_status, sizeof(wl_status), "connected to %s", join_ssid);
 +			printf("SWEET A8 WIFI: %s\n", wl_status);
 +			wl_publish("on", wl_status);
@@ -1432,7 +1458,7 @@ index f638996..db6304b 100644
 +	while (r != w) {
 +		uint32_t ref = rd(shm, wl + HC_Q(q) + 4u * r);
 +		if (ref >= wl && ref < wl + WL_SIZE - 64) {
-+			static uint8_t rxb[2048];
++			static uint8_t rxb[8192];
 +			uint16_t sbuf = rd16(ref + 10), len = rd16(ref + 12), head = rd16(ref + 14);
 +			uint8_t flag = rd8(ref + 4);
 +			uint32_t n = 0, c = 0;
@@ -1459,6 +1485,9 @@ index f638996..db6304b 100644
 +			}
 +			if (q == Q_TH_DAT) {
 +				rx_frames++;
++				if ((flag & 1) && sbuf >= 4 + 14 && rd16(ref + 24) == 0x1300) {
++					net_rx(rd16(ref + 24 + 12), rxb, n);
++				}
 +			}
 +			(void)q_put(Q_TH_RFB, ref);
 +		}
@@ -1518,6 +1547,481 @@ index f638996..db6304b 100644
 +	ring_r4(mgmt_out.wbit);
 +}
 +
++/*
++ * ---- en2: the Wi-Fi link as an Ethernet interface for iOS ----
++ * Legacy-model ifnet with the stock ether_* demux/framer, so ARP and IPv4 are XNU's own. Frames go out as
++ * MA_UNITDATA_REQ (IEEE 802.3 frame, peer index 1 = the AP) from the host data pool, and come in as
++ * MA_UNITDATA_IND on TH_DAT (802.3 or A-MSDU). There is no IOKit network family in this kernel, so configd does not
++ * adopt the interface: a small DHCP client here sets the address and default route, and a self-test fetches
++ * http://1.1.1.1/ to prove the path. DNS for apps needs configd (next step).
++ */
++#define TXQ             64
++#define DAT_SLOTS       ((WL_CTL - WL_TX) / WL_CTL_SLOT)
++LCK_GRP_DECLARE(sweet_wl_grp, "sweet_wl");
++LCK_MTX_DECLARE(sweet_wl_txlock, &sweet_wl_grp);
++static mbuf_t txq[TXQ];
++static unsigned txq_w, txq_r, dat_slot;
++static uint16_t host_tag;
++static uint32_t tx_frames, tx_drops, rx_other;
++static uint8_t dh_ip[4], dh_srv[4], dh_mask[4], dh_gw[4], dh_dns[4];
++static uint32_t dh_xid;
++static uint64_t dh_t;
++static volatile int net_note_new;
++
++static errno_t
++en_output(ifnet_t ifp, mbuf_t m)
++{
++	int ok = 0;
++
++	(void)ifp;
++	lck_mtx_lock(&sweet_wl_txlock);
++	if (connected && txq_w - txq_r < TXQ) {
++		txq[txq_w++ % TXQ] = m;
++		ok = 1;
++	}
++	lck_mtx_unlock(&sweet_wl_txlock);
++	if (!ok) {
++		tx_drops++;
++		mbuf_freem(m);
++		return 0;
++	}
++	thread_wakeup(&wlbt_chan);
++	return 0;
++}
++
++static errno_t
++en_ioctl(ifnet_t ifp, u_long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++	case SIOCSIFMTU:
++		return 0;
++	default:
++		return ether_ioctl(ifp, (u_int32_t)cmd, data);
++	}
++}
++
++/* One Ethernet frame as MA_UNITDATA_REQ on FH_DAT; called only from the Wi-Fi thread. */
++static int
++dat_send(const uint8_t *f, uint32_t len)
++{
++	uint32_t m = wl + WL_TX + WL_CTL_SLOT * dat_slot;
++	uint32_t sbuf = ((20u + 4u + 34u + 3u) & ~3u) - 20u;
++	uint32_t dbuf = len + headroom + tailroom;
++	uint8_t s[64];
++
++	if (len < 14 || 20u + sbuf + dbuf > WL_CTL_SLOT) {
++		return E2BIG;
++	}
++	dat_slot = (dat_slot + 1) % DAT_SLOTS;
++	sig_hdr(s, 0x1000, 1);                  /* MA_UNITDATA_REQ on vif 1 */
++	host_tag = (uint16_t)(host_tag + 4);
++	put16(s + 12, host_tag);
++	put16(s + 14, 0x8000);                  /* FAPI_PRIORITY_CONTENTION */
++	put16(s + 16, 1);                       /* peer index: the AP */
++	put16(s + 18, 1);                       /* FAPI_DATAUNITDESCRIPTOR_IEEE802_3_FRAME */
++	for (uint32_t o = 0; o < 20u + sbuf + headroom; o += 4) {
++		wr(shm, m + o, 0);
++	}
++	wr8(m + 4, 1 | 4);                      /* SIG | OBOUND */
++	wr8(m + 5, 0);                          /* MBULK_CLASS_FROM_HOST_DAT, AC 0 */
++	wr8(m + 6, 0 | (1 << 3) | (1 << 1));    /* data pool 0, colour: peer 1, vif 1 */
++	wr8(m + 7, 1);
++	wr16(m + 8, (uint16_t)dbuf);
++	wr16(m + 10, (uint16_t)sbuf);
++	wr16(m + 12, (uint16_t)len);
++	wr16(m + 14, (uint16_t)(sbuf + headroom));
++	for (uint32_t i = 0; i < 34; i++) {
++		wr8(m + 24 + i, s[i]);
++	}
++	for (uint32_t i = 0; i < len; i++) {
++		wr8(m + 20 + sbuf + headroom + i, f[i]);
++	}
++	wl_dsb();
++	if (q_put(Q_FH_DAT, m) != 0) {
++		tx_drops++;
++		return ENOSPC;
++	}
++	tx_frames++;
++	return 0;
++}
++
++static void
++net_tx_drain(void)
++{
++	static uint8_t fb[1600];
++
++	for (;;) {
++		mbuf_t m = NULL;
++		lck_mtx_lock(&sweet_wl_txlock);
++		if (txq_r != txq_w) {
++			m = txq[txq_r++ % TXQ];
++		}
++		lck_mtx_unlock(&sweet_wl_txlock);
++		if (!m) {
++			return;
++		}
++		size_t len = mbuf_pkthdr_len(m);
++		if (len <= sizeof(fb) && mbuf_copydata(m, 0, len, fb) == 0) {
++			struct ifnet_stat_increment_param st = { 0 };
++			if (dat_send(fb, (uint32_t)len) == 0) {
++				st.packets_out = 1;
++				st.bytes_out = (u_int32_t)len;
++			} else {
++				st.errors_out = 1;
++			}
++			ifnet_stat_increment(wl_ifp, &st);
++		}
++		mbuf_freem(m);
++	}
++}
++
++static uint16_t
++ip_sum(const uint8_t *p, int n)
++{
++	uint32_t s = 0;
++
++	for (int i = 0; i + 1 < n; i += 2) {
++		s += (uint32_t)p[i] << 8 | p[i + 1];
++	}
++	while (s >> 16) {
++		s = (s & 0xffff) + (s >> 16);
++	}
++	return (uint16_t)~s;
++}
++
++static void
++dhcp_send(int type)
++{
++	uint8_t f[14 + 20 + 8 + 300];
++	uint8_t *ip = f + 14, *u = ip + 20, *b = u + 8, *o = b + 240;
++	uint16_t s;
++
++	memset(f, 0, sizeof(f));
++	memset(f, 0xff, 6);
++	memcpy(f + 6, wl_mac, 6);
++	f[12] = 0x08;
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)((20 + 8 + 300) >> 8);
++	ip[3] = (uint8_t)(20 + 8 + 300);
++	ip[8] = 64;
++	ip[9] = 17;
++	memset(ip + 16, 0xff, 4);
++	s = ip_sum(ip, 20);
++	ip[10] = (uint8_t)(s >> 8);
++	ip[11] = (uint8_t)s;
++	u[1] = 68;
++	u[3] = 67;
++	u[4] = (uint8_t)((8 + 300) >> 8);
++	u[5] = (uint8_t)(8 + 300);
++	b[0] = 1;                               /* BOOTREQUEST, Ethernet, 6-byte address */
++	b[1] = 1;
++	b[2] = 6;
++	memcpy(b + 4, &dh_xid, 4);
++	b[10] = 0x80;                           /* broadcast the reply: no address yet */
++	memcpy(b + 28, wl_mac, 6);
++	b[236] = 0x63; b[237] = 0x82; b[238] = 0x53; b[239] = 0x63;
++	*o++ = 53; *o++ = 1; *o++ = (uint8_t)type;
++	*o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, wl_mac, 6); o += 6;
++	if (type == 3) {
++		*o++ = 50; *o++ = 4; memcpy(o, dh_ip, 4); o += 4;
++		*o++ = 54; *o++ = 4; memcpy(o, dh_srv, 4); o += 4;
++	}
++	*o++ = 12; *o++ = 6; memcpy(o, "iPhone", 6); o += 6;
++	*o++ = 55; *o++ = 3; *o++ = 1; *o++ = 3; *o++ = 6;
++	*o++ = 255;
++	(void)dat_send(f, sizeof(f));
++	dh_t = mach_absolute_time();
++}
++
++static void
++dhcp_rx(const uint8_t *ip, uint32_t n)
++{
++	uint32_t ihl = (ip[0] & 15u) * 4u;
++	const uint8_t *b;
++	int type = 0;
++	uint8_t mask[4] = { 255, 255, 255, 0 }, gw[4] = { 0 }, dns[4] = { 0 }, srv[4] = { 0 };
++
++	if (n < ihl + 8 + 240 || ip[ihl + 3] != 68) {
++		return;
++	}
++	b = ip + ihl + 8;
++	if (b[0] != 2 || memcmp(b + 4, &dh_xid, 4) != 0 || b[236] != 0x63 || b[239] != 0x63) {
++		return;
++	}
++	for (uint32_t p = 240; p + 2 <= n - ihl - 8 && b[p] != 255;) {
++		uint8_t c = b[p], l = b[p + 1];
++		if (c == 0) {
++			p++;
++			continue;
++		}
++		if (p + 2 + l > n - ihl - 8) {
++			break;
++		}
++		if (c == 53 && l >= 1) {
++			type = b[p + 2];
++		} else if (c == 1 && l >= 4) {
++			memcpy(mask, b + p + 2, 4);
++		} else if (c == 3 && l >= 4) {
++			memcpy(gw, b + p + 2, 4);
++		} else if (c == 6 && l >= 4) {
++			memcpy(dns, b + p + 2, 4);
++		} else if (c == 54 && l >= 4) {
++			memcpy(srv, b + p + 2, 4);
++		}
++		p += 2u + l;
++	}
++	printf("SWEET A8 WIFI: DHCP message %d: %u.%u.%u.%u\n", type, b[16], b[17], b[18], b[19]);
++	if (type == 2 && dh_state == 1) {
++		memcpy(dh_ip, b + 16, 4);
++		memcpy(dh_srv, srv, 4);
++		dh_state = 2;
++		dhcp_send(3);
++	} else if (type == 5 && dh_state == 2) {
++		memcpy(dh_ip, b + 16, 4);
++		memcpy(dh_mask, mask, 4);
++		memcpy(dh_gw, gw, 4);
++		memcpy(dh_dns, dns, 4);
++		dh_state = 3;
++	} else if (type == 6) {
++		dh_state = 0;                   /* NAK: start over */
++	}
++}
++
++/* One received Ethernet frame (12 address bytes + type/payload): DHCP replies are ours, the rest goes to XNU. */
++static void
++net_deliver(const uint8_t *addrs, const uint8_t *rest, uint32_t rlen)
++{
++	mbuf_t m = NULL;
++	uint32_t len = 12 + rlen;
++
++	if (rlen >= 2 + 20 + 8 && rest[0] == 0x08 && rest[1] == 0x00 && rest[2 + 9] == 17 &&
++	    rlen >= 2u + (rest[2] & 15u) * 4u + 8u && rest[2 + ((rest[2] & 15) * 4) + 3] == 68) {
++		dhcp_rx(rest + 2, rlen - 2);
++		return;
++	}
++	if (!wl_ifp || len < 14 || len > 2000 || mbuf_getpacket(MBUF_DONTWAIT, &m) != 0) {
++		return;
++	}
++	if (mbuf_maxlen(m) < len) {
++		mbuf_freem(m);
++		return;
++	}
++	memcpy(mbuf_data(m), addrs, 12);
++	memcpy((uint8_t *)mbuf_data(m) + 12, rest, rlen);
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	mbuf_pkthdr_setrcvif(m, wl_ifp);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	mbuf_setdata(m, (uint8_t *)mbuf_data(m) + 14, len - 14);
++	mbuf_pkthdr_adjustlen(m, -14);
++	struct ifnet_stat_increment_param st = { 0 };
++	st.packets_in = 1;
++	st.bytes_in = len;
++	ifnet_input(wl_ifp, m, &st);
++}
++
++static void
++net_rx(uint16_t dud, const uint8_t *f, uint32_t n)
++{
++	if (dud == 1 && n >= 14) {                      /* IEEE 802.3 frame */
++		net_deliver(f, f + 12, n - 12);
++	} else if (dud == 3) {                          /* A-MSDU: DA SA len | LLC/SNAP type payload | pad to 4 */
++		for (uint32_t p = 0; p + 14 <= n;) {
++			uint32_t ml = (uint32_t)f[p + 12] << 8 | f[p + 13];
++			if (ml < 8 || p + 14 + ml > n) {
++				break;
++			}
++			net_deliver(f + p, f + p + 14 + 6, ml - 6);
++			p += (14 + ml + 3) & ~3u;
++		}
++	} else {
++		rx_other++;
++	}
++}
++
++static void
++net_attach(void)
++{
++	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++	struct ifnet_init_eparams p;
++	struct sockaddr_dl sdl;
++	errno_t e;
++
++	if (wl_ifp) {
++		ifnet_set_flags(wl_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++		return;
++	}
++	memset(&p, 0, sizeof(p));
++	p.ver = IFNET_INIT_CURRENT_VERSION;
++	p.len = sizeof(p);
++	p.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
++	p.uniqueid = "sweet-a8-wlan";
++	p.uniqueid_len = 13;
++	p.name = "en";
++	p.unit = 2;
++	p.family = IFNET_FAMILY_ETHERNET;
++	p.type = IFT_ETHER;
++	p.output = en_output;
++	p.demux = ether_demux;
++	p.add_proto = ether_add_proto;
++	p.del_proto = ether_del_proto;
++	p.check_multi = ether_check_multi;
++	p.framer_extended = ether_frameout_extended;
++	p.ioctl = en_ioctl;
++	p.broadcast_addr = bcast;
++	p.broadcast_len = 6;
++	e = ifnet_allocate_extended(&p, &wl_ifp);
++	if (e) {
++		printf("SWEET A8 WIFI: ifnet_allocate_extended: %d\n", e);
++		wl_ifp = NULL;
++		return;
++	}
++	ifnet_set_mtu(wl_ifp, 1500);
++	ifnet_set_hdrlen(wl_ifp, 14);
++	ifnet_set_addrlen(wl_ifp, 6);
++	ifnet_set_baudrate(wl_ifp, 72000000);
++	ifnet_set_flags(wl_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST | IFF_UP | IFF_RUNNING, 0xffff);
++	memset(&sdl, 0, sizeof(sdl));
++	sdl.sdl_len = sizeof(sdl);
++	sdl.sdl_family = AF_LINK;
++	sdl.sdl_type = IFT_ETHER;
++	sdl.sdl_alen = 6;
++	memcpy(LLADDR(&sdl), wl_mac, 6);
++	e = ifnet_attach(wl_ifp, &sdl);
++	printf("SWEET A8 WIFI: en2 attach %d, inet plumb %d\n", e, e ? -1 : proto_plumb(PF_INET, wl_ifp));
++}
++
++static void
++sin_set(struct sockaddr_in *s, const uint8_t *a)
++{
++	memset(s, 0, sizeof(*s));
++	s->sin_len = sizeof(*s);
++	s->sin_family = AF_INET;
++	if (a) {
++		memcpy(&s->sin_addr, a, 4);
++	}
++}
++
++static void
++net_test(void *arg, wait_result_t w)
++{
++	static const uint8_t one[4] = { 1, 1, 1, 1 };
++	static const char req[] = "GET / HTTP/1.0\r\nHost: one.one.one.one\r\n\r\n";
++	struct sockaddr_in sa;
++	struct timeval tv = { 15, 0 };
++	socket_t so = NULL;
++	char line[48] = "";
++	errno_t e;
++
++	(void)arg;
++	(void)w;
++	sin_set(&sa, one);
++	sa.sin_port = htons(80);
++	e = sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &so);
++	if (e == 0) {
++		(void)sock_setsockopt(so, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++		(void)sock_setsockopt(so, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++		e = sock_connect(so, (struct sockaddr *)&sa, 0);
++		if (e == 0) {
++			struct iovec iov = { (void *)(uintptr_t)req, sizeof(req) - 1 };
++			struct msghdr mh;
++			size_t got = 0;
++			memset(&mh, 0, sizeof(mh));
++			mh.msg_iov = &iov;
++			mh.msg_iovlen = 1;
++			e = sock_send(so, &mh, 0, &got);
++			if (e == 0) {
++				iov.iov_base = line;
++				iov.iov_len = sizeof(line) - 1;
++				e = sock_receive(so, &mh, MSG_WAITALL, &got);
++				line[got < sizeof(line) ? got : sizeof(line) - 1] = 0;
++				for (char *c = line; *c; c++) {
++					if (*c == '\r' || *c == '\n') {
++						*c = 0;
++						break;
++					}
++				}
++				if (got > 0) {
++					e = 0;
++				}
++			}
++		}
++		sock_close(so);
++	}
++	if (e == 0 && line[0]) {
++		snprintf(net_note, sizeof(net_note), "internet works (1.1.1.1 answered %s)", line);
++	} else {
++		snprintf(net_note, sizeof(net_note), "internet test failed (error %d)", e);
++	}
++	printf("SWEET A8 WIFI: %s\n", net_note);
++	net_note_new = 1;
++	thread_wakeup(&wlbt_chan);
++}
++
++static void
++net_config(void)
++{
++	struct ifaliasreq ifra;
++	struct sockaddr_in dst, gw, msk;
++	uint8_t bc[4];
++	socket_t so = NULL;
++	errno_t e, er = -1;
++	thread_t t;
++
++	memset(&ifra, 0, sizeof(ifra));
++	strlcpy(ifra.ifra_name, "en2", sizeof(ifra.ifra_name));
++	for (int i = 0; i < 4; i++) {
++		bc[i] = (uint8_t)(dh_ip[i] | ~dh_mask[i]);
++	}
++	sin_set((struct sockaddr_in *)&ifra.ifra_addr, dh_ip);
++	sin_set((struct sockaddr_in *)&ifra.ifra_broadaddr, bc);
++	sin_set((struct sockaddr_in *)&ifra.ifra_mask, dh_mask);
++	e = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (e == 0) {
++		e = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	if (e == 0 && (dh_gw[0] | dh_gw[1] | dh_gw[2] | dh_gw[3])) {
++		sin_set(&dst, NULL);
++		sin_set(&gw, dh_gw);
++		sin_set(&msk, NULL);
++		er = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gw, (struct sockaddr *)&msk,
++		    RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++	}
++	snprintf(net_note, sizeof(net_note), "IP %u.%u.%u.%u, router %u.%u.%u.%u%s", dh_ip[0], dh_ip[1], dh_ip[2], dh_ip[3],
++	    dh_gw[0], dh_gw[1], dh_gw[2], dh_gw[3], e ? " (address not set)" : er ? " (no default route)" : ", testing...");
++	printf("SWEET A8 WIFI: DHCP bound: %s; address %d route %d; DNS %u.%u.%u.%u\n", net_note, e, er, dh_dns[0], dh_dns[1],
++	    dh_dns[2], dh_dns[3]);
++	net_note_new = 1;
++	if (e == 0 && kernel_thread_start(net_test, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
++/* Called every loop pass while associated. */
++static void
++net_tick(uint64_t now, uint64_t lim3)
++{
++	net_tx_drain();
++	if (dh_state == 0 || ((dh_state == 1 || dh_state == 2) && mach_absolute_time() - dh_t > lim3)) {
++		if (dh_tries++ >= 10) {
++			dh_state = 5;
++			snprintf(net_note, sizeof(net_note), "no address from the router (DHCP got no answer)");
++			net_note_new = 1;
++			return;
++		}
++		dh_xid = (uint32_t)mach_absolute_time() ^ 0x5a3c0000u;
++		dh_state = 1;
++		dhcp_send(1);
++	} else if (dh_state == 3) {
++		dh_state = 4;
++		net_config();
++	}
++}
++
 +static void
 +put_cfg(uint32_t at, uint16_t ver, uint32_t mib_sz)
 +{
@@ -1545,7 +2049,7 @@ index f638996..db6304b 100644
 +	void *bpa = NULL;
 +	int bsz = 0, cfm = 0;
 +	uint32_t mib_sz = 0, ver, cfg;
-+	uint64_t now, lim15, lim2, pub_t0 = 0;
++	uint64_t now, lim15, lim2, lim3, pub_t0 = 0;
 +	char d[200];
 +
 +	heap_next = (heap_next + 0xfffu) & ~0xfffu;
@@ -1602,6 +2106,7 @@ index f638996..db6304b 100644
 +	scan_req = 1;
 +	nanoseconds_to_absolutetime(15ull * NSEC_PER_SEC, &lim15);
 +	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &lim2);
++	nanoseconds_to_absolutetime(3ull * NSEC_PER_SEC, &lim3);
 +	for (;;) {
 +		wl_drain(Q_TH_CTRL);
 +		wl_drain(Q_TH_DAT);
@@ -1617,20 +2122,24 @@ index f638996..db6304b 100644
 +			join_req = 0;
 +			start_join();
 +		}
-+		if (joining && now - join_t0 > lim15) {
++		if (joining && mach_absolute_time() - join_t0 > lim15) {        /* join_t0 can be newer than now (ios90) */
 +			join_failed("join timed out", 0);
 +		}
 +		if (scan_req && !scanning && !joining) {
 +			scan_req = 0;
 +			send_scan();
 +		}
-+		if (connected && now - pub_t0 > lim2) {
++		if (connected) {
++			net_tick(now, lim3);
++		}
++		if (connected && (net_note_new || now - pub_t0 > lim2)) {
 +			static uint32_t last_rx;
 +			pub_t0 = now;
-+			if (rx_frames != last_rx) {
++			if (net_note_new || rx_frames != last_rx) {
++				net_note_new = 0;
 +				last_rx = rx_frames;
-+				snprintf(wl_status, sizeof(wl_status), "connected to %s (%u packets received; internet is the next build)",
-+				    join_ssid, rx_frames);
++				snprintf(wl_status, sizeof(wl_status), "connected to %s: %s (%u in / %u out)", join_ssid,
++				    net_note[0] ? net_note : "getting an address...", rx_frames, tx_frames);
 +				wl_publish("on", wl_status);
 +			}
 +		}
