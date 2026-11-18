@@ -75,6 +75,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include "sweet_audio.h"
@@ -272,6 +273,7 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	syslog(LOG_NOTICE, "SweetAudio: %s", line);   /* also into the unified log (the HAL's stderr goes nowhere) */
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
@@ -1112,5 +1114,8 @@ static AudioServerPlugInDriverInterface *driver = &interface;
 void *
 HakiosAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
 {
-	return CFEqual(type, kAudioServerPlugInTypeUUID) ? &driver : NULL;
+	Boolean ok = CFEqual(type, kAudioServerPlugInTypeUUID);
+
+	say("hakios: audio: factory called by pid %d, type %s\n", getpid(), ok ? "AudioServerPlugIn" : "other");
+	return ok ? &driver : NULL;
 }
