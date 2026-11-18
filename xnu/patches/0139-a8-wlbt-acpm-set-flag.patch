@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..e9b51fa 100644
+index f638996..ede12ec 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1733 @@
+@@ -1,411 +1,1750 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1312,7 +1312,7 @@ index f638996..e9b51fa 100644
 +
 +static int join_idx = -1;
 +static uint64_t join_t0;
-+static int fwlog_left, join_retry;
++static int fwlog_left, join_retry, auto_join;
 +static uint32_t log_sigs;
 +
 +/*
@@ -1406,6 +1406,9 @@ index f638996..e9b51fa 100644
 +	printf("SWEET A8 WIFI: %s\n", wl_status);
 +	del_vif();
 +	wl_publish("on", wl_status);
++	if (auto_join > 0) {
++		scan_req = 1;                   /* a8join: scan again, then the next attempt */
++	}
 +}
 +
 +static void
@@ -1448,6 +1451,10 @@ index f638996..e9b51fa 100644
 +		snprintf(wl_status, sizeof(wl_status), "%d networks found (%u results)", n_nets, wl_scan_inds);
 +		printf("SWEET A8 WIFI: scan done: %u results, %d networks\n", wl_scan_inds, n_nets);
 +		wl_publish("on", wl_status);
++		if (auto_join > 0 && !connected && !joining) {
++			auto_join--;
++			join_req = 1;
++		}
 +		break;
 +	case SIG_ADD_VIF_CFM:
 +		if (rd16(sig + 12) != 0) {
@@ -2165,6 +2172,16 @@ index f638996..e9b51fa 100644
 +	}
 +	wl_publish("on", d);
 +	sweet_a8net_set_handler(0, wl_cmd);
++	/* Unattended test: boot-arg a8join=SSID joins that open network after each scan, up to 3 attempts. */
++	{
++		char ssid[33] = "";
++		if (PE_parse_boot_argn("a8join", ssid, sizeof(ssid)) && ssid[0]) {
++			ssid[32] = 0;
++			strlcpy(join_ssid, ssid, sizeof(join_ssid));
++			auto_join = 3;
++			printf("SWEET A8 WIFI: a8join: will join %s after the scan\n", join_ssid);
++		}
++	}
 +	scan_req = 1;
 +	nanoseconds_to_absolutetime(15ull * NSEC_PER_SEC, &lim15);
 +	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &lim2);
