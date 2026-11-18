@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..18ea90d 100644
+index f638996..db6304b 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1148 @@
+@@ -1,411 +1,1162 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1170,29 +1170,29 @@ index f638996..18ea90d 100644
 +}
 +
 +static void
-+scan_result(int16_t rssi, uint16_t freq_half_mhz, uint32_t f, uint32_t len)
++scan_result(int16_t rssi, uint16_t freq_half_mhz, const uint8_t *f, uint32_t len)
 +{
 +	struct wnet w;
 +	int i;
 +
-+	if (len < 36 || f + len > SHM_SIZE) {
++	if (len < 36) {
 +		return;
 +	}
 +	memset(&w, 0, sizeof(w));
 +	for (i = 0; i < 6; i++) {
-+		w.bssid[i] = rd8(f + 16 + (uint32_t)i);
++		w.bssid[i] = f[16 + i];
 +	}
 +	w.rssi = rssi;
 +	w.mhz = (uint16_t)(freq_half_mhz / 2);
-+	w.secure = (rd8(f + 34) & 0x10) ? 1 : 0;        /* capability: privacy */
++	w.secure = (f[34] & 0x10) ? 1 : 0;        /* capability: privacy */
 +	for (uint32_t p = 36; p + 2 <= len;) {
-+		uint8_t id = rd8(f + p), l = rd8(f + p + 1);
++		uint8_t id = f[p], l = f[p + 1];
 +		if (p + 2 + l > len) {
 +			break;
 +		}
 +		if (id == 0 && l <= 32) {
 +			for (i = 0; i < l; i++) {
-+				char c = (char)rd8(f + p + 2 + (uint32_t)i);
++				char c = (char)f[p + 2 + (uint32_t)i];
 +				w.ssid[i] = (c < 32 || c == 127) ? '?' : c;
 +			}
 +			w.ssid[l] = 0;
@@ -1219,7 +1219,9 @@ index f638996..18ea90d 100644
 +send_scan(void)
 +{
 +	static const uint16_t mhz[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
-+		                        5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825 };
++		                        5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
++		                        5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720,
++		                        5745, 5765, 5785, 5805, 5825 };
 +	uint8_t s[64], d[160];
 +	uint32_t dl = 0, ch;
 +	int e;
@@ -1354,7 +1356,7 @@ index f638996..18ea90d 100644
 +}
 +
 +static void
-+wl_signal(uint32_t sig, uint32_t sig_len, uint32_t dat, uint32_t dat_len)
++wl_signal(uint32_t sig, uint32_t sig_len, const uint8_t *dat, uint32_t dat_len)
 +{
 +	uint16_t id = rd16(sig);
 +
@@ -1377,7 +1379,7 @@ index f638996..18ea90d 100644
 +		break;
 +	case SIG_SCAN_DONE_IND:
 +		scanning = 0;
-+		snprintf(wl_status, sizeof(wl_status), "%d networks found (Join is the next build)", n_nets);
++		snprintf(wl_status, sizeof(wl_status), "%d networks found (%u results)", n_nets, wl_scan_inds);
 +		printf("SWEET A8 WIFI: scan done: %u results, %d networks\n", wl_scan_inds, n_nets);
 +		wl_publish("on", wl_status);
 +		break;
@@ -1430,23 +1432,35 @@ index f638996..18ea90d 100644
 +	while (r != w) {
 +		uint32_t ref = rd(shm, wl + HC_Q(q) + 4u * r);
 +		if (ref >= wl && ref < wl + WL_SIZE - 64) {
++			static uint8_t rxb[2048];
 +			uint16_t sbuf = rd16(ref + 10), len = rd16(ref + 12), head = rd16(ref + 14);
 +			uint8_t flag = rd8(ref + 4);
-+			if (q == Q_TH_CTRL && (flag & 1) && sbuf >= 4 + 10) {
-+				wl_signal(ref + 24, sbuf - 4u, ref + 20u + head, len);
++			uint32_t n = 0, c = 0;
++
++			/* Bulk data: this segment's, then any chained segments (Linux hip4_mbulk_to_skb). Beacons in
++			 * MLME_SCAN_IND arrive as a signal-only head with the frame in the chain (0 networks on ios89). */
++			for (uint32_t i = 0; i < len && n < sizeof(rxb); i++) {
++				rxb[n++] = rd8(ref + 20u + head + i);
++			}
++			if ((flag & 0xc0) == 0xc0) {
++				c = rd(shm, ref + 16);
++			}
++			for (int k = 0; k < 16 && c >= wl && c < wl + WL_SIZE - 64; k++) {
++				uint16_t cl = rd16(c + 12), ch = rd16(c + 14);
++				uint32_t next = (rd8(c + 4) & 0x80) ? rd(shm, c + 16) : 0;
++				for (uint32_t i = 0; i < cl && n < sizeof(rxb); i++) {
++					rxb[n++] = rd8(c + 20u + ch + i);
++				}
++				(void)q_put(Q_TH_RFB, c);
++				c = next;
++			}
++			if ((flag & 1) && sbuf >= 4 + 10 && (q == Q_TH_CTRL || rd16(ref + 24) != 0x1300)) {
++				wl_signal(ref + 24, sbuf - 4u, rxb, n);
 +			}
 +			if (q == Q_TH_DAT) {
 +				rx_frames++;
 +			}
 +			(void)q_put(Q_TH_RFB, ref);
-+			if ((flag & 0xc0) == 0xc0) {
-+				uint32_t c = rd(shm, ref + 16);
-+				for (int k = 0; k < 16 && c >= wl && c < wl + WL_SIZE - 64; k++) {
-+					uint32_t next = (rd8(c + 4) & 0x80) ? rd(shm, c + 16) : 0;
-+					(void)q_put(Q_TH_RFB, c);
-+					c = next;
-+				}
-+			}
 +		}
 +		r++;
 +		q_set(q, 1, r);
