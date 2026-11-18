@@ -220,10 +220,10 @@ index 2f4a199..00614b7 100644
 +}
  #endif /* SWEET_JACKPOTLTE */
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index f638996..52546f7 100644
+index f638996..a0d4aaf 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
-@@ -1,411 +1,1768 @@
+@@ -1,411 +1,1774 @@
 -/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 -/*
 - * Galaxy A8 (2018, jackpotlte) Wi-Fi / Bluetooth, stage 2: wake Samsung's WLBT ("Maxwell") core and see whether its
@@ -1501,6 +1501,12 @@ index f638996..52546f7 100644
 +			snprintf(wl_status, sizeof(wl_status), "connected to %s", join_ssid);
 +			printf("SWEET A8 WIFI: %s\n", wl_status);
 +			wl_publish("on", wl_status);
++		}
++		break;
++	case 0x230d:                            /* MLME_RECEIVED_FRAME_IND: DHCP/EAPOL come this way (ios92i), Linux
++		                                 * slsi_rx_received_frame_ind passes 802.3 ones to the stack */
++		if (rd16(sig + 12) == 1 && connected) {
++			net_rx(1, dat, dat_len);
 +		}
 +		break;
 +	case SIG_DISCONNECTED_IND:
