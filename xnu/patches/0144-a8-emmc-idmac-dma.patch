@@ -1,0 +1,257 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 7a395df..a6cbefb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -608,6 +608,191 @@ mmc_abort(void)
+ 	(void)mmc_wait(MMC_STATUS, STATUS_BUSY, 0, MMC_DATA_NS);
+ }
+ 
++/*
++ * xnu 0144: IDMAC (the controller's own DMA) for multi-sector transfers,
++ * boot-arg sweetmmcdma=1. PIO moved every word through the CPU (~1 MB/s
++ * before 0111, a few MB/s after). Facts from Samsung's dw_mmc.c /
++ * dw_mmc-exynos.h / include/linux/mmc/dw_mmc.h (Exynos7885-Dev
++ * lineage-18.1, read only): 64-bit descriptors des0 control (OWN 31, CH 4,
++ * FD 3, LD 2, DIC 1), des2 buffer 1 size (13 bits, Samsung uses <= 4 KiB),
++ * des4/5 buffer address, des6/7 next descriptor; with the flash memory
++ * protector (FMP, present on this SoC) a descriptor grows to 32 words (IVs
++ * and keys, all zero here = no encryption), so slots are 128 bytes and the
++ * chain pointers are explicit. Registers DBADDRL 0x88 / DBADDRU 0x8c,
++ * IDSTS64 0x90, IDINTEN64 0x94, PLDMND 0x84; start = CTRL.USE_IDMAC, then
++ * BMOD DE|FB, then PLDMND = 1; stop = clear USE_IDMAC, CTRL DMA_RESET, BMOD
++ * SWR. No SysMMU sits in front of this controller (no iommus in the DT).
++ * The CPU caches are not coherent with it: buffers are cleaned before a
++ * write and flushed before and after a read. Descriptors live in the first
++ * 16 KiB of su.dma (the UFS request lists, unused on the A8). Polled, no IRQ.
++ * Any failure stops the DMA, sends CMD12 and redoes the range by PIO; after
++ * MMC_DMA_GIVEUP failures DMA is switched off for the boot.
++ */
++#define MMC_PLDMND      0x084
++#define MMC_DBADDRL     0x088
++#define MMC_DBADDRU     0x08c
++#define MMC_IDSTS64     0x090
++#define MMC_IDINTEN64   0x094
++#define CTRL_DMA_RESET          (1u << 2)
++#define BMOD_SWR                (1u << 0)
++#define BMOD_FB                 (1u << 1)
++#define IDS_TI                  (1u << 0)
++#define IDS_RI                  (1u << 1)
++#define IDS_FBE                 (1u << 2)
++#define IDS_DU                  (1u << 4)
++#define IDS_CES                 (1u << 5)
++#define IDS_ALL                 0x337u
++#define DES0_DIC                (1u << 1)
++#define DES0_LD                 (1u << 2)
++#define DES0_FD                 (1u << 3)
++#define DES0_CH                 (1u << 4)
++#define DES0_OWN                (1u << 31)
++#define MMC_DESC_SLOT   128u
++#define MMC_DESC_MAX    (0x4000u / MMC_DESC_SLOT)       /* 128 */
++#define MMC_DMA_CHUNK   4096u
++#define MMC_DMA_GIVEUP  8
++
++static uint32_t mmc_dma;                        /* boot-arg sweetmmcdma */
++static struct {
++	uint64_t xfers, sectors, fail;
++	uint32_t rint, ids, n, write;
++	uint64_t lba;
++	uint64_t rd_bytes, rd_abs;              /* every file read, PIO or DMA: throughput for the status line */
++} mdma;
++
++static uint64_t
++mmc_kva_pa(const void *va)
++{
++	uintptr_t v = (uintptr_t)va;
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(v & ~(uintptr_t)PAGE_MASK));
++
++	return pn ? ptoa_64(pn) + (v & PAGE_MASK) : 0;
++}
++
++static void
++mmc_dma_stop(void)
++{
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) & ~CTRL_USE_IDMAC);
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_DMA_RESET);
++	(void)mmc_wait(MMC_CTRL, CTRL_DMA_RESET, 0, 10 * NSEC_PER_MSEC);
++	ufs_wr(MMC_BMOD, (ufs_rd(MMC_BMOD) & ~(BMOD_IDMAC_ENABLE | BMOD_FB)) | BMOD_SWR);
++	(void)mmc_wait(MMC_BMOD, BMOD_SWR, 0, 10 * NSEC_PER_MSEC);
++	ufs_wr(MMC_IDSTS64, IDS_ALL);
++}
++
++static int
++mmc_xfer_dma(uint64_t lba, uint32_t n, uint32_t *buf, bool write)
++{
++	uint8_t *dbase = (uint8_t *)su.dma;
++	uint32_t bytes = n * UFS_BLOCK, nd = 0, st, resp = 0, r = 0, ids = 0;
++	uint64_t deadline;
++
++	if (((uintptr_t)buf & 7) != 0) {
++		return EINVAL;
++	}
++	/* descriptors: one per 4 KiB piece that does not cross a 4 KiB boundary */
++	for (uint32_t off = 0; off < bytes;) {
++		const uint8_t *p = (const uint8_t *)buf + off;
++		uint32_t len = MIN(bytes - off, MMC_DMA_CHUNK - (uint32_t)((uintptr_t)p & (MMC_DMA_CHUNK - 1)));
++		uint64_t pa = mmc_kva_pa(p);
++		volatile uint32_t *d = (volatile uint32_t *)(void *)(dbase + nd * MMC_DESC_SLOT);
++		uint64_t next = su.dma_pa + (nd + 1) * MMC_DESC_SLOT;
++
++		if (!pa || nd >= MMC_DESC_MAX) {
++			return EINVAL;
++		}
++		for (uint32_t k = 0; k < MMC_DESC_SLOT / 4; k++) {
++			d[k] = 0;
++		}
++		d[0] = DES0_OWN | DES0_DIC | DES0_CH;
++		d[2] = len & 0x1fff;
++		d[4] = (uint32_t)pa;
++		d[5] = (uint32_t)(pa >> 32);
++		d[6] = (uint32_t)next;
++		d[7] = (uint32_t)(next >> 32);
++		if (write) {
++			clean_dcache64((addr64_t)pa, len, TRUE);
++		} else {
++			flush_dcache64((addr64_t)pa, len, TRUE);
++		}
++		off += len;
++		nd++;
++	}
++	volatile uint32_t *first = (volatile uint32_t *)(void *)dbase;
++	volatile uint32_t *last = (volatile uint32_t *)(void *)(dbase + (nd - 1) * MMC_DESC_SLOT);
++	first[0] |= DES0_FD;
++	last[0] = (last[0] & ~(DES0_CH | DES0_DIC)) | DES0_LD;
++	clean_dcache64((addr64_t)su.dma_pa, nd * MMC_DESC_SLOT, TRUE);
++
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
++	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
++	mmc_dma_stop();                         /* clean IDMAC state, descriptor pointer back to DBADDR */
++	ufs_wr(MMC_IDINTEN64, 0);
++	ufs_wr(MMC_DBADDRL, (uint32_t)su.dma_pa);
++	ufs_wr(MMC_DBADDRU, (uint32_t)(su.dma_pa >> 32));
++	ufs_wr(MMC_BLKSIZ, 512);
++	ufs_wr(MMC_BYTCNT, bytes);
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_USE_IDMAC);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ufs_wr(MMC_BMOD, ufs_rd(MMC_BMOD) | BMOD_IDMAC_ENABLE | BMOD_FB);
++	ufs_wr(MMC_PLDMND, 1);
++	st = mmc_cmd(write ? 25 : 18, (uint32_t)lba, CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_PRV_DAT_WAIT |
++	    CMD_SEND_STOP | (write ? CMD_READ_WRITE : 0), &resp);
++	if (st == UINT32_MAX || (st & MMC_WR_ERROR) || (resp & R1_ERRORS)) {
++		r = st;
++		goto fail;
++	}
++	nanoseconds_to_absolutetime(4 * MMC_DATA_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		r = ufs_rd(MMC_RINTSTS);
++		ids = ufs_rd(MMC_IDSTS64);
++		if ((r & MMC_WR_ERROR) || (ids & (IDS_FBE | IDS_DU | IDS_CES))) {
++			goto fail;
++		}
++		if ((r & INT_DATA_OVER) && (ids & (write ? IDS_TI : IDS_RI))) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			goto fail;
++		}
++	}
++	if (!mmc_wait(MMC_RINTSTS, INT_ACD, INT_ACD, MMC_CMD_NS) || (ufs_rd(MMC_RESP1) & R1_ERRORS)) {
++		r = ufs_rd(MMC_RINTSTS);
++		resp = ufs_rd(MMC_RESP1);
++		goto fail;
++	}
++	mmc_dma_stop();
++	if (!write) {
++		for (uint32_t off = 0; off < bytes;) {
++			const uint8_t *p = (const uint8_t *)buf + off;
++			uint32_t len = MIN(bytes - off, MMC_DMA_CHUNK - (uint32_t)((uintptr_t)p & (MMC_DMA_CHUNK - 1)));
++			flush_dcache64((addr64_t)mmc_kva_pa(p), len, TRUE);
++			off += len;
++		}
++	}
++	mdma.xfers++;
++	mdma.sectors += n;
++	return write ? mmc_wait_tran(lba) : 0;
++fail:
++	mmc_dma_stop();
++	if (!mdma.fail++) {
++		mdma.rint = r;
++		mdma.ids = ids;
++		mdma.n = n;
++		mdma.write = write;
++		mdma.lba = lba;
++		printf("SWEET MMC: DMA CMD%u of %u at 0x%llx failed: rintsts 0x%x idsts 0x%x r1 0x%x; redoing by PIO\n",
++		    write ? 25 : 18, n, lba, r, ids, resp);
++	}
++	if (mdma.fail >= MMC_DMA_GIVEUP && mmc_dma) {
++		mmc_dma = 0;
++		printf("SWEET MMC: %llu DMA failures, DMA off for this boot\n", mdma.fail);
++	}
++	mmc_abort();
++	return EIO;
++}
++
+ static int
+ mmc_xfer_multi(uint64_t lba, uint32_t n, uint32_t *buf, bool write)
+ {
+@@ -621,6 +806,9 @@ mmc_xfer_multi(uint64_t lba, uint32_t n, uint32_t *buf, bool write)
+ 		printf("SWEET MMC: refusing write of %u at 0x%llx (writable 0x%llx-0x%llx)\n", n, lba, mmc_wr_lo, mmc_wr_hi);
+ 		return wst_fail(EPERM, 1, lba, n, 0);
+ 	}
++	if (mmc_dma && mmc_xfer_dma(lba, n, buf, write) == 0) {
++		return 0;
++	}
+ 	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
+ 	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
+ 	if (!mmc_wait(MMC_STATUS, STATUS_FCNT_MASK | STATUS_FIFO_EMPTY, STATUS_FIFO_EMPTY, 10 * NSEC_PER_MSEC)) {
+@@ -1143,6 +1331,16 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    wst.multi, wst.mfail, wst.mbad);
+ 		sweet_mali_status();
+ #if defined(SWEET_JACKPOTLTE)
++		{
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mdma.rd_abs, &ns);
++			printf("SWEET MMC: %s; read %llu MiB in %llu ms (%llu KB/s); %llu DMA transfers, %llu sectors, "
++			    "%llu failed (first: CMD%u of %u at 0x%llx rintsts 0x%x idsts 0x%x)
++",
++			    mmc_dma ? "DMA" : "PIO", mdma.rd_bytes >> 20, ns / NSEC_PER_MSEC,
++			    ns ? mdma.rd_bytes * (NSEC_PER_SEC / 1000) / ns : 0, mdma.xfers, mdma.sectors, mdma.fail,
++			    mdma.write ? 25 : 18, mdma.n, mdma.lba, mdma.rint, mdma.ids);
++		}
+ 		if (clocks == 0) {                              /* xnu 0137: ACPM speeds (boot-arg a8dvfs) */
+ 			sweet_a8_dvfs_init();
+ 			sweet_a8_audio_run();
+@@ -1155,8 +1353,23 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ }
+ 
+ /* count 512-byte sectors of the file at sector lba into the bounce buffer. */
++static int file_read_blocks_timed(uint64_t lba, uint32_t count);
++
+ static int
+ file_read_blocks(uint64_t lba, uint32_t count)
++{
++	uint64_t t0 = mach_absolute_time();
++	int error = file_read_blocks_timed(lba, count);
++
++	if (!error) {
++		mdma.rd_bytes += (uint64_t)count * UFS_BLOCK;
++		mdma.rd_abs += mach_absolute_time() - t0;
++	}
++	return error;
++}
++
++static int
++file_read_blocks_timed(uint64_t lba, uint32_t count)
+ {
+ 	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
+ 
+@@ -1445,6 +1658,9 @@ ufs_take_over_host(void)
+ 	/* PIO: the CPU drains the FIFO, no IDMAC descriptors */
+ 	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) & ~(CTRL_USE_IDMAC | CTRL_DMA_ENABLE));
+ 	ufs_wr(MMC_BMOD, ufs_rd(MMC_BMOD) & ~BMOD_IDMAC_ENABLE);
++	PE_parse_boot_argn("sweetmmcdma", &mmc_dma, sizeof(mmc_dma));
++	printf("SWEET MMC: multi-sector transfers by %s (BMOD 0x%x)
++", mmc_dma ? "IDMAC DMA" : "PIO", ufs_rd(MMC_BMOD));
+ 	st = mmc_cmd(13, MMC_RCA << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
+ 	if (st == UINT32_MAX || (st & INT_ERROR) || ((resp >> 9) & 0xf) != 4) {
+ 		printf("SWEET MMC: card not in TRAN at RCA %u (rintsts 0x%x r1 0x%x)\n",
