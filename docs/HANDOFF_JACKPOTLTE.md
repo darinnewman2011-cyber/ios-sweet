@@ -1154,3 +1154,13 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
     r8-r12/sp/lr/spsr, 43-44 und pc/spsr, **45 DFAR, 46 DFSR, 47 ADFSR, 48 IFAR, 49 IFSR, 50 AIFSR**, 52 xor cksum.
 - **ios86 (`f3b960b4...8eee`):** Sweet Connect shows "on: radio firmware running, 1 messages from the core"
   (MM_START_IND). Next: WLAN service start + mx140_wlan.hcf, HIP, scan; then BT service + HCI.
+
+## 2026-11-18: CPU DVFS works (ios102)
+
+- ACPM `FREQ_GET` returns 0 for every domain: expected, Samsung's cal-if never uses it (`cal_dfs_get_rate` reads the CMU).
+- **ios102t (a8dvfs=2, kernel #140): `SWEET CPU: MHz` A53 1689, A73 2183** (was 1013 / 1351), MIF asked 1794 MHz.
+  Ran to the planned 240 s reboot with 0 storage failures, no panic besides the known Halt/Restart timeout.
+- **Everyday image `a8-ios102-boot.img` `2cc93fa7...64b8`** = ios101 cmdline with `a8dvfs=2`, flashed 2026-11-18.
+- `_tmp/flash-when-twrp.sh` now refuses to flash unless `ro.product.device` is jackpotlte; `_tmp/waitlog.sh OUT` waits
+  for a test boot to come back to TWRP and saves ramoops.
+- Next speed-ups: GPU voltage for 747 MHz (ACPM domain 4) + GPU IRQs, eMMC IDMAC, low RAM bank.
