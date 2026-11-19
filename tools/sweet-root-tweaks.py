@@ -113,7 +113,11 @@ def activation(root):
 def audio(root):
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-    if os.path.exists(src):
+    # With a HAL driver that gives it devices (A8: SweetAudio, "Speaker"/"Hawking"/"Codec"), VirtualAudio must
+    # stay: it builds iOS's audio routes on top of them, and without it everything plays to no device at all.
+    if os.path.exists(os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/SweetAudio.driver')):
+        print('VirtualAudio.plugin kept (SweetAudio.driver present)')
+    elif os.path.exists(src):
         os.makedirs(dst_dir, exist_ok=True)
         shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
