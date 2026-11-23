@@ -17,8 +17,8 @@ index 7a395df..5ade872 100644
 + * protector (FMP, present on this SoC) a descriptor grows to 32 words (IVs
 + * and keys, all zero here = no encryption), so slots are 128 bytes and the
 + * chain pointers are explicit. Registers DBADDRL 0x88 / DBADDRU 0x8c,
-+ * IDSTS64 0x90, IDINTEN64 0x94, PLDMND 0x84; start = CTRL.USE_IDMAC, then
-+ * BMOD DE|FB, then PLDMND = 1; stop = clear USE_IDMAC, CTRL DMA_RESET, BMOD
++ * IDSTS64 0x90, IDINTEN64 0x94, PLDMND 0x84; start = CTRL.DMA_ENABLE|USE_IDMAC, then
++ * BMOD DE|FB, then PLDMND = 1; stop = clear both, CTRL DMA_RESET, BMOD
 + * SWR. No SysMMU sits in front of this controller (no iommus in the DT).
 + * The CPU caches are not coherent with it: buffers are cleaned before a
 + * write and flushed before and after a read. Descriptors live in the first
@@ -73,7 +73,7 @@ index 7a395df..5ade872 100644
 +static void
 +mmc_dma_stop(void)
 +{
-+	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) & ~CTRL_USE_IDMAC);
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) & ~(CTRL_USE_IDMAC | CTRL_DMA_ENABLE));
 +	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_DMA_RESET);
 +	(void)mmc_wait(MMC_CTRL, CTRL_DMA_RESET, 0, 10 * NSEC_PER_MSEC);
 +	ufs_wr(MMC_BMOD, (ufs_rd(MMC_BMOD) & ~(BMOD_IDMAC_ENABLE | BMOD_FB)) | BMOD_SWR);
@@ -133,7 +133,7 @@ index 7a395df..5ade872 100644
 +	ufs_wr(MMC_DBADDRU, (uint32_t)(su.dma_pa >> 32));
 +	ufs_wr(MMC_BLKSIZ, 512);
 +	ufs_wr(MMC_BYTCNT, bytes);
-+	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_USE_IDMAC);
++	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_USE_IDMAC | CTRL_DMA_ENABLE);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	ufs_wr(MMC_BMOD, ufs_rd(MMC_BMOD) | BMOD_IDMAC_ENABLE | BMOD_FB);
 +	ufs_wr(MMC_PLDMND, 1);
