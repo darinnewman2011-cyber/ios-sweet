@@ -1,0 +1,61 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 22:51:07
++++ b/bsd/dev/sweet_usb.c	2026-11-22 22:51:07
+@@ -182,8 +182,8 @@
+ 		} else {
+ 			printf("SWEET USB: status: step %d (%s), GSNPSID 0x%08x\n", st, name, a8u.id);
+ 		}
+-		printf("SWEET USB: status: PLL_USB 0x%08x -> 0x%08x; first failed ep cmd 0x%06x (DEPCMD 0x%08x); GUSB2PHYCFG 0x%08x GHWPARAMS3 0x%08x\n",
+-		    a8u.pll0, a8u.pll1, a8u.epfail, a8u.depcmd, a8u.dwc ? usb_rd(a8u.dwc, 0xc200) : 0, a8u.dwc ? usb_rd(a8u.dwc, 0xc14c) : 0);
++		printf("SWEET USB: status: PLL_USB 0x%08x -> 0x%08x; first failed ep cmd 0x%06x (DEPCMD 0x%08x); GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
++		    a8u.pll0, a8u.pll1, a8u.epfail, a8u.depcmd, a8u.dwc ? usb_rd(a8u.dwc, 0xc200) : 0, a8u.dwc ? usb_rd(a8u.dwc, 0xc2c0) : 0);
+ 	}
+ }
+ 
+@@ -1148,6 +1148,12 @@
+ 	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 12)) | (2u << 12));
+ 	/* xnu 0150: and the USB 2.0 PHY must not be allowed to suspend (GUSB2PHYCFG SUSPHY 6, ENBLSLPM 8) */
+ 	dwc_wr(0xc200, dwc_rd(0xc200) & ~((1u << 6) | (1u << 8)));
++	/*
++	 * xnu 0157: this is the USB 3 core (GHWPARAMS3 SSPHY_IFC = PIPE3) and its SuperSpeed PHY is never started; with
++	 * GUSB3PIPECTL.SUSPHY (bit 17) clear the core waits for a PIPE clock that never comes and endpoint commands
++	 * stall (ios110g: SETEPCONFIG ep0 timed out, CMDACT stuck). Linux dwc3_phy_setup sets it.
++	 */
++	dwc_wr(0xc2c0, dwc_rd(0xc2c0) | (1u << 17));
+ #endif
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 22:51:07
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 22:51:07
+@@ -56,6 +56,11 @@
+ extern void sweet_a8_input_init(void);
+ extern void sweet_a8_gpu_init(void);
+ extern void sweet_mali_status(void);            /* sweet_a8gpu.c: one GPU line for wst_thread() */
++#if defined(SWEET_JACKPOTLTE)
++extern uint64_t max_mem;                        /* xnu 0157: for the SWEET PERF line */
++extern uint64_t sweet_lowram_size;
++extern unsigned int vm_page_free_count;
++#endif
+ extern void sweet_usb_probe(void);
+ #if defined(SWEET_JACKPOTLTE)
+ extern void sweet_lowram_release(void);
+@@ -1482,6 +1487,20 @@
+ 			    mdma.write ? 25 : 18, mdma.n, mdma.lba, mdma.rint, mdma.ids, mdma.where, mdma.r1, mdma.d0,
+ 			    mdma.checked, mdma.mismatch, mmc_dma64 < 0 ? 0 : (mmc_dma64 ? 64 : 32), mmc_dma_above4g);
+ 			printf("SWEET MMC: FIFOTH 0x%08x -> 0x%08x now 0x%08x\n", mmc_fifoth0, mmc_fifoth1, ufs_rd(0x04c));
++			{
++				/* xnu 0157: the boot lines that prove these scroll out of ramoops; repeat the facts every 30 s */
++				static vm_offset_t g3d;
++				uint32_t c = 0;
++				if (g3d == 0) {
++					g3d = ml_io_map(0x11400000, 0x1000);
++				}
++				if (g3d != 0) {
++					c = *(volatile uint32_t *)(g3d + 0x120);
++				}
++				uint32_t pd = (c >> 8) & 0x3f;
++				printf("SWEET PERF: GPU PLL %u MHz (CON0 %#x); RAM max_mem %llu MiB, low bank %llu MiB, %u free pages\n",
++				    pd ? (26u * ((c >> 16) & 0x3ff) / pd) >> (c & 7) : 0, c, max_mem >> 20, sweet_lowram_size >> 20, vm_page_free_count);
++			}
+ 			printf("SWEET MMC: HCON 0x%08x; SMC sec 0x%llx init 0x%llx; MPSBEGIN0 0x%08x MPSEND0 0x%08x MPSLUN0 0x%08x MPSCTRL0 0x%08x BMOD 0x%08x CTRL 0x%08x\n",
+ 			    mmc_hcon, mmc_smc_sec, mmc_smc_init, ufs_rd(MMC_MPSBEGIN0), ufs_rd(MMC_MPSEND0), ufs_rd(MMC_MPSLUN0),
+ 			    ufs_rd(MMC_MPSCTRL0), ufs_rd(MMC_BMOD), ufs_rd(MMC_CTRL));
