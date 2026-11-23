@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 6a05585..9fa6d28 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -2612,8 +2612,12 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 		 * ssid len @0x60 + ssid @0x61, age @0x84, ie_len @0x8a, the frame's IEs @0x8c (up to 1024).
+ 		 * ENXIO after the last one, EBUSY while scanning.
+ 		 */
++		/*
++		 * xnu 0176: the end of the list must be EIO (5) or 0xe0820446: __dispatchAsyncScanEvent keeps the results
++		 * only for those and drops the whole batch for anything else (ENXIO before: "0 networks").
++		 */
+ 		if (a11_scan_cursor >= (uint32_t)n_nets || scanning) {
+-			err = scanning ? EBUSY : ENXIO;
++			err = scanning ? EBUSY : EIO;
+ 			break;
+ 		}
+ 		struct wnet *w = &nets[a11_scan_cursor++];
