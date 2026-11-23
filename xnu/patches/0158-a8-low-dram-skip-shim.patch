@@ -1,0 +1,13 @@
+--- a/osfmk/arm64/arm_vm_init.c	2026-11-22 23:39:23
++++ b/osfmk/arm64/arm_vm_init.c	2026-11-22 23:39:23
+@@ -381,7 +381,9 @@
+  * boot-time vm_pages[] array must stay gap-free). Nothing is mapped in the gaps.
+  */
+ const struct sweet_lowram_range { pmap_paddr_t pa, len; } sweet_lowram_ranges[SWEET_LOWRAM_NRANGES] = {
+-	{ 0x80004000ull, 0x92400000ull - 0x80004000ull },
++	/* xnu 0158: not below 0x84000000: S-Boot's shim Image (from 0x80080000) holds the secondary CPUs' trampoline
++	 * (0100, SWEET_SMP_TRAMPOLINE_PA), which stays mapped (ios115: pmap_assert_free, mapping to 0x80080000) */
++	{ 0x84000000ull, 0x92400000ull - 0x84000000ull },
+ 	{ 0x92500000ull, 0xb8000000ull - 0x92500000ull },
+ 	{ 0xb8200000ull, 0xbda00000ull - 0xb8200000ull },
+ 	{ 0xc0080000ull, 0xe9000000ull - 0xc0080000ull },
