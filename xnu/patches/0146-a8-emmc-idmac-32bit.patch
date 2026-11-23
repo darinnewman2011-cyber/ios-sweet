@@ -1,0 +1,121 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 20:00:30
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 20:00:50
+@@ -653,6 +653,18 @@
+ #define MMC_DMA_GIVEUP  8
+ 
+ static uint32_t mmc_dma;                        /* boot-arg sweetmmcdma */
++/*
++ * xnu 0146: Samsung's dw_mmc picks the IDMAC layout from HCON at run time (bits 17:16 = 0: internal DMA,
++ * bit 27 ADDR_CONFIG: 1 = 64-bit DBADDRL/U 0x88/0x8c, IDSTS64 0x90, 32-byte+ descriptors; 0 = 32-bit DBADDR 0x88,
++ * IDSTS 0x8c, IDINTEN 0x90, 16-byte descriptors des0 ctrl / des1 size / des2 buffer / des3 next). 0144 assumed
++ * 64-bit; on ios103t-105t IDSTS64 read 0 and no descriptor was ever taken. In 32-bit mode a transfer whose buffer or
++ * descriptors sit above 4 GiB goes by PIO (EINVAL before any register is touched, not counted as a failure).
++ */
++#define MMC_DBADDR32    0x088
++#define MMC_IDSTS32     0x08c
++#define MMC_IDINTEN32   0x090
++static int mmc_dma64 = -1;                      /* -1: HCON not read yet */
++static uint64_t mmc_dma_above4g;                /* 32-bit mode: transfers left to PIO */
+ static uint32_t mmc_dma_chk[MMC_MULTI_MAX * UFS_BLOCK / 4] __attribute__((aligned(64)));
+ static uint64_t mmc_dma_check_lba;
+ static struct {
+@@ -680,7 +692,7 @@
+ 	(void)mmc_wait(MMC_CTRL, CTRL_DMA_RESET, 0, 10 * NSEC_PER_MSEC);
+ 	ufs_wr(MMC_BMOD, (ufs_rd(MMC_BMOD) & ~(BMOD_IDMAC_ENABLE | BMOD_FB)) | BMOD_SWR);
+ 	(void)mmc_wait(MMC_BMOD, BMOD_SWR, 0, 10 * NSEC_PER_MSEC);
+-	ufs_wr(MMC_IDSTS64, IDS_ALL);
++	ufs_wr(mmc_dma64 == 0 ? MMC_IDSTS32 : MMC_IDSTS64, IDS_ALL);
+ }
+ 
+ static int
+@@ -693,6 +705,18 @@
+ 	if (((uintptr_t)buf & 7) != 0) {
+ 		return EINVAL;
+ 	}
++	if (mmc_dma64 < 0) {
++		uint32_t hcon = ufs_rd(MMC_HCON);
++
++		mmc_dma64 = (hcon >> 27) & 1;
++		printf("SWEET MMC: VERID 0x%x HCON 0x%08x: DMA interface %u (0 = IDMAC), IDMAC %s-bit, descriptors at 0x%llx\n",
++		    ufs_rd(0x06c), hcon, (hcon >> 16) & 3, mmc_dma64 ? "64" : "32", su.dma_pa);
++		if (((hcon >> 16) & 3) != 0) {
++			printf("SWEET MMC: no internal DMA on this controller, DMA off\n");
++			mmc_dma = 0;
++			return EINVAL;
++		}
++	}
+ 	/* descriptors: one per 4 KiB piece that does not cross a 4 KiB boundary */
+ 	for (uint32_t off = 0; off < bytes;) {
+ 		const uint8_t *p = (const uint8_t *)buf + off;
+@@ -704,15 +728,25 @@
+ 		if (!pa || nd >= MMC_DESC_MAX) {
+ 			return EINVAL;
+ 		}
++		if (!mmc_dma64 && ((pa + len - 1) >> 32 || (next + MMC_DESC_SLOT - 1) >> 32)) {
++			mmc_dma_above4g++;
++			return EINVAL;
++		}
+ 		for (uint32_t k = 0; k < MMC_DESC_SLOT / 4; k++) {
+ 			d[k] = 0;
+ 		}
+ 		d[0] = DES0_OWN | DES0_DIC | DES0_CH;
+-		d[2] = len & 0x1fff;
+-		d[4] = (uint32_t)pa;
+-		d[5] = (uint32_t)(pa >> 32);
+-		d[6] = (uint32_t)next;
+-		d[7] = (uint32_t)(next >> 32);
++		if (mmc_dma64) {
++			d[2] = len & 0x1fff;
++			d[4] = (uint32_t)pa;
++			d[5] = (uint32_t)(pa >> 32);
++			d[6] = (uint32_t)next;
++			d[7] = (uint32_t)(next >> 32);
++		} else {
++			d[1] = len & 0x1fff;
++			d[2] = (uint32_t)pa;
++			d[3] = (uint32_t)next;
++		}
+ 		if (write) {
+ 			clean_dcache64((addr64_t)pa, len, TRUE);
+ 		} else {
+@@ -730,9 +764,14 @@
+ 	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_FIFO_RESET);
+ 	(void)mmc_wait(MMC_CTRL, CTRL_FIFO_RESET, 0, 10 * NSEC_PER_MSEC);
+ 	mmc_dma_stop();                         /* clean IDMAC state, descriptor pointer back to DBADDR */
+-	ufs_wr(MMC_IDINTEN64, 0);
+-	ufs_wr(MMC_DBADDRL, (uint32_t)su.dma_pa);
+-	ufs_wr(MMC_DBADDRU, (uint32_t)(su.dma_pa >> 32));
++	if (mmc_dma64) {
++		ufs_wr(MMC_IDINTEN64, 0);
++		ufs_wr(MMC_DBADDRL, (uint32_t)su.dma_pa);
++		ufs_wr(MMC_DBADDRU, (uint32_t)(su.dma_pa >> 32));
++	} else {
++		ufs_wr(MMC_IDINTEN32, 0);
++		ufs_wr(MMC_DBADDR32, (uint32_t)su.dma_pa);
++	}
+ 	ufs_wr(MMC_BLKSIZ, 512);
+ 	ufs_wr(MMC_BYTCNT, bytes);
+ 	ufs_wr(MMC_CTRL, ufs_rd(MMC_CTRL) | CTRL_USE_IDMAC | CTRL_DMA_ENABLE);
+@@ -750,7 +789,7 @@
+ 	deadline += mach_absolute_time();
+ 	for (;;) {
+ 		r = ufs_rd(MMC_RINTSTS);
+-		ids = ufs_rd(MMC_IDSTS64);
++		ids = ufs_rd(mmc_dma64 ? MMC_IDSTS64 : MMC_IDSTS32);
+ 		if ((r & MMC_WR_ERROR) || (ids & (IDS_FBE | IDS_DU | IDS_CES))) {
+ 			where = 2;
+ 			goto fail;
+@@ -1368,11 +1407,11 @@
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(mdma.rd_abs, &ns);
+ 			printf("SWEET MMC: %s; read %llu MiB in %llu ms (%llu KB/s); %llu DMA transfers, %llu sectors, "
+-			    "%llu failed (first: CMD%u of %u at 0x%llx rintsts 0x%x idsts 0x%x where %u r1 0x%x des0 0x%x); checked %llu, mismatched %llu\n",
++			    "%llu failed (first: CMD%u of %u at 0x%llx rintsts 0x%x idsts 0x%x where %u r1 0x%x des0 0x%x); checked %llu, mismatched %llu; IDMAC %d-bit, %llu PIO above 4 GiB\n",
+ 			    mmc_dma ? "DMA" : "PIO", mdma.rd_bytes >> 20, ns / NSEC_PER_MSEC,
+ 			    ns ? mdma.rd_bytes * (NSEC_PER_SEC / 1000) / ns : 0, mdma.xfers, mdma.sectors, mdma.fail,
+ 			    mdma.write ? 25 : 18, mdma.n, mdma.lba, mdma.rint, mdma.ids, mdma.where, mdma.r1, mdma.d0,
+-			    mdma.checked, mdma.mismatch);
++			    mdma.checked, mdma.mismatch, mmc_dma64 < 0 ? 0 : (mmc_dma64 ? 64 : 32), mmc_dma_above4g);
+ 		}
+ 		if (clocks == 0) {                              /* xnu 0137: ACPM speeds (boot-arg a8dvfs) */
+ 			sweet_a8_dvfs_init();
