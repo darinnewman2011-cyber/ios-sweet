@@ -384,7 +384,7 @@ index d8eed73..5db0b07 100644
  }
 diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
 new file mode 100644
-index 0000000..21a18d4
+index 0000000..41a3e7a
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
 @@ -0,0 +1,202 @@
@@ -521,7 +521,7 @@ index 0000000..21a18d4
 +{
 +	(void)refCon;
 +	sweet_a80211_note("notify-port", type, 0);
-+	if (MACH_PORT_VALID(port)) {
++	if (port != MACH_PORT_NULL) {
 +		releaseNotificationPort(port);  /* not kept in stage 1; balances the caller's send right */
 +	}
 +	return kIOReturnSuccess;
