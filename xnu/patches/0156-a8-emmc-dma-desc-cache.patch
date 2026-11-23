@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 22:44:16
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 22:44:16
+@@ -851,6 +851,13 @@
+ 	for (;;) {
+ 		r = ufs_rd(MMC_RINTSTS);
+ 		ids = ufs_rd(mmc_dma64 ? MMC_IDSTS64 : MMC_IDSTS32);
++		/*
++		 * xnu 0156: the descriptors are in cached memory and the IDMAC writes their OWN bits behind the cache:
++		 * drop the last descriptor's line before looking (it was cleaned before the start and the CPU has not
++		 * written it since, so nothing dirty is lost). ios103t-109u read a stale OWN = 1 every time and gave
++		 * up on transfers whose data-over had already arrived.
++		 */
++		flush_dcache64((addr64_t)(su.dma_pa + (nd - 1) * MMC_DESC_SLOT), MMC_DESC_SLOT, TRUE);
+ 		if ((r & MMC_WR_ERROR) || (ids & (IDS_FBE | IDS_DU | IDS_CES))) {
+ 			where = 2;
+ 			goto fail;
+@@ -895,6 +902,7 @@
+ 		mdma.ids = ids;
+ 		mdma.where = where;
+ 		mdma.r1 = resp;
++		flush_dcache64((addr64_t)su.dma_pa, MMC_DESC_SLOT, TRUE);  /* xnu 0156: the IDMAC's view, not the cache's */
+ 		mdma.d0 = ((volatile uint32_t *)(void *)su.dma)[0];
+ 		mdma.n = n;
+ 		mdma.write = write;
