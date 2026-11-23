@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
-index d8eed73..5db0b07 100644
+index d8eed73..0dc4e8c 100644
 --- a/bsd/dev/sweet_a8wlbt.c
 +++ b/bsd/dev/sweet_a8wlbt.c
 @@ -407,6 +407,7 @@ static char wl_status[160];
@@ -20,7 +20,7 @@ index d8eed73..5db0b07 100644
  		ifmr->ifm_mask = 0;
  		ifmr->ifm_status = IFM_AVALID | (connected ? IFM_ACTIVE : 0);
  		ifmr->ifm_count = 0;
-@@ -2184,6 +2186,330 @@ bt_cmd(const char *cmd)
+@@ -2184,6 +2186,339 @@ bt_cmd(const char *cmd)
  	return 0;
  }
  
@@ -187,12 +187,21 @@ index d8eed73..5db0b07 100644
 +		n = 6 + 256;
 +		break;
 +	}
-+	case A11_CARD_CAPABILITIES:     /* version + 14 capability bytes; WEP/TKIP/AES/WPA/WPA2 bits for now */
-+		a11_put32(o, 0, 1);
-+		o[4] = 0x0f;
-+		o[5] = 0x06;
-+		n = 18;
++	case A11_CARD_CAPABILITIES: {
++		/*
++		 * APPLE80211_CAP_* bitmap: WEP 0, TKIP 1, AES_CCM 3, PMGT 6, SHSLOT 9, SHPREAMBLE 10, TKIPMIC 12, WPA1 13,
++		 * WPA2 14, WPA 15, WME 17, SHORT_GI_20MHZ 19. iOS 16's bind asks for it raw (13 bytes into the handle);
++		 * the macOS-style apple80211_capability_data (18 bytes) has a version word in front.
++		 */
++		static const uint8_t caps[3] = { 0x4b, 0xf6, 0x0a };
++		uint32_t at = outcap >= 18 ? 4 : 0;
++		if (at) {
++			a11_put32(o, 0, 1);
++		}
++		memcpy(o + at, caps, sizeof(caps));
++		n = at ? 18 : (outcap < 13 ? outcap : 13);
 +		break;
++	}
 +	case A11_POWER:                 /* version, num_radios, power_state[4] */
 +		a11_put32(o, 0, 1);
 +		a11_put32(o, 4, 1);
@@ -351,7 +360,7 @@ index d8eed73..5db0b07 100644
  static void
  wifi_run(uint32_t panic_off)
  {
-@@ -2244,6 +2570,16 @@ wifi_run(uint32_t panic_off)
+@@ -2244,6 +2579,16 @@ wifi_run(uint32_t panic_off)
  	}
  	wl_publish("on", d);
  	sweet_a8net_set_handler(0, wl_cmd);
@@ -368,7 +377,7 @@ index d8eed73..5db0b07 100644
  	sweet_a8net_set_handler(1, bt_cmd);
  	bt_publish("off", "radio running; turn Bluetooth on to start it");
  	/* Unattended test: boot-arg a8join=SSID joins that open network after each scan, up to 3 attempts. */
-@@ -2304,6 +2640,13 @@ wifi_run(uint32_t panic_off)
+@@ -2304,6 +2649,13 @@ wifi_run(uint32_t panic_off)
  			printf("SWEET A8 WIFI: %s\n", d);
  			return;
  		}
