@@ -1,0 +1,81 @@
+diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
+index 66e9e8c..7c1ce1b 100644
+--- a/iokit/Kernel/arm/SweetA8WiFi.cpp
++++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
+@@ -29,6 +29,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <sys/proc.h>
+ #include <IOKit/IORegistryEntry.h>
++#include <libkern/c++/OSKext.h>
+ 
+ extern "C" int sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint32_t inlen,
+     void *out, uint32_t outcap, uint32_t *outlen);
+@@ -75,6 +76,30 @@ sweet_dump_iokit_busy(void)
+ 	IOLog("SWEET BUSY: %d busy services\n", busy);
+ }
+ 
++/*
++ * xnu 0171: the root keeps one busy count from StartIOKitMatching until the IOKit daemon (driverkitd on iOS)
++ * checks in through kext_request (OSKext: sendAllKextPersonalitiesToCatalog -> IOService::iokitDaemonLaunched).
++ * On the A8 that check-in never completes, so IOKit is never quiet, configd's InterfaceNamer never says so, and
++ * every SCNetworkInterfaceCopyAll (wifid, CoreWiFi) blocks in __wait_for_IOKit_to_quiesce. If the daemon has not
++ * checked in by then, do what its check-in does. OSKext's own path skips a second release once the daemon is
++ * marked active.
++ */
++extern "C" void sweet_iokit_daemon_fallback(void);
++extern "C" void
++sweet_iokit_daemon_fallback(void)
++{
++	if (OSKext::iokitDaemonActive()) {
++		IOLog("SWEET IOKIT: the IOKit daemon checked in; root busy %u\n", IOService::getServiceRoot()->getBusyState());
++		return;
++	}
++	IOLog("SWEET IOKIT: no IOKit daemon check-in; marking it launched (root busy %u)\n",
++	    IOService::getServiceRoot()->getBusyState());
++	OSKext::setIOKitDaemonActive();
++	OSKext::setDeferredLoadSucceeded(TRUE);
++	IOService::iokitDaemonLaunched();
++	IOLog("SWEET IOKIT: root busy now %u\n", IOService::getServiceRoot()->getBusyState());
++}
++
+ /* Called from the Wi-Fi service thread once the radio's WLAN service runs: lets the personality below match. */
+ extern "C" void
+ sweet_a80211_ready(void)
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+index 82661cf..acdd918 100644
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -13211,7 +13211,7 @@ try_codeless:
+ 		 * dext and codeless kext personalities should have all been
+ 		 * delivered via this one call.
+ 		 */
+-		if (!daemon_ready) {
++		if (!daemon_ready && !OSKext::iokitDaemonActive()) {    /* xnu 0171: the A8 fallback may have run */
+ 			OSKext::setIOKitDaemonActive();
+ 			OSKext::setDeferredLoadSucceeded(TRUE);
+ 			IOService::iokitDaemonLaunched();
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index f400829..fcef465 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -637,6 +637,20 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 		printf("SWEET A8: test reboot in 60 s: clock moved back 30 min as the warning; Restart or Shut Down now goes "
+ 		    "to TWRP cleanly\n");
+ 	}
++	/* xnu 0171: release IOKit's daemon busy hold if driverkitd never checked in (boot-arg sweetiokitq=secs, 0 off) */
++	{
++		static uint32_t iokq = 45;
++		static bool iokq_read, iokq_done;
++		extern void sweet_iokit_daemon_fallback(void);
++		if (!iokq_read) {
++			iokq_read = true;
++			(void)PE_parse_boot_argn("sweetiokitq", &iokq, sizeof(iokq));
++		}
++		if (iokq && !iokq_done && sweet_boot_hb_secs >= iokq) {
++			iokq_done = true;
++			sweet_iokit_daemon_fallback();
++		}
++	}
+ 	/* xnu 0169: before a test reboot, the stuck process's threads (boot-arg sweetbt=NAME, default wifid) */
+ 	if (sweet_boot_reboot_secs > 20 && sweet_boot_hb_secs == ((sweet_boot_reboot_secs - 10) / 5) * 5) {
+ 		char bt[16] = "wifid";
