@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 0dc4e8c..cb29582 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -2215,6 +2215,8 @@ bt_cmd(const char *cmd)
+ #define A11_DRIVER_VERSION 43
+ #define A11_HARDWARE_VERSION 44
+ #define A11_COUNTRY_CODE 51
++#define A11_CHANNELS_INFO 207
++#define A11_HW_SUPPORTED_CHANNELS 254
+ 
+ struct a11_stat {
+ 	uint16_t type;
+@@ -2447,6 +2449,35 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 		n = 52;
+ 		break;
+ 	}
++	case A11_CHANNELS_INFO: {
++		/*
++		 * apple80211_channels_info (AirportItlwm's layout): version, unk1, u16 count @8, u16 chanspec[128] @0xa
++		 * (Broadcom: 20 MHz = 0x1000, 5 GHz band = 0xc000 | control channel), u8 chan_num[128] @0x10a, then
++		 * indoor @0x18a / radar @0x20a / passive @0x28a / 40 MHz @0x30a / 80 MHz @0x38a flags (all 0 here).
++		 */
++		static const uint8_t c2[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++		static const uint8_t c5[] = { 36, 40, 44, 48, 149, 153, 157, 161, 165 };
++		uint16_t k = 0;
++		if (outcap < 0x38a + 128) {
++			err = ENOSPC;
++			break;
++		}
++		a11_put32(o, 0, 1);
++		for (unsigned i = 0; i < sizeof(c2); i++, k++) {
++			uint16_t cs = (uint16_t)(0x1000 | c2[i]);
++			memcpy(o + 0xa + 2 * k, &cs, 2);
++			o[0x10a + k] = c2[i];
++		}
++		for (unsigned i = 0; i < sizeof(c5); i++, k++) {
++			uint16_t cs = (uint16_t)(0xd000 | c5[i]);
++			memcpy(o + 0xa + 2 * k, &cs, 2);
++			o[0x10a + k] = c5[i];
++		}
++		memcpy(o + 8, &k, 2);
++		n = outcap;
++		break;
++	}
++	case A11_HW_SUPPORTED_CHANNELS:         /* same shape as SUPPORTED_CHANNELS (a guess; see the next log) */
+ 	case A11_SUPPORTED_CHANNELS: {
+ 		static const uint16_t mhz[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+ 			                        5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825 };
