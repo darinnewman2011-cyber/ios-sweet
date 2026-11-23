@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 69b1aff..e58ba10 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -45,6 +45,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <sys/kern_event.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -2645,10 +2646,25 @@ wifi_run(uint32_t panic_off)
+ 	wr(shm, wl + HC_INIT + 8, wl + HC_V4);
+ 	wr(shm, wl + HC_INIT + 12, wl + HC_V3);
+ 	{
+-		uint64_t t = mach_absolute_time();
+-		wl_mac[0] = 0x02;               /* locally administered */
+-		for (int i = 1; i < 6; i++) {
+-			wl_mac[i] = (uint8_t)(t >> (8 * i));
++		/*
++		 * xnu 0167: a stable address from the ADT's /chosen mac-address-wifi0 (tools/adt-radios.py; iBoot puts
++		 * it there on iPhones and MobileGestalt reads it), so DHCP leases and known networks survive reboots.
++		 * Without one: a locally administered address from the timer, as before.
++		 */
++		DTEntry ch;
++		void const *mp = NULL;
++		unsigned int msz = 0;
++		if (SecureDTLookupEntry(NULL, "/chosen", &ch) == kSuccess &&
++		    SecureDTGetProperty(ch, "mac-address-wifi0", &mp, &msz) == kSuccess && msz >= 6) {
++			memcpy(wl_mac, mp, 6);
++			printf("SWEET A8 WIFI: MAC %02x:%02x:%02x:%02x:%02x:%02x from the device tree\n", wl_mac[0], wl_mac[1],
++			    wl_mac[2], wl_mac[3], wl_mac[4], wl_mac[5]);
++		} else {
++			uint64_t t = mach_absolute_time();
++			wl_mac[0] = 0x02;               /* locally administered */
++			for (int i = 1; i < 6; i++) {
++				wl_mac[i] = (uint8_t)(t >> (8 * i));
++			}
+ 		}
+ 	}
+ 	(void)mgmt_poll();                      /* consumes MM_START_IND */
