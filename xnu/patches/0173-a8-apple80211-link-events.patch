@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 8530e08..f9740a8 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -59,6 +59,8 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <net/route.h>
++#include <net/dlil.h>
++#include <net/net_kev.h>
+ #include <netinet/in.h>
+ #include <kern/locks.h>
+ 
+@@ -412,6 +414,7 @@ static int vif_up, joining, connected;  /* station vif 1 added; join in progress
+ static int a80211_on;                   /* boot-arg a8wifi80211=1: answer IO80211 (iokit/Kernel/arm/SweetA8WiFi.cpp) */
+ static volatile int a11_scan_wanted, a11_scan_done_post;        /* xnu 0172, defined again below (tentative) */
+ static uint32_t a11_scan_cursor;
++static volatile int a11_link_post, a11_leave_req;      /* xnu 0173: 1 = link up, 2 = link down to report to wifid / the stack */
+ static uint32_t rx_frames;
+ static ifnet_t wl_ifp;
+ static int dh_state, dh_tries;  /* DHCP: 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 ACKed, 4 configured, 5 gave up */
+@@ -671,6 +674,9 @@ del_vif(void)
+ 		(void)short_sig(SIG_DEL_VIF_REQ);
+ 		vif_up = 0;
+ 	}
++	if (connected && a80211_on) {
++		a11_link_post = 2;
++	}
+ 	connected = 0;
+ 	dh_state = 0;
+ 	if (wl_ifp) {
+@@ -871,6 +877,9 @@ wl_signal(uint32_t sig, uint32_t sig_len, const uint8_t *dat, uint32_t dat_len)
+ 			dh_tries = 0;
+ 			net_note[0] = 0;
+ 			net_attach();
++			if (a80211_on) {
++				a11_link_post = 1;
++			}
+ 			snprintf(wl_status, sizeof(wl_status), "connected to %s", join_ssid);
+ 			printf("SWEET A8 WIFI: %s\n", wl_status);
+ 			wl_publish("on", wl_status);
+@@ -2228,6 +2237,7 @@ bt_cmd(const char *cmd)
+ #define A11_INT_MIT 18
+ #define A11_SCAN_REQ_MULTIPLE 86
+ #define A11_CURRENT_NETWORK 103
++#define A11_LINK_CHANGED_EVENT_DATA 156
+ #define A11_CHANNELS_INFO 207
+ #define A11_HW_SUPPORTED_CHANNELS 254
+ 
+@@ -2273,6 +2283,9 @@ a11_count(int set, uint32_t type, int err)
+  */
+ #define A11_EV_LINK_CHANGED 4
+ #define A11_EV_SCAN_DONE 10
++#define A11_EV_SSID_CHANGED 2
++#define A11_EV_BSSID_CHANGED 3
++#define A11_EV_ASSOC_DONE 9
+ #define A11_EV_DRIVER_AVAILABLE 55
+ static volatile int a11_scan_wanted, a11_scan_done_post;  /* xnu 0172: IO80211 asked for a scan / post SCAN_DONE */
+ static uint64_t a11_avail_due;          /* mach time: post DRIVER_AVAILABLE then (0 = nothing pending) */
+@@ -2398,7 +2411,8 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 			}
+ 			err = EINVAL;
+ 			break;
+-		case A11_DISASSOCIATE:
++		case A11_DISASSOCIATE:          /* xnu 0173: leave the network (done in the Wi-Fi thread) */
++			a11_leave_req = 1;
+ 			break;
+ 		default:
+ 			err = EOPNOTSUPP;
+@@ -2593,6 +2607,16 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 		n = 0x88;
+ 		break;
+ 	}
++	case A11_LINK_CHANGED_EVENT_DATA: {     /* isLinkDown @0, rssi @4, snr @8, nf @10, voluntary @16, reason @20 */
++		int32_t rssi = j >= 0 ? nets[j].rssi : -100;
++		uint16_t snr = (uint16_t)(rssi + 92), nf = (uint16_t)(int16_t)-92;
++		o[0] = j < 0;
++		a11_put32(o, 4, (uint32_t)rssi);
++		memcpy(o + 8, &snr, 2);
++		memcpy(o + 10, &nf, 2);
++		n = 24;
++		break;
++	}
+ 	case A11_CURRENT_NETWORK:       /* the joined network's scan result; nothing while not associated */
+ 		err = j < 0 ? ENXIO : EOPNOTSUPP;
+ 		break;
+@@ -2806,6 +2830,41 @@ wifi_run(uint32_t panic_off)
+ 			printf("SWEET A8 WIFI: %s\n", d);
+ 			return;
+ 		}
++		if (a11_leave_req) {
++			a11_leave_req = 0;
++			if (connected || joining) {
++				joining = 0;
++				del_vif();
++				snprintf(wl_status, sizeof(wl_status), "left %s", join_ssid);
++				wl_publish("on", wl_status);
++			}
++		}
++		if (a80211_on && a11_link_post) {
++			/*
++			 * xnu 0173: a join finished or the link went away. wifid: ASSOC_DONE, SSID/BSSID_CHANGED,
++			 * LINK_CHANGED {isLinkDown, rssi, snr, nf}; the network stack: KEV_DL_LINK_ON / OFF for en2.
++			 */
++			int up = a11_link_post == 1;
++			a11_link_post = 0;
++			uint8_t lc[24];
++			int jj = a11_joined();
++			int32_t rssi = up && jj >= 0 ? nets[jj].rssi : -100;
++			uint16_t snr = (uint16_t)(rssi + 92), nf = (uint16_t)(int16_t)-92;
++			memset(lc, 0, sizeof(lc));
++			lc[0] = !up;
++			memcpy(lc + 4, &rssi, 4);
++			memcpy(lc + 8, &snr, 2);
++			memcpy(lc + 10, &nf, 2);
++			if (up) {
++				a11_post(A11_EV_ASSOC_DONE, NULL, 0);
++			}
++			a11_post(A11_EV_SSID_CHANGED, NULL, 0);
++			a11_post(A11_EV_BSSID_CHANGED, NULL, 0);
++			a11_post(A11_EV_LINK_CHANGED, lc, sizeof(lc));
++			if (wl_ifp) {
++				dlil_post_msg(wl_ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++			}
++		}
+ 		if (a80211_on && a11_scan_done_post) {
+ 			a11_scan_done_post = 0;
+ 			a11_post(A11_EV_SCAN_DONE, NULL, 0);
