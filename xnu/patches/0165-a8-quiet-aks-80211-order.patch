@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index cb29582..2b4b0d5 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -2231,9 +2231,15 @@ static char a11_notes[160];
+ static int a11_wifi_ready;
+ extern void sweet_a80211_ready(void);
+ 
++static char a11_seq[200];               /* xnu 0165: the first requests in order, "g43 g12 s10!45 ..." */
++
+ static void
+ a11_count(int set, uint32_t type, int err)
+ {
++	size_t sl = strlen(a11_seq);
++	if (sl < sizeof(a11_seq) - 12) {
++		snprintf(a11_seq + sl, sizeof(a11_seq) - sl, err ? " %c%u!%d" : " %c%u", set ? 's' : 'g', type, err);
++	}
+ 	for (int i = 0; i < a11_nstats; i++) {
+ 		if (a11_stats[i].type == type && a11_stats[i].set == set) {
+ 			a11_stats[i].n++;
+@@ -2548,6 +2554,7 @@ a11_summary(void)
+ 		}
+ 	}
+ 	printf("%s\n", line);
++	printf("SWEET 80211: order:%s\n", a11_seq[0] ? a11_seq : " (none)");
+ }
+ 
+ static void
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..44b70ac 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -232,10 +232,20 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/*
++	 * xnu 0165: the selectors the system needs are known by now and the same few calls (searchd 35, ReportCrash
++	 * 17, ...) repeated hundreds of times filled TWRP's 16 KB console tail; log the first 48 calls and the first
++	 * 32 failures only.
++	 */
++	static uint32_t logged, failed;
++	if (logged < 48 || (ret != kIOReturnSuccess && failed < 32)) {
++		char name[32];
++		logged++;
++		failed += ret != kIOReturnSuccess;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
