@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 2b4b0d5..69b1aff 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -45,6 +45,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/kern_event.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+ #include <sys/socket.h>
+@@ -2252,13 +2253,66 @@ a11_count(int set, uint32_t type, int err)
+ 	}
+ }
+ 
++/*
++ * xnu 0166: IO80211 events for wifid. IO80211.framework's event socket (SIOCSKEVFILT vendor 1 / class 6 /
++ * subclass 1) reads kern_event_msg: event_code @0x14, the interface name (16 bytes) @0x18 compared with the bound
++ * interface, payload @0x28 (__eventRead, iOS 16.7). wifid waits for APPLE80211_M_DRIVER_AVAILABLE (55) before using
++ * the device: {u64 event, u64 available, u32 reason, u32 sub_reason, pad[160]} (0xb8 bytes).
++ */
++#define A11_EV_LINK_CHANGED 4
++#define A11_EV_SCAN_DONE 10
++#define A11_EV_DRIVER_AVAILABLE 55
++static uint64_t a11_avail_due;          /* mach time: post DRIVER_AVAILABLE then (0 = nothing pending) */
++static uint32_t a11_events;
++
++static void
++a11_post(uint32_t code, const void *data, uint32_t len)
++{
++	struct kev_msg ev;
++	char ifname[16] = "en2";
++
++	memset(&ev, 0, sizeof(ev));
++	ev.vendor_code = KEV_VENDOR_APPLE;
++	ev.kev_class = KEV_IEEE80211_CLASS;
++	ev.kev_subclass = 1;
++	ev.event_code = code;
++	ev.dv[0].data_length = sizeof(ifname);
++	ev.dv[0].data_ptr = ifname;
++	if (len) {
++		ev.dv[1].data_length = len;
++		ev.dv[1].data_ptr = (void *)(uintptr_t)data;
++	}
++	int e = kev_post_msg(&ev);
++	a11_events++;
++	if (a11_events <= 24) {
++		printf("SWEET 80211: event %u (%u bytes) posted, %d\n", code, len, e);
++	}
++}
++
++static void
++a11_post_driver_available(void)
++{
++	uint8_t d[0xb8];
++
++	memset(d, 0, sizeof(d));
++	uint64_t ev = A11_EV_DRIVER_AVAILABLE, avail = 1;
++	memcpy(d + 0, &ev, 8);
++	memcpy(d + 8, &avail, 8);
++	a11_post(A11_EV_DRIVER_AVAILABLE, d, sizeof(d));
++}
++
+ void sweet_a80211_note(const char *what, uint32_t a, uint32_t b);
+ void
+ sweet_a80211_note(const char *what, uint32_t a, uint32_t b)
+ {
+ 	size_t l = strlen(a11_notes);
+-	if (strcmp(what, "open") == 0) {
+-		a11_opens++;
++	if (strcmp(what, "open") == 0 || strcmp(what, "useiouc") == 0) {
++		uint64_t d;
++		if (strcmp(what, "open") == 0) {
++			a11_opens++;
++		}
++		nanoseconds_to_absolutetime(3ull * NSEC_PER_SEC, &d);
++		a11_avail_due = mach_absolute_time() + d;       /* wifid listens once its bind is done */
+ 	}
+ 	if (l < sizeof(a11_notes) - 32) {
+ 		snprintf(a11_notes + l, sizeof(a11_notes) - l, " %s:%x/%x", what, a, b);
+@@ -2687,6 +2741,10 @@ wifi_run(uint32_t panic_off)
+ 			printf("SWEET A8 WIFI: %s\n", d);
+ 			return;
+ 		}
++		if (a80211_on && a11_avail_due && now > a11_avail_due) {
++			a11_avail_due = 0;
++			a11_post_driver_available();
++		}
+ 		if (a80211_on) {
+ 			static uint64_t a11_t0;
+ 			if (a11_t0 == 0 || now - a11_t0 > 10 * lim3) {     /* 30 s */
