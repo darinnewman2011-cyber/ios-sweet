@@ -1,0 +1,76 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2..9702b19 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -742,10 +742,25 @@ ml_get_machine_mem(void)
+ 	return machine_info.memory_size;
+ }
+ 
++#if defined(SWEET_JACKPOTLTE)
++int sweet_a8_test_mode(void);                   /* osfmk/kern/startup.c */
++void sweet_a8_reboot_recovery(void) __dead2;    /* bsd/dev/sweet_ufs.c */
++#endif
++
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+ {
++#if defined(SWEET_JACKPOTLTE)
++	/*
++	 * xnu 0163: on a test image, iOS's Restart / Shut Down (filesystems already synced and unmounted by now)
++	 * goes straight into TWRP with the console saved, before IOKit's halt callouts (which time out here).
++	 */
++	if (sweet_a8_test_mode()) {
++		printf("SWEET A8: %s from iOS on a test image: into TWRP\n", reboot ? "restart" : "shutdown");
++		sweet_a8_reboot_recovery();
++	}
++#endif
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
+ 		PEHaltRestart(kPERestartCPU);
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 35b79ff..4d73bde 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -591,6 +591,7 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
+  */
+ #if defined(SWEET_JACKPOTLTE)
+ #include <kern/thread_call.h>
++#include <kern/clock.h>
+ void sweet_early_kick(void);     /* osfmk/arm64/sweet_early.c */
+ 
+ /*
+@@ -624,6 +625,18 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	    (int)t->block_hint);
+ 	sweet_early_kick();
+ 	sweet_a8_snapshot();
++	/*
++	 * xnu 0163: 60 s before a test reboot (sweetreboot=N), move the calendar clock back 30 minutes so the status
++	 * bar shows the warning; a Restart / Shut Down from iOS in that time lands in TWRP cleanly (halt_all_cpus).
++	 */
++	if (sweet_boot_reboot_secs > 60 && sweet_boot_hb_secs == ((sweet_boot_reboot_secs - 60) / 5) * 5) {
++		clock_sec_t now_s;
++		clock_usec_t now_us;
++		clock_get_calendar_microtime(&now_s, &now_us);
++		clock_set_calendar_microtime(now_s - 1800, now_us);
++		printf("SWEET A8: test reboot in 60 s: clock moved back 30 min as the warning; Restart or Shut Down now goes "
++		    "to TWRP cleanly\n");
++	}
+ 	if (sweet_boot_reboot_secs && sweet_boot_hb_secs >= sweet_boot_reboot_secs) {
+ 		printf("SWEET A8: %us up, rebooting into TWRP (sweetreboot)\n", sweet_boot_hb_secs);
+ 		sweet_a8_reboot_recovery();
+@@ -632,6 +645,14 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	thread_call_enter_delayed(sweet_boot_hb_call, deadline);
+ }
+ 
++/* xnu 0163: a test image (sweetreboot != 0): halt_all_cpus() sends iOS's own restart / shutdown to TWRP */
++int sweet_a8_test_mode(void);
++int
++sweet_a8_test_mode(void)
++{
++	return sweet_boot_reboot_secs != 0;
++}
++
+ static void
+ sweet_boot_hb_start(void)
+ {
