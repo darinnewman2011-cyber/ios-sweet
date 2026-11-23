@@ -1,0 +1,51 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 20:30:51
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 20:30:51
+@@ -664,6 +664,36 @@
+ #define MMC_IDSTS32     0x08c
+ #define MMC_IDINTEN32   0x090
+ static int mmc_dma64 = -1;                      /* -1: HCON not read yet */
++/*
++ * xnu 0148: ios107u (HCON: IDMAC 64-bit) still never had a descriptor taken. The DT links this controller to the
++ * Exynos SMU (mmc-exynos-smu = /smu, samsung,exynos-smu), the access-control unit in front of the IDMAC, and Samsung's
++ * driver sets it up through the secure world at probe (dw_mci_probe: access_control_sec_cfg, then _init;
++ * crypto/fmp/smu_dev.c): SMC_CMD_FMP_SECURITY 0xC2001810 (0, SMU_EMBEDDED 0, CFG_DESCTYPE 3 = FMP descriptors) and
++ * SMC_CMD_SMU 0xC2001850 (SMU_INIT 0, SMU_EMBEDDED 0, 0). PIO (CPU reads of the FIFO) never needed it. Done once
++ * before the first DMA; the MPS entry-0 registers (controller +0x1200) are logged before and after.
++ */
++#define MMC_MPSBEGIN0   0x1200
++#define MMC_MPSEND0     0x1204
++#define MMC_MPSLUN0     0x1208
++#define MMC_MPSCTRL0    0x120c
++static uint64_t
++mmc_smc4(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) :: "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++static void
++mmc_smu_show(const char *when)
++{
++	printf("SWEET MMC: SMU %s: MPSBEGIN0 0x%08x MPSEND0 0x%08x MPSLUN0 0x%08x MPSCTRL0 0x%08x\n", when,
++	    ufs_rd(MMC_MPSBEGIN0), ufs_rd(MMC_MPSEND0), ufs_rd(MMC_MPSLUN0), ufs_rd(MMC_MPSCTRL0));
++}
+ static uint64_t mmc_dma_above4g;                /* 32-bit mode: transfers left to PIO */
+ static uint32_t mmc_dma_chk[MMC_MULTI_MAX * UFS_BLOCK / 4] __attribute__((aligned(64)));
+ static uint64_t mmc_dma_check_lba;
+@@ -716,6 +746,11 @@
+ 			mmc_dma = 0;
+ 			return EINVAL;
+ 		}
++		mmc_smu_show("before");
++		uint64_t sec = mmc_smc4(0xC2001810ull, 0, 0, 3);
++		uint64_t init = mmc_smc4(0xC2001850ull, 0, 0, 0);
++		printf("SWEET MMC: SMC FMP_SECURITY(0, 0, 3) -> 0x%llx, SMC SMU(INIT, EMBEDDED) -> 0x%llx\n", sec, init);
++		mmc_smu_show("after");
+ 	}
+ 	/* descriptors: one per 4 KiB piece that does not cross a 4 KiB boundary */
+ 	for (uint32_t off = 0; off < bytes;) {

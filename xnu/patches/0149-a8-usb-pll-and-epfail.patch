@@ -1,0 +1,79 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 20:32:32
++++ b/bsd/dev/sweet_usb.c	2026-11-22 20:32:32
+@@ -158,6 +158,8 @@
+ 	int step;
+ 	vm_offset_t ucon, dwc;
+ 	uint32_t id;
++	uint32_t pll0, pll1;           /* xnu 0149: PLL_USB CON0 before / after */
++	uint32_t epfail, depcmd;        /* first failed endpoint command: ep << 16 | cmd << 8 | status (0xff timeout) */
+ } a8u;
+ static const char *const a8u_step[] = {
+ 	"started", "gates on", "DWC3 ID ok", "PHY set up", "role set", "soft reset done",
+@@ -180,6 +182,8 @@
+ 		} else {
+ 			printf("SWEET USB: status: step %d (%s), GSNPSID 0x%08x\n", st, name, a8u.id);
+ 		}
++		printf("SWEET USB: status: PLL_USB 0x%08x -> 0x%08x; first failed ep cmd 0x%06x (DEPCMD 0x%08x)\n",
++		    a8u.pll0, a8u.pll1, a8u.epfail, a8u.depcmd);
+ 	}
+ }
+ 
+@@ -213,6 +217,32 @@
+ 	}
+ 	printf("SWEET USB: QCH hsdrd 0x%08x usb20 0x%08x usb30_0 0x%08x usb30_1 0x%08x\n",
+ 	    usb_rd(fsys, 0x3034), usb_rd(fsys, 0x3038), usb_rd(fsys, 0x303c), usb_rd(fsys, 0x3040));
++	/*
++	 * xnu 0149: the USB 2.0 PHY's reference clock is PLL_OUT_USB (DT phy_refclk "out_usb", clock 0x10a =
++	 * CLK_FSYS_BASE + 16), the FSYS PLL_USB at +0x1a0 (PLL_1418X: enable 31, stable 29, M 25:16, P 13:8,
++	 * S 2:0). Samsung runs it at 50 MHz: M 400, P 13, S 4 from the 26 MHz oscillator (cmucal-node.c
++	 * pll_usb_rate_table). ios107u failed its first endpoint command, as a DWC3 does without a PHY clock.
++	 */
++	{
++		const uint32_t mps = (400u << 16) | (13u << 8) | 4u, mask = (0x3ffu << 16) | (0x3fu << 8) | 7u;
++		uint32_t pll = usb_rd(fsys, 0x1a0);
++
++		a8u.pll0 = pll;
++		printf("SWEET USB: PLL_USB CON0 0x%08x (enable %u, stable %u, M %u P %u S %u)\n", pll, (pll >> 31) & 1,
++		    (pll >> 29) & 1, (pll >> 16) & 0x3ff, (pll >> 8) & 0x3f, pll & 7);
++		if (enabled >= 2 && (!(pll & (1u << 31)) || (pll & mask) != mps)) {
++			a8_usb_wr(fsys, 0x1a0, pll & ~(1u << 31));
++			a8_usb_wr(fsys, 0x1a0, ((pll & ~(1u << 31)) & ~mask) | mps);
++			a8_usb_wr(fsys, 0x1a0, usb_rd(fsys, 0x1a0) | (1u << 31));
++			int w;
++			for (w = 0; w < 100 && !(usb_rd(fsys, 0x1a0) & (1u << 29)); w++) {
++				delay(100);
++			}
++			printf("SWEET USB: PLL_USB set to 50 MHz: CON0 0x%08x, %s after %d x 100 us\n", usb_rd(fsys, 0x1a0),
++			    (usb_rd(fsys, 0x1a0) & (1u << 29)) ? "stable" : "NOT stable", w);
++		}
++		a8u.pll1 = usb_rd(fsys, 0x1a0);
++	}
+ 	a8u.step = 1;
+ 	if (enabled < 2) {
+ 		printf("SWEET USB: sweetusb=1: clocks reported, USB left off\n");
+@@ -489,6 +519,12 @@
+ 			uint32_t status = (v >> 12) & 0xf;
+ 			if (status) {
+ 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
++#if defined(SWEET_JACKPOTLTE)
++				if (!a8u.epfail) {
++					a8u.epfail = (ep << 16) | ((cmd & 0xf) << 8) | status;
++					a8u.depcmd = v;
++				}
++#endif
+ 				return -1;
+ 			}
+ 			return 0;
+@@ -496,6 +532,12 @@
+ 		delay(1);
+ 	}
+ 	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++#if defined(SWEET_JACKPOTLTE)
++	if (!a8u.epfail) {
++		a8u.epfail = (ep << 16) | ((cmd & 0xf) << 8) | 0xff;
++		a8u.depcmd = dwc_rd(DEPCMD(ep));
++	}
++#endif
+ 	return -1;
+ }
+ 
