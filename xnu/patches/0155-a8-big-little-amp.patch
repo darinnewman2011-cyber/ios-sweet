@@ -1,0 +1,30 @@
+--- a/pexpert/pexpert/arm64/board_config.h	2026-11-22 22:41:41
++++ b/pexpert/pexpert/arm64/board_config.h	2026-11-22 22:41:41
+@@ -102,7 +102,12 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
++#if defined(SWEET_JACKPOTLTE)
++/* xnu 0155: two clusters for the AMP scheduler: A53s (E) and A73s (P), from the ADT's cluster-type */
++#define MAX_CPU_CLUSTERS               2
++#else
+ #define MAX_CPU_CLUSTERS               1
++#endif
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 
+--- a/pexpert/pexpert/arm64/SWEET.h	2026-11-22 22:41:41
++++ b/pexpert/pexpert/arm64/SWEET.h	2026-11-22 22:41:41
+@@ -82,6 +82,12 @@
+  */
+ #define __ARM64_PMAP_SUBPAGE_L1__ 1
+ #define SWEET_GICV2               1
++/*
++ * xnu 0155: Exynos 7885 is big.LITTLE (2x A73 at 2184 MHz, 6x A53 at 1690 MHz). XNU's AMP scheduler
++ * (sched_amp: P first, spill to E, background on E) needs __ARM_AMP__ plus cluster-type 'E'/'P' on the ADT's cpu
++ * nodes (a8art12/jackpotlte-island-amp.adt). Without CLPC every core counts as recommended.
++ */
++#define __ARM_AMP__               1
+ #else
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+ #define __ARM_PAN_AVAILABLE__     1
