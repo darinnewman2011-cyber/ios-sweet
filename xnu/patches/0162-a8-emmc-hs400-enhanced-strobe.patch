@@ -1,0 +1,175 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e8c7c8f..3764fcf 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -705,6 +705,7 @@ mmc_smu_show(const char *when)
+ static uint64_t mmc_dma_above4g;                /* 32-bit mode: transfers left to PIO */
+ static uint32_t mmc_hcon;                       /* xnu 0150: kept for the 30 s status line */
+ static uint32_t mmc_fifoth0, mmc_fifoth1;       /* xnu 0153: FIFOTH before / after */
++static char mmc_hs400_note[160] = "HS400 off (sweeths400=0)";     /* xnu 0162 */
+ static uint64_t mmc_smc_sec = ~0ull, mmc_smc_init = ~0ull;
+ static uint32_t mmc_dma_chk[MMC_MULTI_MAX * UFS_BLOCK / 4] __attribute__((aligned(64)));
+ static uint64_t mmc_dma_check_lba;
+@@ -1487,6 +1488,7 @@ wst_thread(__unused void *arg, __unused wait_result_t wr)
+ 			    mdma.write ? 25 : 18, mdma.n, mdma.lba, mdma.rint, mdma.ids, mdma.where, mdma.r1, mdma.d0,
+ 			    mdma.checked, mdma.mismatch, mmc_dma64 < 0 ? 0 : (mmc_dma64 ? 64 : 32), mmc_dma_above4g);
+ 			printf("SWEET MMC: FIFOTH 0x%08x -> 0x%08x now 0x%08x\n", mmc_fifoth0, mmc_fifoth1, ufs_rd(0x04c));
++			printf("SWEET MMC: %s\n", mmc_hs400_note);
+ 			{
+ 				/* xnu 0157: the boot lines that prove these scroll out of ramoops; repeat the facts every 30 s */
+ 				static vm_offset_t g3d;
+@@ -1807,6 +1809,146 @@ ufs_take_over_host(void)
+ 	return 0;
+ }
+ #else /* SWEET_JACKPOTLTE */
++/*
++ * HS400 with enhanced strobe (xnu 0162, boot-arg sweeths400=1). S-Boot leaves the eMMC in DDR52 8-bit: CMU
++ * MMC_EMBD at 400 MHz (PLL_SHARED0/2 = 799.5 MHz divided by 2), CLKSEL divider 3, card clock 50 MHz DDR. Android
++ * ran this card (BJTD4R) at HS400 + enhanced strobe. From Samsung's SM-A530F kernel (dw_mmc-exynos.c set_ios /
++ * config_hs400, read for facts) and the stock device tree (ciu_clkin HS400 200 MHz, hs400-timing <1 0 2 0>,
++ * hs400-delay-line 0x60, txdt-crc-timer 0x13/0x15):
++ *   card: CMD6 BUS_WIDTH (183) = 0x86 (8-bit DDR + strobe), CMD6 HS_TIMING (185) = 3 (HS400)
++ *   host: card clock off; CMU_TOP CLK_CON_DIV_CLKCMU_FSYS_MMC_EMBD (0x1206184c) ratio 0 = 799.5 MHz; CLKSEL timing
++ *         divider 1 / drive 2 / sample 0 (CIU 400 MHz, card 200 MHz with the unchanged CLKDIV); HS400_DQS_EN
++ *         (0x180) = CRC timers 0x13/0x15 | DATA_STROBE/RDDQS | RESP_RCLK_MODE (enhanced strobe) | AXI non-blocking;
++ *         HS400_DLINE_CTRL (0x188) = FIFO clock delay 2 | read DQS delay 0x60; card clock on.
++ * Then CMD13 must say TRAN and 16 known sectors must read back identically, else everything is put back to DDR52
++ * before anything else touches the card. mmc_hs400_note goes into the 30 s status line.
++ */
++#define MMC_CLKDIV      0x008
++#define MMC_CLKENA      0x010
++#define CMD_UPD_CLK             (1u << 21)
++#define MMC_DQS_EN      0x180
++#define MMC_DLINE       0x188
++#define CMU_TOP_PA      0x12060000u
++#define CMU_MMC_DIV     0x184c
++
++static bool
++mmc_update_clock(void)
++{
++	ufs_wr(MMC_CMDARG, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ufs_wr(MMC_CMD, CMD_START | CMD_UPD_CLK | CMD_PRV_DAT_WAIT | mmc_hold);
++	return mmc_wait(MMC_CMD, CMD_START, 0, 10 * NSEC_PER_MSEC);
++}
++
++/* host side: clock off, CMU divider, CLKSEL, strobe registers, clock on */
++static bool
++mmc_host_timing(volatile uint32_t *cmu, uint32_t div, uint32_t clksel, uint32_t dqs, uint32_t dline)
++{
++	bool ok;
++
++	ufs_wr(MMC_CLKENA, 0);
++	ok = mmc_update_clock();
++	cmu[CMU_MMC_DIV / 4] = (cmu[CMU_MMC_DIV / 4] & ~0x1ffu) | div;
++	for (int i = 0; i < 1000 && (cmu[CMU_MMC_DIV / 4] & (1u << 16)); i++) {      /* BUSY */
++		delay(1);
++	}
++	ufs_wr(MMC_CLKSEL, clksel);
++	mmc_hold = ((clksel >> 16) & 7) ? CMD_USE_HOLD_REG : 0;
++	ufs_wr(MMC_DQS_EN, dqs);
++	ufs_wr(MMC_DLINE, dline);
++	ufs_wr(MMC_CLKENA, 1);
++	ok = mmc_update_clock() && ok;
++	delay(100);
++	return ok;
++}
++
++static int
++mmc_switch(uint32_t index, uint32_t value, bool status)
++{
++	uint32_t resp = 0, st = mmc_cmd(6, (3u << 24) | (index << 16) | (value << 8), CMD_RESP_EXP | CMD_RESP_CRC, &resp);
++
++	if (st == UINT32_MAX || (st & INT_ERROR)) {
++		return EIO;
++	}
++	if (!mmc_wait(MMC_STATUS, STATUS_BUSY, 0, MMC_DATA_NS)) {
++		return ETIMEDOUT;
++	}
++	return status ? mmc_wait_tran(0) : 0;
++}
++
++static void
++mmc_hs400(void)
++{
++	static uint32_t ref[16][128], got[128];
++	static const uint64_t lbas[16] = { 0, 1, 2, 3, 34, 35, 64, 1000, 4096, 65536, 131072, 524288, 1048576, 2097152,
++		                           4194304, 8388608 };
++	uint32_t on = 0, resp = 0;
++	int e = 0, bad = -1;
++
++	if (!PE_parse_boot_argn("sweeths400", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	volatile uint32_t *cmu = (volatile uint32_t *)ml_io_map(CMU_TOP_PA, 0x2000);
++	uint32_t div0 = cmu[CMU_MMC_DIV / 4] & 0x1ff, clksel0 = ufs_rd(MMC_CLKSEL), dqs0 = ufs_rd(MMC_DQS_EN);
++	uint32_t dline0 = ufs_rd(MMC_DLINE), uhs = ufs_rd(MMC_UHS_REG), clkdiv = ufs_rd(MMC_CLKDIV);
++	printf("SWEET MMC: HS400: start: CMU div %u, CLKSEL 0x%x, DQS 0x%x, DLINE 0x%x, UHS 0x%x, CLKDIV 0x%x\n", div0,
++	    clksel0, dqs0, dline0, uhs, clkdiv);
++	for (int i = 0; i < 16 && !e; i++) {
++		e = mmc_read_sector(lbas[i], ref[i]);
++	}
++	if (e) {
++		snprintf(mmc_hs400_note, sizeof(mmc_hs400_note), "HS400 not tried: reference read failed (%d)", e);
++		return;
++	}
++	if (div0 != 1 || ((clksel0 >> 24) & 7) != 3 || !(uhs & 0x10000)) {
++		snprintf(mmc_hs400_note, sizeof(mmc_hs400_note), "HS400 not tried: not the expected DDR52 state (div %u CLKSEL "
++		    "0x%x UHS 0x%x)", div0, clksel0, uhs);
++		return;
++	}
++	/* card: 8-bit DDR with strobe, then HS400 */
++	e = mmc_switch(183, 0x86, true);
++	if (!e) {
++		e = mmc_switch(185, 3, false) ? 2 : 0;
++	} else {
++		e = 1;
++	}
++	if (!e) {
++		uint32_t clksel = (clksel0 & ~((7u << 24) | (3u << 22) | (7u << 16) | 0xfu | (1u << 30) | (1u << 19))) |
++		    (1u << 24) | (2u << 16);
++		uint32_t dqs = (dqs0 & ~((0xffu << 16) | (0xffu << 8))) | (0x13u << 16) | (0x15u << 8) | (1u << 7) |
++		    (1u << 5) | 1u;
++		uint32_t dline = (2u << 16) | 0x60u;
++		if (!mmc_host_timing(cmu, 0, clksel, dqs, dline)) {
++			e = 3;
++		} else if (mmc_wait_tran(0)) {
++			e = 4;
++		}
++	}
++	if (!e) {
++		for (int i = 0; i < 16 && bad < 0; i++) {
++			if (mmc_read_sector(lbas[i], got) || memcmp(got, ref[i], 512)) {
++				bad = i;
++			}
++		}
++		if (bad >= 0) {
++			e = 5;
++		}
++	}
++	if (!e) {
++		snprintf(mmc_hs400_note, sizeof(mmc_hs400_note), "HS400 ES ON: CIU 400 MHz, card 200 MHz DDR; 16/16 sectors "
++		    "match; CLKSEL 0x%x DQS 0x%x DLINE 0x%x", ufs_rd(MMC_CLKSEL), ufs_rd(MMC_DQS_EN), ufs_rd(MMC_DLINE));
++		printf("SWEET MMC: %s\n", mmc_hs400_note);
++		return;
++	}
++	/* back to DDR52: host first (slower clock is fine for the card), then HS timing and DDR 8-bit */
++	(void)mmc_host_timing(cmu, div0, clksel0, dqs0, dline0);
++	int r1 = mmc_switch(185, 1, false), r2 = mmc_switch(183, 6, true);
++	(void)mmc_cmd(13, MMC_RCA << 16, CMD_RESP_EXP | CMD_RESP_CRC, &resp);
++	snprintf(mmc_hs400_note, sizeof(mmc_hs400_note), "HS400 FAILED at step %d%s%d, back to DDR52 (switch %d/%d, r1 0x%x)",
++	    e, bad >= 0 ? " sector " : " ", bad, r1, r2, resp);
++	printf("SWEET MMC: %s\n", mmc_hs400_note);
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -1830,6 +1972,7 @@ ufs_take_over_host(void)
+ 		    MMC_RCA, st, resp);
+ 		return ENXIO;
+ 	}
++	mmc_hs400();
+ 	return 0;
+ }
+ #endif /* SWEET_JACKPOTLTE */
