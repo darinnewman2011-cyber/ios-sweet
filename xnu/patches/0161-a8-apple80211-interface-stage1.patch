@@ -384,10 +384,10 @@ index d8eed73..5db0b07 100644
  }
 diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
 new file mode 100644
-index 0000000..41a3e7a
+index 0000000..ca60821
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,214 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 Wi-Fi as an Apple Wi-Fi interface (boot-arg a8wifi80211=1), stage 1.
@@ -545,7 +545,14 @@ index 0000000..41a3e7a
 +	}
 +	bzero(req, A80211_REQ_SIZE);
 +	if (args->structureInputDescriptor != NULL) {
-+		if (args->structureInputDescriptor->readBytes(0, req, in_size) != in_size) {
++		/* out-of-line (> 4 KB) structures arrive unwired: prepare() before touching them (else IOGMD panics) */
++		IOMemoryDescriptor *md = args->structureInputDescriptor;
++		if (md->prepare(kIODirectionOut) != kIOReturnSuccess) {
++			return kIOReturnVMError;
++		}
++		IOByteCount got = md->readBytes(0, req, in_size);
++		md->complete(kIODirectionOut);
++		if (got != in_size) {
 +			return kIOReturnBadArgument;
 +		}
 +	} else {
@@ -578,7 +585,12 @@ index 0000000..41a3e7a
 +			outlen = out_cap;
 +		}
 +		if (args->structureOutputDescriptor != NULL) {
-+			args->structureOutputDescriptor->writeBytes(0, reply, outlen);
++			IOMemoryDescriptor *md = args->structureOutputDescriptor;
++			if (md->prepare(kIODirectionIn) != kIOReturnSuccess) {
++				return kIOReturnVMError;
++			}
++			md->writeBytes(0, reply, outlen);
++			md->complete(kIODirectionIn);
 +			args->structureOutputDescriptorSize = outlen;
 +		} else {
 +			bcopy(reply, args->structureOutput, outlen);
