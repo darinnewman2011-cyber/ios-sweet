@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
+index a1a8369..66e9e8c 100644
+--- a/iokit/Kernel/arm/SweetA8WiFi.cpp
++++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
+@@ -28,6 +28,7 @@
+ #include <libkern/c++/OSString.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <sys/proc.h>
++#include <IOKit/IORegistryEntry.h>
+ 
+ extern "C" int sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint32_t inlen,
+     void *out, uint32_t outcap, uint32_t *outlen);
+@@ -40,6 +41,40 @@ extern "C" void sweet_a80211_ready(void);
+ #define A80211_SIOCGA     0xc02869c9u
+ #define A80211_SIOCSA     0x802869c8u
+ 
++/*
++ * xnu 0170: which IOServices keep IOKit busy. SystemConfiguration's __wait_for_IOKit_to_quiesce (behind
++ * SCNetworkInterfaceCopyAll) waits for configd's InterfaceNamer to see IOKit quiet; wifid hangs there on the A8.
++ * Printed with the test-reboot backtraces: the root's busy state and every service still busy.
++ */
++extern "C" void sweet_dump_iokit_busy(void);
++extern "C" void
++sweet_dump_iokit_busy(void)
++{
++	IOService *root = IOService::getServiceRoot();
++	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	int shown = 0, busy = 0;
++
++	IOLog("SWEET BUSY: root busy %u\n", root ? root->getBusyState() : 0xffffffffu);
++	if (it == NULL) {
++		return;
++	}
++	OSObject *o;
++	while ((o = it->getNextObject()) != NULL) {
++		IOService *svc = OSDynamicCast(IOService, o);
++		if (svc == NULL || svc->getBusyState() == 0) {
++			continue;
++		}
++		busy++;
++		if (shown < 40) {
++			shown++;
++			IOLog("SWEET BUSY: %s (%s) busy %u%s\n", svc->getName(), svc->getMetaClass()->getClassName(),
++			    svc->getBusyState(), svc->isInactive() ? " inactive" : "");
++		}
++	}
++	it->release();
++	IOLog("SWEET BUSY: %d busy services\n", busy);
++}
++
+ /* Called from the Wi-Fi service thread once the radio's WLAN service runs: lets the personality below match. */
+ extern "C" void
+ sweet_a80211_ready(void)
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 0d9e9e3..f400829 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -646,6 +646,8 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 		if (bt[0] != '-') {
+ 			sweet_dump_user_bt(bt);
+ 		}
++		extern void sweet_dump_iokit_busy(void);
++		sweet_dump_iokit_busy();
+ 	}
+ 	if (sweet_boot_reboot_secs && sweet_boot_hb_secs >= sweet_boot_reboot_secs) {
+ 		printf("SWEET A8: %us up, rebooting into TWRP (sweetreboot)\n", sweet_boot_hb_secs);
