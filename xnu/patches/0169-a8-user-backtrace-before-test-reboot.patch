@@ -1,0 +1,107 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..6e95c05 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -835,6 +835,81 @@ exception_triage(
+ void sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
+ static void sweet_crash_strings(const char *name);
+ 
++/*
++ * xnu 0169: user backtraces of a running (stuck) process for the console, e.g. wifid before a test reboot:
++ * per thread its wait state, pc/lr and a 12-frame frame-pointer chain read with vm_map_read_user, plus the
++ * task's shared-cache slide and Mach-O header for symbolication. Threads are referenced under the locks and
++ * walked after dropping them (reading user memory can fault).
++ */
++extern queue_head_t tasks;
++extern lck_mtx_t tasks_threads_lock;
++void sweet_dump_user_bt(const char *want);
++
++void
++sweet_dump_user_bt(const char *want)
++{
++	task_t task = TASK_NULL, t;
++	thread_t th, list[48];
++	int n = 0;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, t, task_t, tasks) {
++		void *bp = get_bsdtask_info(t);
++		const char *nm = bp ? proc_name_address(bp) : NULL;
++		if (nm && strncmp(nm, want, 16) == 0) {
++			task = t;
++			task_reference(task);
++			break;
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	if (task == TASK_NULL) {
++		printf("SWEET BT: no process %s\n", want);
++		return;
++	}
++	uint64_t slide = 0, mh = task->mach_header_vm_address;
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	task_lock(task);
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		if (n < (int)(sizeof(list) / sizeof(list[0]))) {
++			thread_reference(th);
++			list[n++] = th;
++		}
++	}
++	task_unlock(task);
++	printf("SWEET BT: %s: %d threads, slide 0x%llx mh 0x%llx\n", want, n, slide, mh);
++	for (int i = 0; i < n; i++) {
++		th = list[i];
++		arm_saved_state_t *ss = find_user_regs(th);
++		char line[300];
++		int l = snprintf(line, sizeof(line), "SWEET BT: %s t%llx st 0x%x ev 0x%llx hint %d", want, th->thread_id,
++		    th->state, (unsigned long long)th->wait_event, (int)th->block_hint);
++		if (ss != NULL && is_saved_state64(ss)) {
++			uint64_t fp = get_saved_state_fp(ss);
++			l += snprintf(line + l, sizeof(line) - (size_t)l, " pc 0x%llx lr 0x%llx bt", get_saved_state_pc(ss),
++			    get_saved_state_lr(ss));
++			for (int k = 0; k < 12 && fp && (fp & 7) == 0 && l < (int)sizeof(line) - 20; k++) {
++				uint64_t fr[2];
++				if (vm_map_read_user(task->map, (vm_map_address_t)fp, fr, sizeof(fr)) != KERN_SUCCESS) {
++					break;
++				}
++				l += snprintf(line + l, sizeof(line) - (size_t)l, " 0x%llx", fr[1]);
++				if (fr[0] <= fp) {
++					break;
++				}
++				fp = fr[0];
++			}
++		}
++		printf("%s\n", line);
++		thread_deallocate(th);
++	}
++	task_deallocate(task);
++}
++
+ void
+ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
+ {
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 4d73bde..0d9e9e3 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -637,6 +637,16 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 		printf("SWEET A8: test reboot in 60 s: clock moved back 30 min as the warning; Restart or Shut Down now goes "
+ 		    "to TWRP cleanly\n");
+ 	}
++	/* xnu 0169: before a test reboot, the stuck process's threads (boot-arg sweetbt=NAME, default wifid) */
++	if (sweet_boot_reboot_secs > 20 && sweet_boot_hb_secs == ((sweet_boot_reboot_secs - 10) / 5) * 5) {
++		char bt[16] = "wifid";
++		extern void sweet_dump_user_bt(const char *want);
++		(void)PE_parse_boot_argn("sweetbt", bt, sizeof(bt));
++		bt[15] = 0;
++		if (bt[0] != '-') {
++			sweet_dump_user_bt(bt);
++		}
++	}
+ 	if (sweet_boot_reboot_secs && sweet_boot_hb_secs >= sweet_boot_reboot_secs) {
+ 		printf("SWEET A8: %us up, rebooting into TWRP (sweetreboot)\n", sweet_boot_hb_secs);
+ 		sweet_a8_reboot_recovery();
