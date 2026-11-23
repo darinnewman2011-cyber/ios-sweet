@@ -1,0 +1,623 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index d8eed73..5db0b07 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -407,6 +407,7 @@ static char wl_status[160];
+ static char join_ssid[33];
+ static volatile int join_req;
+ static int vif_up, joining, connected;  /* station vif 1 added; join in progress; associated */
++static int a80211_on;                   /* boot-arg a8wifi80211=1: answer IO80211 (iokit/Kernel/arm/SweetA8WiFi.cpp) */
+ static uint32_t rx_frames;
+ static ifnet_t wl_ifp;
+ static int dh_state, dh_tries;  /* DHCP: 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 ACKed, 4 configured, 5 gave up */
+@@ -1042,7 +1043,8 @@ en_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ 	case SIOCGIFMEDIA32:
+ 	case SIOCGIFMEDIA64: {
+ 		struct ifmediareq *ifmr = data;         /* the fields before ifm_ulist are the same in both forms */
+-		ifmr->ifm_current = ifmr->ifm_active = IFM_ETHER | IFM_AUTO;
++		/* IO80211's interface list keeps only interfaces whose media is IEEE 802.11 */
++		ifmr->ifm_current = ifmr->ifm_active = (a80211_on ? IFM_IEEE80211 : IFM_ETHER) | IFM_AUTO;
+ 		ifmr->ifm_mask = 0;
+ 		ifmr->ifm_status = IFM_AVALID | (connected ? IFM_ACTIVE : 0);
+ 		ifmr->ifm_count = 0;
+@@ -2184,6 +2186,330 @@ bt_cmd(const char *cmd)
+ 	return 0;
+ }
+ 
++/*
++ * Apple80211 front end (a8wifi80211=1, stage 1). iokit/Kernel/arm/SweetA8WiFi.cpp turns each IO80211 get/set into a
++ * call here. Layouts (version 1, little-endian) are those of IO80211's apple80211_*_data structures as AirportItlwm's
++ * reverse-engineered headers describe them (OpenIntelWireless/itlwm, read for facts). Unknown types answer
++ * EOPNOTSUPP; every type is counted and summarised every 30 s ("SWEET 80211:"), which is how the next stage learns
++ * what wifid needs. Returns an errno (0 = success); *outlen = bytes of reply written to out.
++ */
++#define A11_SSID 1
++#define A11_AUTH_TYPE 2
++#define A11_CHANNEL 4
++#define A11_TXPOWER 7
++#define A11_RATE 8
++#define A11_BSSID 9
++#define A11_SCAN_REQ 10
++#define A11_SCAN_RESULT 11
++#define A11_CARD_CAPABILITIES 12
++#define A11_STATE 13
++#define A11_PHY_MODE 14
++#define A11_OP_MODE 15
++#define A11_RSSI 16
++#define A11_NOISE 17
++#define A11_POWER 19
++#define A11_ASSOCIATE 20
++#define A11_DISASSOCIATE 22
++#define A11_SUPPORTED_CHANNELS 27
++#define A11_LOCALE 28
++#define A11_DRIVER_VERSION 43
++#define A11_HARDWARE_VERSION 44
++#define A11_COUNTRY_CODE 51
++
++struct a11_stat {
++	uint16_t type;
++	uint8_t set;
++	uint8_t err;
++	uint32_t n;
++};
++static struct a11_stat a11_stats[48];
++static int a11_nstats;
++static uint32_t a11_total, a11_opens, a11_scan_cursor;
++static char a11_notes[160];
++static int a11_wifi_ready;
++extern void sweet_a80211_ready(void);
++
++static void
++a11_count(int set, uint32_t type, int err)
++{
++	for (int i = 0; i < a11_nstats; i++) {
++		if (a11_stats[i].type == type && a11_stats[i].set == set) {
++			a11_stats[i].n++;
++			a11_stats[i].err = (uint8_t)err;
++			return;
++		}
++	}
++	if (a11_nstats < (int)(sizeof(a11_stats) / sizeof(a11_stats[0]))) {
++		a11_stats[a11_nstats++] = (struct a11_stat){ (uint16_t)type, (uint8_t)set, (uint8_t)err, 1 };
++	}
++}
++
++void sweet_a80211_note(const char *what, uint32_t a, uint32_t b);
++void
++sweet_a80211_note(const char *what, uint32_t a, uint32_t b)
++{
++	size_t l = strlen(a11_notes);
++	if (strcmp(what, "open") == 0) {
++		a11_opens++;
++	}
++	if (l < sizeof(a11_notes) - 32) {
++		snprintf(a11_notes + l, sizeof(a11_notes) - l, " %s:%x/%x", what, a, b);
++	}
++	printf("SWEET 80211: %s %#x %#x\n", what, a, b);
++}
++
++static void
++a11_put32(uint8_t *o, uint32_t off, uint32_t v)
++{
++	memcpy(o + off, &v, 4);
++}
++
++/* channel number and apple80211 channel flags (20 MHz, 2.4 or 5 GHz) for a centre frequency */
++static void
++a11_chan(uint16_t mhz, uint32_t *ch, uint32_t *flags)
++{
++	if (mhz < 2400) {
++		*ch = 0;
++		*flags = 0x2;
++	} else if (mhz >= 5000) {
++		*ch = (uint32_t)(mhz - 5000) / 5;
++		*flags = 0x2 | 0x10;
++	} else {
++		*ch = mhz == 2484 ? 14 : (uint32_t)(mhz - 2407) / 5;
++		*flags = 0x2 | 0x8;
++	}
++}
++
++static int
++a11_joined(void)
++{
++	return connected && join_idx >= 0 && join_idx < n_nets ? join_idx : -1;
++}
++
++int sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint32_t inlen, void *outv,
++    uint32_t outcap, uint32_t *outlen);
++int
++sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint32_t inlen, void *outv, uint32_t outcap,
++    uint32_t *outlen)
++{
++	uint8_t *o = outv;
++	int err = 0, j = a11_joined();
++	uint32_t n = 0, ch, fl;
++
++	(void)val;
++	a11_total++;
++	*outlen = 0;
++	if (set) {
++		switch (type) {
++		case A11_SCAN_REQ:
++			scan_req = 1;
++			a11_scan_cursor = 0;
++			break;
++		case A11_POWER:         /* the radio stays on in stage 1 */
++			break;
++		case A11_ASSOCIATE:
++			/* apple80211_assoc_data: version, u16 mode, u16 auth lower, u16 auth upper, (pad) u32 ssid_len @12, ssid @16 */
++			if (inlen >= 48) {
++				uint32_t l;
++				memcpy(&l, (const uint8_t *)in + 12, 4);
++				if (l > 0 && l <= 32) {
++					memcpy(join_ssid, (const uint8_t *)in + 16, l);
++					join_ssid[l] = 0;
++					join_req = 1;
++					break;
++				}
++			}
++			err = EINVAL;
++			break;
++		case A11_DISASSOCIATE:
++			break;
++		default:
++			err = EOPNOTSUPP;
++			break;
++		}
++		a11_count(1, type, err);
++		return err;
++	}
++	if (outcap < 4) {
++		a11_count(0, type, EINVAL);
++		return EINVAL;
++	}
++	switch (type) {
++	case A11_DRIVER_VERSION:
++	case A11_HARDWARE_VERSION: {
++		const char *v = type == A11_DRIVER_VERSION ? "SweetA8 SCSC 1.0 (ios-sweet)" : "Samsung S5E7885 WLBT (Maxwell)";
++		uint16_t l = (uint16_t)strlen(v);
++		if (outcap < 6 + (uint32_t)l + 1) {
++			err = ENOSPC;
++			break;
++		}
++		a11_put32(o, 0, 1);
++		memcpy(o + 4, &l, 2);
++		memcpy(o + 6, v, l + 1);
++		n = 6 + 256;
++		break;
++	}
++	case A11_CARD_CAPABILITIES:     /* version + 14 capability bytes; WEP/TKIP/AES/WPA/WPA2 bits for now */
++		a11_put32(o, 0, 1);
++		o[4] = 0x0f;
++		o[5] = 0x06;
++		n = 18;
++		break;
++	case A11_POWER:                 /* version, num_radios, power_state[4] */
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);
++		a11_put32(o, 8, a11_wifi_ready ? 1 : 0);
++		n = 24;
++		break;
++	case A11_STATE:
++		a11_put32(o, 0, 1);
++		if (outcap >= 8) {
++			a11_put32(o, 4, j >= 0 ? 4 : joining ? 3 : scanning ? 1 : 0);
++			n = 8;
++		} else {
++			a11_put32(o, 0, j >= 0 ? 4 : 0);
++			n = 4;
++		}
++		break;
++	case A11_OP_MODE:
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 0x1);   /* infrastructure station */
++		n = 8;
++		break;
++	case A11_PHY_MODE:
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80);  /* auto, 11a/b/g/n/ac */
++		a11_put32(o, 8, j >= 0 ? (nets[j].mhz >= 5000 ? 0x80 : 0x10) : 0x1);
++		n = 12;
++		break;
++	case A11_LOCALE:
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);     /* FCC */
++		n = 8;
++		break;
++	case A11_COUNTRY_CODE:
++		a11_put32(o, 0, 1);
++		memcpy(o + 4, "US", 3);
++		n = 7;
++		break;
++	case A11_SSID:
++		if (j < 0) {
++			err = ENXIO;
++			break;
++		}
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, (uint32_t)strlen(nets[j].ssid));
++		memcpy(o + 8, nets[j].ssid, strlen(nets[j].ssid));
++		n = 40;
++		break;
++	case A11_BSSID:
++		if (j < 0) {
++			err = ENXIO;
++			break;
++		}
++		a11_put32(o, 0, 1);
++		memcpy(o + 4, nets[j].bssid, 6);
++		n = 10;
++		break;
++	case A11_CHANNEL:
++		if (j < 0) {
++			err = ENXIO;
++			break;
++		}
++		a11_chan(nets[j].mhz, &ch, &fl);
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);
++		a11_put32(o, 8, ch);
++		a11_put32(o, 12, fl);
++		n = 16;
++		break;
++	case A11_RSSI:
++	case A11_NOISE: {
++		int32_t v = type == A11_NOISE ? -92 : (j >= 0 ? nets[j].rssi : -100);
++		if (type == A11_RSSI && j < 0) {
++			err = ENXIO;
++			break;
++		}
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);
++		a11_put32(o, 8, 0);     /* dBm */
++		a11_put32(o, 12, (uint32_t)v);
++		a11_put32(o, 28, (uint32_t)v);
++		n = 52;
++		break;
++	}
++	case A11_SUPPORTED_CHANNELS: {
++		static const uint16_t mhz[] = { 2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++			                        5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825 };
++		uint32_t k = 0;
++		a11_put32(o, 0, 1);
++		for (unsigned i = 0; i < sizeof(mhz) / sizeof(mhz[0]) && 8 + (k + 1) * 12 <= outcap; i++, k++) {
++			a11_chan(mhz[i], &ch, &fl);
++			a11_put32(o, 8 + k * 12, 1);
++			a11_put32(o, 12 + k * 12, ch);
++			a11_put32(o, 16 + k * 12, fl);
++		}
++		a11_put32(o, 4, k);
++		n = 8 + 128 * 12;
++		break;
++	}
++	case A11_SCAN_RESULT: {
++		/* one result per get, in the layout AirportItlwm documents (channel @4, rssi @0x16, bssid @0x1c,
++		 * ssid_len @0x60, ssid @0x61); ENXIO after the last one. Layout to be confirmed against wifid. */
++		if (a11_scan_cursor >= (uint32_t)n_nets || scanning) {
++			err = scanning ? EBUSY : ENXIO;
++			break;
++		}
++		struct wnet *w = &nets[a11_scan_cursor++];
++		a11_chan(w->mhz, &ch, &fl);
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);
++		a11_put32(o, 8, ch);
++		a11_put32(o, 12, fl);
++		int16_t noise = -92, rssi = w->rssi, snr = (int16_t)(w->rssi + 92), bi = 100, cap = w->secure ? 0x11 : 0x01;
++		memcpy(o + 0x12, &noise, 2);
++		memcpy(o + 0x14, &snr, 2);
++		memcpy(o + 0x16, &rssi, 2);
++		memcpy(o + 0x18, &bi, 2);
++		memcpy(o + 0x1a, &cap, 2);
++		memcpy(o + 0x1c, w->bssid, 6);
++		o[0x60] = (uint8_t)strlen(w->ssid);
++		memcpy(o + 0x61, w->ssid, strlen(w->ssid));
++		n = 0x88;
++		break;
++	}
++	default:
++		err = EOPNOTSUPP;
++		break;
++	}
++	if (err == 0) {
++		*outlen = n > outcap ? outcap : n;
++	}
++	a11_count(0, type, err);
++	return err;
++}
++
++/* every 30 s from wifi_run: what IO80211 asked for (type x count, !errno) */
++static void
++a11_summary(void)
++{
++	char line[480];
++	int l = snprintf(line, sizeof(line), "SWEET 80211: %u requests, %u opens;%s; get", a11_total, a11_opens,
++	    a11_notes[0] ? a11_notes : " no notes");
++	for (int set = 0; set < 2; set++) {
++		if (set) {
++			l += snprintf(line + l, sizeof(line) - (size_t)l, "; set");
++		}
++		for (int i = 0; i < a11_nstats && l < (int)sizeof(line) - 24; i++) {
++			if (a11_stats[i].set == set) {
++				l += snprintf(line + l, sizeof(line) - (size_t)l, a11_stats[i].err ? " %ux%u!%u" : " %ux%u",
++				    a11_stats[i].type, a11_stats[i].n, a11_stats[i].err);
++			}
++		}
++	}
++	printf("%s\n", line);
++}
++
+ static void
+ wifi_run(uint32_t panic_off)
+ {
+@@ -2244,6 +2570,16 @@ wifi_run(uint32_t panic_off)
+ 	}
+ 	wl_publish("on", d);
+ 	sweet_a8net_set_handler(0, wl_cmd);
++	{
++		int a = 0;
++		a80211_on = PE_parse_boot_argn("a8wifi80211", &a, sizeof(a)) && a == 1;
++	}
++	if (a80211_on) {                        /* en2 now (not at the first join) so wifid finds it, then the service */
++		a11_wifi_ready = 1;
++		net_attach();
++		sweet_a80211_ready();
++		printf("SWEET 80211: a8wifi80211=1: en2 up, IO80211SkywalkInterface published\n");
++	}
+ 	sweet_a8net_set_handler(1, bt_cmd);
+ 	bt_publish("off", "radio running; turn Bluetooth on to start it");
+ 	/* Unattended test: boot-arg a8join=SSID joins that open network after each scan, up to 3 attempts. */
+@@ -2304,6 +2640,13 @@ wifi_run(uint32_t panic_off)
+ 			printf("SWEET A8 WIFI: %s\n", d);
+ 			return;
+ 		}
++		if (a80211_on) {
++			static uint64_t a11_t0;
++			if (a11_t0 == 0 || now - a11_t0 > 10 * lim3) {     /* 30 s */
++				a11_t0 = now;
++				a11_summary();
++			}
++		}
+ 		sleep_ms(20);
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
+new file mode 100644
+index 0000000..21a18d4
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
+@@ -0,0 +1,202 @@
++/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
++/*
++ * Galaxy A8 Wi-Fi as an Apple Wi-Fi interface (boot-arg a8wifi80211=1), stage 1.
++ *
++ * iOS 16's wifid waits for an IOKit service of class IO80211SkywalkInterface (IOServiceAddMatchingNotification), reads
++ * its BSD name, and IO80211.framework then binds to it: _Apple80211FindService matches IOInterfaceName == BSD name,
++ * Apple80211BindToInterfaceWithService calls IOServiceOpen(service, task, 0) and from then on every Apple80211 get/set
++ * is one IOConnectCallStructMethod(selector 0) with a 0x3c30-byte request (iOS 16.7 IO80211, read from the dsc):
++ *   +0x0000 u32 ioctl command: SIOCGA80211 0xc02869c9 (get) / SIOCSA80211 0x802869c8 (set)
++ *   +0x0004 u32 length of the inline data (1..0x3c00), else 0
++ *   +0x0008 the request's data, copied inline
++ *   +0x3c08 struct apple80211req { char ifname[16]; u32 type; u32 val; u32 len; void *data; }
++ * and the reply goes to the output structure: the caller's data buffer (len bytes) or, without one, req_val (4 bytes).
++ * The return value is handed back as the request's error.
++ *
++ * Here: the service is published when the A8's WLAN service is running (bsd/dev/sweet_a8wlbt.c publishes the resource
++ * SweetA8WiFi), named after en2, and requests go to sweet_a80211_request() in that file. Other selectors and the
++ * notification port are only logged for now (stage 1 is about learning what wifid asks).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET_JACKPOTLTE)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSNumber.h>
++#include <sys/proc.h>
++
++extern "C" int sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint32_t inlen,
++    void *out, uint32_t outcap, uint32_t *outlen);
++extern "C" void sweet_a80211_note(const char *what, uint32_t a, uint32_t b);
++extern "C" void sweet_a80211_ready(void);
++
++#define A80211_REQ_SIZE   0x3c30
++#define A80211_DATA_MAX   0x3c00
++#define A80211_REQ_OFF    0x3c08
++#define A80211_SIOCGA     0xc02869c9u
++#define A80211_SIOCSA     0x802869c8u
++
++/* Called from the Wi-Fi service thread once the radio's WLAN service runs: lets the personality below match. */
++extern "C" void
++sweet_a80211_ready(void)
++{
++	IOService::publishResource("SweetA8WiFi", kOSBooleanTrue);
++}
++
++class IO80211SkywalkInterface : public IOService {
++	OSDeclareDefaultStructors(IO80211SkywalkInterface);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IO80211SkywalkInterface, IOService);
++
++bool
++IO80211SkywalkInterface::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetA80211UserClient");
++	setProperty("IOInterfaceName", "en2");
++	setProperty("BSD Name", "en2");
++	setProperty("IOInterfaceNamePrefix", "en");
++	setProperty("IOInterfaceUnit", 2ULL, 32);
++	setProperty("IO80211InterfaceRole", "Infrastructure");
++	setProperty("IOInterfaceType", 6ULL, 32);      /* IFT_ETHER */
++	registerService();
++	IOLog("SWEET 80211: IO80211SkywalkInterface en2 registered\n");
++	sweet_a80211_note("service", 0, 0);
++	return true;
++}
++
++class SweetA80211UserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetA80211UserClient);
++
++	uint8_t *req = nullptr;
++	uint8_t *reply = nullptr;
++
++public:
++	bool initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetA80211UserClient, IOUserClient);
++
++bool
++SweetA80211UserClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityToken, type, properties)) {
++		return false;
++	}
++	req = (uint8_t *)IOMallocZeroData(A80211_REQ_SIZE);
++	reply = (uint8_t *)IOMallocZeroData(A80211_DATA_MAX);
++	if (req == nullptr || reply == nullptr) {
++		return false;
++	}
++	sweet_a80211_note("open", type, (uint32_t)proc_selfpid());
++	return true;
++}
++
++void
++SweetA80211UserClient::free(void)
++{
++	if (req) {
++		IOFreeData(req, A80211_REQ_SIZE);
++	}
++	if (reply) {
++		IOFreeData(reply, A80211_DATA_MAX);
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++SweetA80211UserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetA80211UserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
++{
++	(void)refCon;
++	sweet_a80211_note("notify-port", type, 0);
++	if (MACH_PORT_VALID(port)) {
++		releaseNotificationPort(port);  /* not kept in stage 1; balances the caller's send right */
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetA80211UserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	uint32_t in_size = args->structureInputDescriptor != NULL ?
++	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++	uint32_t out_cap = args->structureOutputDescriptor != NULL ?
++	    (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
++
++	if (selector != 0 || in_size < A80211_REQ_OFF + 24) {
++		sweet_a80211_note("selector", selector, in_size);
++		return kIOReturnUnsupported;
++	}
++	if (in_size > A80211_REQ_SIZE) {
++		in_size = A80211_REQ_SIZE;
++	}
++	bzero(req, A80211_REQ_SIZE);
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->readBytes(0, req, in_size) != in_size) {
++			return kIOReturnBadArgument;
++		}
++	} else {
++		bcopy(args->structureInput, req, in_size);
++	}
++
++	uint32_t cmd = *(uint32_t *)(req + 0);
++	uint32_t inlen = *(uint32_t *)(req + 4);
++	uint32_t type = *(uint32_t *)(req + A80211_REQ_OFF + 16);
++	uint32_t val = *(uint32_t *)(req + A80211_REQ_OFF + 20);
++	if (inlen > A80211_DATA_MAX) {
++		inlen = 0;
++	}
++	if (cmd != A80211_SIOCGA && cmd != A80211_SIOCSA) {
++		sweet_a80211_note("command", cmd, type);
++		return kIOReturnBadArgument;
++	}
++	if (out_cap > A80211_DATA_MAX) {
++		out_cap = A80211_DATA_MAX;
++	}
++	bzero(reply, out_cap);
++	/* gets usually pass their (zeroed) buffer in as well: start from it so partial answers keep the caller's version */
++	if (inlen) {
++		bcopy(req + 8, reply, MIN(inlen, out_cap));
++	}
++	uint32_t outlen = 0;
++	int err = sweet_a80211_request(cmd == A80211_SIOCSA, type, val, req + 8, inlen, reply, out_cap, &outlen);
++	if (err == 0 && outlen) {
++		if (outlen > out_cap) {
++			outlen = out_cap;
++		}
++		if (args->structureOutputDescriptor != NULL) {
++			args->structureOutputDescriptor->writeBytes(0, reply, outlen);
++			args->structureOutputDescriptorSize = outlen;
++		} else {
++			bcopy(reply, args->structureOutput, outlen);
++			args->structureOutputSize = outlen;
++		}
++	} else if (args->structureOutputDescriptor == NULL) {
++		args->structureOutputSize = err == 0 ? 0 : args->structureOutputSize;
++	}
++	return (IOReturn)err;
++}
++#endif /* SWEET_JACKPOTLTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 855e9b2..6709885 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,14 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++#if defined(SWEET_JACKPOTLTE)
++    "   {"
++    "     'IOClass'         = IO80211SkywalkInterface;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = SweetA8WiFi;"
++    "     'IOMatchCategory' = IO80211SkywalkInterface;"
++    "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 47aa9d2..68ea80b 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,7 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetMali.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetA8WiFi.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
