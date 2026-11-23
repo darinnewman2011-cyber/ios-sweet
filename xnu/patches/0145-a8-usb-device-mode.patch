@@ -1,0 +1,214 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 19:40:41
++++ b/bsd/dev/sweet_usb.c	2026-11-22 19:41:59
+@@ -71,7 +71,161 @@
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile ("dmb oshld" ::: "memory");
+ 	return v;
++}
++
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * xnu 0145: Galaxy A8 (2018, Exynos7885) USB device mode. The DWC3 core at
++ * 0x13600000 (DT dr_mode otg, maximum-speed high-speed) sits behind
++ * Samsung's USBCON wrapper with its USB 2.0 PHY at 0x135d0000 (DT
++ * phy_version 0x300). Facts from Samsung's phy-exynos-usbdrd.c,
++ * phy-exynos-usb3p1.c / -reg.h and cmucal-sfr.c (exynos7885 kernel, read
++ * only): pmu_mask 0 (no PMU isolation to lift), is_not_vbus_pad (VBUS valid
++ * is forced in the PHY), common_block_disable. The USB clocks in CMU_FSYS
++ * (0x13400000) are hardware auto-gated; their gates are forced on here
++ * (bit 20 MANUAL, bit 21 CG_VAL) before any USB register is touched, so a
++ * gated block can't hang the bus. After the PHY sequence and the DWC3 role
++ * setup, sweet's gadget code (CDC-ECM ue0 192.168.7.2, live log to UDP
++ * 192.168.7.1:5140) runs unchanged. Boot-arg sweetusb: 0 (default on the
++ * A8) off, 1 report the clocks only, 2 start USB.
++ */
++#define A8_FSYS_PA              0x13400000
++#define A8_FSYS_SIZE            0x4000
++#define A8_GATE_MANUAL          (1u << 20)
++#define A8_GATE_CG_VAL          (1u << 21)
++#define A8_USBCON_PA            0x135d0000
++#define A8_USBCON_SIZE          0x200
++#define A8_DWC3_PA              0x13600000
++#define A8_DWC3_SIZE            0x10000
++#define UCON_LINK_CTRL          0x04
++#define   LINKCTRL_DIS_QACT_ALL (0xfu << 9)     /* LINKGATE 12, ID0 11, VBUS_VALID 10, BVALID 9 */
++#define   LINKCTRL_FORCE_QACT   (1u << 8)
++#define   LINKCTRL_FILTER_BYPASS (0xfu << 4)
++#define UCON_LINK_PORT          0x08
++#define   LINKPORT_SEL_OCD_U3U2 (3u << 2)
++#define UCON_CLKRST             0x20
++#define   CLKRST_PHY_SW_RST     (1u << 3)
++#define   CLKRST_PHY_RST_SEL    (1u << 2)
++#define   CLKRST_PORT_RST       (1u << 1)
++#define   CLKRST_LINK_SW_RST    (1u << 0)
++#define UCON_UTMI               0x50
++#define   UTMI_FORCE_VBUSVALID  (1u << 5)
++#define   UTMI_FORCE_BVALID     (1u << 4)
++#define   UTMI_PULLDOWNS        (3u << 2)       /* DP 3, DM 2 */
++#define   UTMI_FORCE_SUSP_SLEEP (3u << 0)
++#define UCON_HSP                0x54
++#define   HSP_VBUSVLDEXTSEL     (1u << 13)
++#define   HSP_VBUSVLDEXT        (1u << 12)
++#define   HSP_EN_UTMISUSPEND    (1u << 9)
++#define   HSP_COMMONONN         (1u << 8)
++#define UCON_HSP_TEST           0x5c
++#define   HSP_TEST_SIDDQ        (1u << 24)
++
++static const struct {
++	uint32_t off;
++	const char *name;
++} a8_usb_gate[] = {
++	{ 0x200c, "usb20phy_clkcore" },
++	{ 0x2068, "aclk_20phyctrl" },
++	{ 0x206c, "aclk_30phyctrl_0" },
++	{ 0x2070, "aclk_30phyctrl_1" },
++	{ 0x2074, "bus_clk_early" },
++	{ 0x2078, "ref_clk" },
++};
++
++static inline void
++a8_usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++a8_usb_show(vm_offset_t ucon, const char *when)
++{
++	printf("SWEET USB: USBCON %s: LINK_CTRL 0x%08x LINK_PORT 0x%08x CLKRST 0x%08x UTMI 0x%08x HSP 0x%08x HSP_TEST 0x%08x\n",
++	    when, usb_rd(ucon, UCON_LINK_CTRL), usb_rd(ucon, UCON_LINK_PORT), usb_rd(ucon, UCON_CLKRST),
++	    usb_rd(ucon, UCON_UTMI), usb_rd(ucon, UCON_HSP), usb_rd(ucon, UCON_HSP_TEST));
++}
++
++static void
++sweet_usb_a8_probe(void)
++{
++	int enabled = 0;
++	uint32_t r, id;
++
++	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	vm_offset_t fsys = ml_io_map(A8_FSYS_PA, A8_FSYS_SIZE);
++	if (fsys == 0) {
++		printf("SWEET USB: CMU_FSYS map failed\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(a8_usb_gate) / sizeof(a8_usb_gate[0]); i++) {
++		r = usb_rd(fsys, a8_usb_gate[i].off);
++		if (enabled >= 2) {
++			a8_usb_wr(fsys, a8_usb_gate[i].off, r | A8_GATE_MANUAL | A8_GATE_CG_VAL);
++		}
++		printf("SWEET USB: gate %-16s 0x%08x -> 0x%08x\n", a8_usb_gate[i].name, r, usb_rd(fsys, a8_usb_gate[i].off));
++	}
++	printf("SWEET USB: QCH hsdrd 0x%08x usb20 0x%08x usb30_0 0x%08x usb30_1 0x%08x\n",
++	    usb_rd(fsys, 0x3034), usb_rd(fsys, 0x3038), usb_rd(fsys, 0x303c), usb_rd(fsys, 0x3040));
++	if (enabled < 2) {
++		printf("SWEET USB: sweetusb=1: clocks reported, USB left off\n");
++		return;
++	}
++	vm_offset_t ucon = ml_io_map(A8_USBCON_PA, A8_USBCON_SIZE);
++	vm_offset_t dwc = ml_io_map(A8_DWC3_PA, A8_DWC3_SIZE);
++	if (ucon == 0 || dwc == 0) {
++		printf("SWEET USB: USBCON/DWC3 map failed\n");
++		return;
++	}
++	a8_usb_show(ucon, "before");
++	id = usb_rd(dwc, 0xc120);
++	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
++	    id, usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc70c));
++	if ((id >> 16) != 0x5533) {
++		printf("SWEET USB: no DWC3 ID, USB not started\n");
++		return;
++	}
++
++	/* Samsung phy_exynos_usb_v3p1_enable(), version 3.0.0. Q-channel workaround first. */
++	r = (usb_rd(ucon, UCON_LINK_CTRL) | LINKCTRL_DIS_QACT_ALL) & ~LINKCTRL_FORCE_QACT;
++	delay(500);
++	a8_usb_wr(ucon, UCON_LINK_CTRL, r);
++	delay(500);
++	a8_usb_wr(ucon, UCON_LINK_CTRL, usb_rd(ucon, UCON_LINK_CTRL) | LINKCTRL_FORCE_QACT);
++	/* link reset */
++	r = usb_rd(ucon, UCON_CLKRST);
++	a8_usb_wr(ucon, UCON_CLKRST, r | CLKRST_LINK_SW_RST);
++	delay(10);
++	a8_usb_wr(ucon, UCON_CLKRST, r & ~CLKRST_LINK_SW_RST);
++	/* PHY reset high, PHY power on (SIDDQ off), UTMI out of suspend, HS PHY common block */
++	a8_usb_wr(ucon, UCON_CLKRST, usb_rd(ucon, UCON_CLKRST) | CLKRST_PHY_SW_RST | CLKRST_PHY_RST_SEL);
++	a8_usb_wr(ucon, UCON_HSP_TEST, usb_rd(ucon, UCON_HSP_TEST) & ~HSP_TEST_SIDDQ);
++	a8_usb_wr(ucon, UCON_UTMI, usb_rd(ucon, UCON_UTMI) & ~(UTMI_FORCE_SUSP_SLEEP | UTMI_PULLDOWNS));
++	a8_usb_wr(ucon, UCON_HSP, usb_rd(ucon, UCON_HSP) | HSP_EN_UTMISUSPEND | HSP_COMMONONN);
++	delay(100);
++	/* PHY reset low */
++	r = usb_rd(ucon, UCON_CLKRST);
++	a8_usb_wr(ucon, UCON_CLKRST, (r | CLKRST_PHY_RST_SEL) & ~(CLKRST_PHY_SW_RST | CLKRST_PORT_RST));
++	/* no VBUS pad: VBUS / B-session valid forced, VBUS filter bypassed; OCD from the hub port select */
++	a8_usb_wr(ucon, UCON_LINK_CTRL, usb_rd(ucon, UCON_LINK_CTRL) | LINKCTRL_FILTER_BYPASS);
++	a8_usb_wr(ucon, UCON_UTMI, usb_rd(ucon, UCON_UTMI) | UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID);
++	a8_usb_wr(ucon, UCON_HSP, usb_rd(ucon, UCON_HSP) | HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT);
++	a8_usb_wr(ucon, UCON_LINK_PORT, usb_rd(ucon, UCON_LINK_PORT) | LINKPORT_SEL_OCD_U3U2);
++	a8_usb_show(ucon, "after");
++
++	/* DWC3 role (Linux dwc3_set_prtcap): device; the core must not suspend the USB 2.0 PHY. */
++	a8_usb_wr(dwc, 0xc200, usb_rd(dwc, 0xc200) & ~(1u << 6));
++	a8_usb_wr(dwc, 0xc110, (usb_rd(dwc, 0xc110) & ~(3u << 12)) | (2u << 12));
++	printf("SWEET USB: DWC3 GCTL 0x%08x GUSB2PHYCFG 0x%08x GHWPARAMS0 0x%08x GHWPARAMS3 0x%08x\n",
++	    usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc140), usb_rd(dwc, 0xc14c));
++	sweet_usb_gadget_start(dwc);
+ }
++#endif /* SWEET_JACKPOTLTE */
+ 
+ void
+ sweet_usb_probe(void)
+@@ -80,6 +234,12 @@
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
++#if defined(SWEET_JACKPOTLTE)
++	if (enabled) {      /* only sweet_usb_a8_probe() below runs on the A8 */
++		sweet_usb_a8_probe();
++		return;
++	}
++#endif
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+@@ -877,6 +1037,10 @@
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++#if defined(SWEET_JACKPOTLTE)
++	/* the soft reset may clear the port role: device again (GCTL.PRTCAPDIR = 2) */
++	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 12)) | (2u << 12));
++#endif
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -902,6 +1066,7 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
++#if !defined(SWEET_JACKPOTLTE)    /* Qualcomm wrapper; the A8 forces VBUS valid in its PHY (sweet_usb_a8_probe) */
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+@@ -913,6 +1078,7 @@
+ 		printf("SWEET USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
++#endif
+ 
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 19:40:41
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 19:41:59
+@@ -2048,6 +2048,7 @@
+ #else
+ 	sweet_a8_input_init();          /* GPIO keys and sec_ts touch (sweet_a8input.c) */
+ 	sweet_a8_gpu_init();            /* Mali-G71 probe, boot-arg sweetgpu (sweet_a8gpu.c) */
++	sweet_usb_probe();              /* xnu 0145: USB device mode, boot-arg sweetusb=2 (sweet_usb.c) */
+ #endif
+ 	return 0;
+ }
