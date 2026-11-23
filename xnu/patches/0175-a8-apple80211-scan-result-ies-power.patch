@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index f9740a8..6a05585 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -396,6 +396,9 @@ struct wnet {
+ 	int16_t rssi;
+ 	uint8_t secure;
+ 	uint16_t mhz;
++	uint16_t bint, cap;                     /* xnu 0175: beacon interval and capability info */
++	uint16_t ie_len;                        /* xnu 0175: the frame's information elements, for IO80211 */
++	uint8_t ie[1024];
+ };
+ static uint32_t wl;
+ static unsigned ctl_slot;
+@@ -414,7 +417,8 @@ static int vif_up, joining, connected;  /* station vif 1 added; join in progress
+ static int a80211_on;                   /* boot-arg a8wifi80211=1: answer IO80211 (iokit/Kernel/arm/SweetA8WiFi.cpp) */
+ static volatile int a11_scan_wanted, a11_scan_done_post;        /* xnu 0172, defined again below (tentative) */
+ static uint32_t a11_scan_cursor;
+-static volatile int a11_link_post, a11_leave_req;      /* xnu 0173: 1 = link up, 2 = link down to report to wifid / the stack */
++static volatile int a11_link_post, a11_leave_req;
++static int a11_power = 1;               /* xnu 0175: what wifid last set (the radio itself stays up) */      /* xnu 0173: 1 = link up, 2 = link down to report to wifid / the stack */
+ static uint32_t rx_frames;
+ static ifnet_t wl_ifp;
+ static int dh_state, dh_tries;  /* DHCP: 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 ACKed, 4 configured, 5 gave up */
+@@ -582,6 +586,10 @@ scan_result(int16_t rssi, uint16_t freq_half_mhz, const uint8_t *f, uint32_t len
+ 	w.rssi = rssi;
+ 	w.mhz = (uint16_t)(freq_half_mhz / 2);
+ 	w.secure = (f[34] & 0x10) ? 1 : 0;        /* capability: privacy */
++	w.bint = (uint16_t)(f[32] | f[33] << 8);
++	w.cap = (uint16_t)(f[34] | f[35] << 8);
++	w.ie_len = (uint16_t)MIN(len - 36, sizeof(w.ie));
++	memcpy(w.ie, f + 36, w.ie_len);
+ 	for (uint32_t p = 36; p + 2 <= len;) {
+ 		uint8_t id = f[p], l = f[p + 1];
+ 		if (p + 2 + l > len) {
+@@ -2395,8 +2403,22 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 			a11_scan_cursor = 0;
+ 			a11_scan_wanted = 1;    /* SCAN_DONE goes out when the firmware's SCAN_DONE_IND arrives */
+ 			break;
+-		case A11_POWER:         /* the radio stays on in stage 1 */
++		case A11_POWER: {       /* apple80211_power_data {version, num_radios, power_state[]}: remembered */
++			uint32_t ps = 1;
++			if (inlen >= 12) {
++				memcpy(&ps, (const uint8_t *)in + 8, 4);
++			} else {
++				ps = val;
++			}
++			a11_power = ps != 0;
++			a11_post(1 /* APPLE80211_M_POWER_CHANGED */, NULL, 0);
++			if (!a11_power) {
++				a11_leave_req = 1;
++			} else {
++				scan_req = 1;
++			}
+ 			break;
++		}
+ 		case A11_ASSOCIATE:
+ 			/* apple80211_assoc_data: version, u16 mode, u16 auth lower, u16 auth upper, (pad) u32 ssid_len @12, ssid @16 */
+ 			if (inlen >= 48) {
+@@ -2458,7 +2480,7 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 	case A11_POWER:                 /* version, num_radios, power_state[4] */
+ 		a11_put32(o, 0, 1);
+ 		a11_put32(o, 4, 1);
+-		a11_put32(o, 8, a11_wifi_ready ? 1 : 0);
++		a11_put32(o, 8, a11_wifi_ready && a11_power ? 1 : 0);
+ 		n = 24;
+ 		break;
+ 	case A11_STATE:
+@@ -2583,8 +2605,13 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 		break;
+ 	}
+ 	case A11_SCAN_RESULT: {
+-		/* one result per get, in the layout AirportItlwm documents (channel @4, rssi @0x16, bssid @0x1c,
+-		 * ssid_len @0x60, ssid @0x61); ENXIO after the last one. Layout to be confirmed against wifid. */
++		/*
++		 * xnu 0175: iOS 16 reads one apple80211_scan_result per get into a 0x488-byte buffer (len 0x48c,
++		 * Apple80211Scan): version, channel {version, number, flags} @4, noise @0x12, snr @0x14, rssi @0x16,
++		 * beacon interval @0x18, capability @0x1a, bssid @0x1c, rate count @0x22 + rates (Mbps, u32) @0x24,
++		 * ssid len @0x60 + ssid @0x61, age @0x84, ie_len @0x8a, the frame's IEs @0x8c (up to 1024).
++		 * ENXIO after the last one, EBUSY while scanning.
++		 */
+ 		if (a11_scan_cursor >= (uint32_t)n_nets || scanning) {
+ 			err = scanning ? EBUSY : ENXIO;
+ 			break;
+@@ -2595,16 +2622,33 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 		a11_put32(o, 4, 1);
+ 		a11_put32(o, 8, ch);
+ 		a11_put32(o, 12, fl);
+-		int16_t noise = -92, rssi = w->rssi, snr = (int16_t)(w->rssi + 92), bi = 100, cap = w->secure ? 0x11 : 0x01;
++		int16_t noise = -92, rssi = w->rssi, snr = (int16_t)(w->rssi + 92);
+ 		memcpy(o + 0x12, &noise, 2);
+ 		memcpy(o + 0x14, &snr, 2);
+ 		memcpy(o + 0x16, &rssi, 2);
+-		memcpy(o + 0x18, &bi, 2);
+-		memcpy(o + 0x1a, &cap, 2);
++		memcpy(o + 0x18, &w->bint, 2);
++		memcpy(o + 0x1a, &w->cap, 2);
+ 		memcpy(o + 0x1c, w->bssid, 6);
++		uint8_t nr = 0;
++		for (uint32_t p = 0; p + 2 <= w->ie_len;) {
++			uint8_t id = w->ie[p], il = w->ie[p + 1];
++			if (p + 2 + il > w->ie_len) {
++				break;
++			}
++			if (id == 1 || id == 50) {      /* (extended) supported rates, 500 kb/s units */
++				for (uint8_t k = 0; k < il && nr < 15; k++) {
++					a11_put32(o, 0x24 + 4u * nr++, (uint32_t)(w->ie[p + 2 + k] & 0x7f) / 2);
++				}
++			}
++			p += 2u + il;
++		}
++		o[0x22] = nr;
+ 		o[0x60] = (uint8_t)strlen(w->ssid);
+ 		memcpy(o + 0x61, w->ssid, strlen(w->ssid));
+-		n = 0x88;
++		uint16_t iel = (uint16_t)MIN((uint32_t)w->ie_len, outcap > 0x8c ? outcap - 0x8c : 0);
++		memcpy(o + 0x8a, &iel, 2);
++		memcpy(o + 0x8c, w->ie, iel);
++		n = 0x8c + iel;
+ 		break;
+ 	}
+ 	case A11_LINK_CHANGED_EVENT_DATA: {     /* isLinkDown @0, rssi @4, snr @8, nf @10, voluntary @16, reason @20 */
