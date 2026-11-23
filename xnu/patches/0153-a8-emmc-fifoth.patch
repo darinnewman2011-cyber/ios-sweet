@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 22:15:26
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 22:15:26
+@@ -699,6 +699,7 @@
+ }
+ static uint64_t mmc_dma_above4g;                /* 32-bit mode: transfers left to PIO */
+ static uint32_t mmc_hcon;                       /* xnu 0150: kept for the 30 s status line */
++static uint32_t mmc_fifoth0, mmc_fifoth1;       /* xnu 0153: FIFOTH before / after */
+ static uint64_t mmc_smc_sec = ~0ull, mmc_smc_init = ~0ull;
+ static uint32_t mmc_dma_chk[MMC_MULTI_MAX * UFS_BLOCK / 4] __attribute__((aligned(64)));
+ static uint64_t mmc_dma_check_lba;
+@@ -759,6 +760,23 @@
+ 		mmc_smc_sec = sec;
+ 		mmc_smc_init = init;
+ 		mmc_smu_show("after");
++		/*
++		 * xnu 0153: FIFO thresholds for the IDMAC. ios109u: SMU open (MPSCTRL0 0xf1), first descriptor taken,
++		 * then the data stayed in the FIFO (RXDR). Our driver never wrote FIFOTH (0x4c); Samsung's probe sets
++		 * MSIZE 2 (8 transfers), RX_WMARK depth/2 - 1, TX_WMARK depth/2, the depth being the bootloader's RX_WMARK + 1
++		 * (no fifo-depth in this DT). A burst larger than the RX watermark allows never starts.
++		 */
++		{
++			uint32_t f = ufs_rd(0x04c), depth = 1 + ((f >> 16) & 0xfff);
++
++			if (depth < 16 || depth > 4096) {
++				depth = 64;
++			}
++			mmc_fifoth0 = f;
++			ufs_wr(0x04c, (2u << 28) | ((depth / 2 - 1) << 16) | (depth / 2));
++			mmc_fifoth1 = ufs_rd(0x04c);
++			printf("SWEET MMC: FIFOTH 0x%08x -> 0x%08x (FIFO depth %u)\n", mmc_fifoth0, mmc_fifoth1, depth);
++		}
+ 	}
+ 	/* descriptors: one per 4 KiB piece that does not cross a 4 KiB boundary */
+ 	for (uint32_t off = 0; off < bytes;) {
+@@ -1455,6 +1473,7 @@
+ 			    ns ? mdma.rd_bytes * (NSEC_PER_SEC / 1000) / ns : 0, mdma.xfers, mdma.sectors, mdma.fail,
+ 			    mdma.write ? 25 : 18, mdma.n, mdma.lba, mdma.rint, mdma.ids, mdma.where, mdma.r1, mdma.d0,
+ 			    mdma.checked, mdma.mismatch, mmc_dma64 < 0 ? 0 : (mmc_dma64 ? 64 : 32), mmc_dma_above4g);
++			printf("SWEET MMC: FIFOTH 0x%08x -> 0x%08x now 0x%08x\n", mmc_fifoth0, mmc_fifoth1, ufs_rd(0x04c));
+ 			printf("SWEET MMC: HCON 0x%08x; SMC sec 0x%llx init 0x%llx; MPSBEGIN0 0x%08x MPSEND0 0x%08x MPSLUN0 0x%08x MPSCTRL0 0x%08x BMOD 0x%08x CTRL 0x%08x\n",
+ 			    mmc_hcon, mmc_smc_sec, mmc_smc_init, ufs_rd(MMC_MPSBEGIN0), ufs_rd(MMC_MPSEND0), ufs_rd(MMC_MPSLUN0),
+ 			    ufs_rd(MMC_MPSCTRL0), ufs_rd(MMC_BMOD), ufs_rd(MMC_CTRL));
