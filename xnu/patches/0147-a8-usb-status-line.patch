@@ -1,0 +1,147 @@
+--- a/bsd/dev/sweet_usb.c	2026-11-22 20:05:07
++++ b/bsd/dev/sweet_usb.c	2026-11-22 20:05:45
+@@ -148,7 +148,42 @@
+ 	    usb_rd(ucon, UCON_UTMI), usb_rd(ucon, UCON_HSP), usb_rd(ucon, UCON_HSP_TEST));
+ }
+ 
++/*
++ * xnu 0147: the A8 keeps only the last 16 KiB of the console (ramoops), so the
++ * probe's early lines are gone by the time the log can be read. A thread prints
++ * the furthest step reached and the live controller state every 30 s.
++ */
++static void ud_sleep_ms(unsigned ms);
++static struct {
++	int step;
++	vm_offset_t ucon, dwc;
++	uint32_t id;
++} a8u;
++static const char *const a8u_step[] = {
++	"started", "gates on", "DWC3 ID ok", "PHY set up", "role set", "soft reset done",
++	"endpoint 0 set up", "running", "no DWC3 ID", "soft reset stuck", "endpoint 0 failed", "map failed",
++};
++
+ static void
++a8_usb_status_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		ud_sleep_ms(30000);
++		int st = a8u.step;
++		const char *name = (st >= 0 && st < (int)(sizeof(a8u_step) / sizeof(a8u_step[0]))) ? a8u_step[st] : "?";
++		if (a8u.dwc != 0 && st >= 2 && st != 8) {
++			uint32_t dsts = usb_rd(a8u.dwc, 0xc70c);
++			printf("SWEET USB: status: step %d (%s); DSTS 0x%08x (speed %u, link state %u, halted %u) DCTL 0x%08x "
++			    "GEVNTCOUNT 0x%x GCTL 0x%08x; UTMI 0x%08x HSP 0x%08x\n", st, name, dsts, dsts & 7, (dsts >> 18) & 0xf,
++			    (dsts >> 22) & 1, usb_rd(a8u.dwc, 0xc704), usb_rd(a8u.dwc, 0xc40c), usb_rd(a8u.dwc, 0xc110),
++			    usb_rd(a8u.ucon, UCON_UTMI), usb_rd(a8u.ucon, UCON_HSP));
++		} else {
++			printf("SWEET USB: status: step %d (%s), GSNPSID 0x%08x\n", st, name, a8u.id);
++		}
++	}
++}
++
++static void
+ sweet_usb_a8_probe(void)
+ {
+ 	int enabled = 0;
+@@ -158,6 +193,12 @@
+ 	if (!enabled) {
+ 		return;
+ 	}
++	{
++		thread_t st;
++		if (kernel_thread_start(a8_usb_status_thread, NULL, &st) == KERN_SUCCESS) {
++			thread_deallocate(st);
++		}
++	}
+ 	vm_offset_t fsys = ml_io_map(A8_FSYS_PA, A8_FSYS_SIZE);
+ 	if (fsys == 0) {
+ 		printf("SWEET USB: CMU_FSYS map failed\n");
+@@ -172,6 +213,7 @@
+ 	}
+ 	printf("SWEET USB: QCH hsdrd 0x%08x usb20 0x%08x usb30_0 0x%08x usb30_1 0x%08x\n",
+ 	    usb_rd(fsys, 0x3034), usb_rd(fsys, 0x3038), usb_rd(fsys, 0x303c), usb_rd(fsys, 0x3040));
++	a8u.step = 1;
+ 	if (enabled < 2) {
+ 		printf("SWEET USB: sweetusb=1: clocks reported, USB left off\n");
+ 		return;
+@@ -180,16 +222,22 @@
+ 	vm_offset_t dwc = ml_io_map(A8_DWC3_PA, A8_DWC3_SIZE);
+ 	if (ucon == 0 || dwc == 0) {
+ 		printf("SWEET USB: USBCON/DWC3 map failed\n");
++		a8u.step = 11;
+ 		return;
+ 	}
++	a8u.ucon = ucon;
++	a8u.dwc = dwc;
+ 	a8_usb_show(ucon, "before");
+ 	id = usb_rd(dwc, 0xc120);
+ 	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GUSB2PHYCFG 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
+ 	    id, usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc70c));
++	a8u.id = id;
+ 	if ((id >> 16) != 0x5533) {
+ 		printf("SWEET USB: no DWC3 ID, USB not started\n");
++		a8u.step = 8;
+ 		return;
+ 	}
++	a8u.step = 2;
+ 
+ 	/* Samsung phy_exynos_usb_v3p1_enable(), version 3.0.0. Q-channel workaround first. */
+ 	r = (usb_rd(ucon, UCON_LINK_CTRL) | LINKCTRL_DIS_QACT_ALL) & ~LINKCTRL_FORCE_QACT;
+@@ -217,12 +265,14 @@
+ 	a8_usb_wr(ucon, UCON_HSP, usb_rd(ucon, UCON_HSP) | HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT);
+ 	a8_usb_wr(ucon, UCON_LINK_PORT, usb_rd(ucon, UCON_LINK_PORT) | LINKPORT_SEL_OCD_U3U2);
+ 	a8_usb_show(ucon, "after");
++	a8u.step = 3;
+ 
+ 	/* DWC3 role (Linux dwc3_set_prtcap): device; the core must not suspend the USB 2.0 PHY. */
+ 	a8_usb_wr(dwc, 0xc200, usb_rd(dwc, 0xc200) & ~(1u << 6));
+ 	a8_usb_wr(dwc, 0xc110, (usb_rd(dwc, 0xc110) & ~(3u << 12)) | (2u << 12));
+ 	printf("SWEET USB: DWC3 GCTL 0x%08x GUSB2PHYCFG 0x%08x GHWPARAMS0 0x%08x GHWPARAMS3 0x%08x\n",
+ 	    usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc200), usb_rd(dwc, 0xc140), usb_rd(dwc, 0xc14c));
++	a8u.step = 4;
+ 	sweet_usb_gadget_start(dwc);
+ }
+ #endif /* SWEET_JACKPOTLTE */
+@@ -1035,9 +1085,15 @@
+ 	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+ 	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++#if defined(SWEET_JACKPOTLTE)
++		a8u.step = 9;
++#endif
+ 		return;
+ 	}
+ #if defined(SWEET_JACKPOTLTE)
++	a8u.step = 5;
++#endif
++#if defined(SWEET_JACKPOTLTE)
+ 	/* the soft reset may clear the port role: device again (GCTL.PRTCAPDIR = 2) */
+ 	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 12)) | (2u << 12));
+ #endif
+@@ -1061,10 +1117,16 @@
+ 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("SWEET USB: endpoint 0 setup failed\n");
++#if defined(SWEET_JACKPOTLTE)
++		a8u.step = 10;
++#endif
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
++#if defined(SWEET_JACKPOTLTE)
++	a8u.step = 6;
++#endif
+ 
+ #if !defined(SWEET_JACKPOTLTE)    /* Qualcomm wrapper; the A8 forces VBUS valid in its PHY (sweet_usb_a8_probe) */
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+@@ -1085,6 +1147,9 @@
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++#if defined(SWEET_JACKPOTLTE)
++	a8u.step = 7;
++#endif
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
