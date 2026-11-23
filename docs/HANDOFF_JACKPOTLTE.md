@@ -1164,3 +1164,16 @@ without a PC: it checks BOOT = mmcblk0p12, the Android backup's hash and the ima
 - `_tmp/flash-when-twrp.sh` now refuses to flash unless `ro.product.device` is jackpotlte; `_tmp/waitlog.sh OUT` waits
   for a test boot to come back to TWRP and saves ramoops.
 - Next speed-ups: GPU voltage for 747 MHz (ACPM domain 4) + GPU IRQs, eMMC IDMAC, low RAM bank.
+
+## 2026-11-19..22: eMMC IDMAC DMA (xnu 0144), in progress
+
+- 0144 (`sweetmmcdma=1`): IDMAC for multi-sector transfers; 128-byte chained descriptors (FMP-sized) in the first
+  16 KiB of su.dma; registers DBADDRL 0x88, IDSTS64 0x90, PLDMND 0x84 (Samsung dw_mmc-exynos.h). Status line
+  `SWEET MMC: PIO|DMA; read N MiB in T ms (KB/s) ...` every 30 s.
+- **ios103t (kernel #142, `a31038f7...4714`): every DMA read gave up** with rintsts 0x402c (data over + auto CMD12
+  done, no error bits) and IDSTS64 0, then DMA switched off after 8; the boot ran on PIO with no errors.
+  PIO baseline from that boot: **2125 MiB read in 84 s = ~26 MB/s**.
+- Next version (committed, NOT built yet): accepts data-over once the last descriptor's OWN bit is clear, records
+  where/r1/des0 of the first failure in the status line, DMA for reads only (`sweetmmcdma=2` = writes too), and the
+  first 64 DMA reads are re-read by PIO and compared (any mismatch: PIO data used, DMA off).
+- Everyday image is still **ios102** (`2cc93fa7...64b8`, CPU DVFS, no DMA).
