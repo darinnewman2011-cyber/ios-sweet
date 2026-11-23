@@ -384,10 +384,10 @@ index d8eed73..5db0b07 100644
  }
 diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
 new file mode 100644
-index 0000000..ca60821
+index 0000000..a1a8369
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,235 @@
 +/* Copyright (c) 2026 Darin. MIT License (see LICENSE); keep this notice. Written by Claude (Anthropic) for the ios-sweet Galaxy A8 port. */
 +/*
 + * Galaxy A8 Wi-Fi as an Apple Wi-Fi interface (boot-arg a8wifi80211=1), stage 1.
@@ -536,6 +536,27 @@ index 0000000..ca60821
 +	uint32_t out_cap = args->structureOutputDescriptor != NULL ?
 +	    (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
 +
++	/*
++	 * Selector 1 (Apple80211BindToInterfaceWithService, after the DRIVER_VERSION check): no input, one output byte
++	 * that IO80211 stores as "use the user client when possible" (handle+0x5c1, which the get/set wrappers test).
++	 */
++	if (selector == 1) {
++		uint8_t yes = 1;
++		sweet_a80211_note("useiouc", out_cap, 0);
++		if (args->structureOutputDescriptor != NULL) {
++			IOMemoryDescriptor *md = args->structureOutputDescriptor;
++			if (md->prepare(kIODirectionIn) != kIOReturnSuccess) {
++				return kIOReturnVMError;
++			}
++			md->writeBytes(0, &yes, 1);
++			md->complete(kIODirectionIn);
++			args->structureOutputDescriptorSize = 1;
++		} else if (args->structureOutput != NULL && args->structureOutputSize >= 1) {
++			*(uint8_t *)args->structureOutput = yes;
++			args->structureOutputSize = 1;
++		}
++		return kIOReturnSuccess;
++	}
 +	if (selector != 0 || in_size < A80211_REQ_OFF + 24) {
 +		sweet_a80211_note("selector", selector, in_size);
 +		return kIOReturnUnsupported;
