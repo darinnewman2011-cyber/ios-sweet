@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index e58ba10..8530e08 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -410,6 +410,8 @@ static char join_ssid[33];
+ static volatile int join_req;
+ static int vif_up, joining, connected;  /* station vif 1 added; join in progress; associated */
+ static int a80211_on;                   /* boot-arg a8wifi80211=1: answer IO80211 (iokit/Kernel/arm/SweetA8WiFi.cpp) */
++static volatile int a11_scan_wanted, a11_scan_done_post;        /* xnu 0172, defined again below (tentative) */
++static uint32_t a11_scan_cursor;
+ static uint32_t rx_frames;
+ static ifnet_t wl_ifp;
+ static int dh_state, dh_tries;  /* DHCP: 0 idle, 1 DISCOVER sent, 2 REQUEST sent, 3 ACKed, 4 configured, 5 gave up */
+@@ -819,6 +821,11 @@ wl_signal(uint32_t sig, uint32_t sig_len, const uint8_t *dat, uint32_t dat_len)
+ 		break;
+ 	case SIG_SCAN_DONE_IND:
+ 		scanning = 0;
++		if (a11_scan_wanted) {          /* xnu 0172: tell wifid (APPLE80211_M_SCAN_DONE) from the Wi-Fi thread */
++			a11_scan_wanted = 0;
++			a11_scan_cursor = 0;
++			a11_scan_done_post = 1;
++		}
+ 		snprintf(wl_status, sizeof(wl_status), "%d networks found (%u results)", n_nets, wl_scan_inds);
+ 		printf("SWEET A8 WIFI: scan done: %u results, %d networks\n", wl_scan_inds, n_nets);
+ 		wl_publish("on", wl_status);
+@@ -2217,6 +2224,10 @@ bt_cmd(const char *cmd)
+ #define A11_DRIVER_VERSION 43
+ #define A11_HARDWARE_VERSION 44
+ #define A11_COUNTRY_CODE 51
++#define A11_POWERSAVE 5
++#define A11_INT_MIT 18
++#define A11_SCAN_REQ_MULTIPLE 86
++#define A11_CURRENT_NETWORK 103
+ #define A11_CHANNELS_INFO 207
+ #define A11_HW_SUPPORTED_CHANNELS 254
+ 
+@@ -2226,14 +2237,14 @@ struct a11_stat {
+ 	uint8_t err;
+ 	uint32_t n;
+ };
+-static struct a11_stat a11_stats[48];
++static struct a11_stat a11_stats[96];
+ static int a11_nstats;
+ static uint32_t a11_total, a11_opens, a11_scan_cursor;
+ static char a11_notes[160];
+ static int a11_wifi_ready;
+ extern void sweet_a80211_ready(void);
+ 
+-static char a11_seq[200];               /* xnu 0165: the first requests in order, "g43 g12 s10!45 ..." */
++static char a11_seq[1400];               /* xnu 0165: the first requests in order, "g43 g12 s10!45 ..." */
+ 
+ static void
+ a11_count(int set, uint32_t type, int err)
+@@ -2263,6 +2274,7 @@ a11_count(int set, uint32_t type, int err)
+ #define A11_EV_LINK_CHANGED 4
+ #define A11_EV_SCAN_DONE 10
+ #define A11_EV_DRIVER_AVAILABLE 55
++static volatile int a11_scan_wanted, a11_scan_done_post;  /* xnu 0172: IO80211 asked for a scan / post SCAN_DONE */
+ static uint64_t a11_avail_due;          /* mach time: post DRIVER_AVAILABLE then (0 = nothing pending) */
+ static uint32_t a11_events;
+ 
+@@ -2365,8 +2377,10 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 	if (set) {
+ 		switch (type) {
+ 		case A11_SCAN_REQ:
++		case A11_SCAN_REQ_MULTIPLE:
+ 			scan_req = 1;
+ 			a11_scan_cursor = 0;
++			a11_scan_wanted = 1;    /* SCAN_DONE goes out when the firmware's SCAN_DONE_IND arrives */
+ 			break;
+ 		case A11_POWER:         /* the radio stays on in stage 1 */
+ 			break;
+@@ -2579,6 +2593,29 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 		n = 0x88;
+ 		break;
+ 	}
++	case A11_CURRENT_NETWORK:       /* the joined network's scan result; nothing while not associated */
++		err = j < 0 ? ENXIO : EOPNOTSUPP;
++		break;
++	case A11_POWERSAVE:             /* version, powersave level (0 = off) */
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 0);
++		n = 8;
++		break;
++	case A11_INT_MIT:               /* version, interference mitigation (1 = off) */
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);
++		n = 8;
++		break;
++	case A11_RATE:                  /* version, num_radios, rate[4] (Mbps) */
++		if (j < 0) {
++			err = ENXIO;
++			break;
++		}
++		a11_put32(o, 0, 1);
++		a11_put32(o, 4, 1);
++		a11_put32(o, 8, 72);
++		n = 24;
++		break;
+ 	default:
+ 		err = EOPNOTSUPP;
+ 		break;
+@@ -2590,12 +2627,24 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 	return err;
+ }
+ 
+-/* every 30 s from wifi_run: what IO80211 asked for (type x count, !errno) */
++/* every 30 s from wifi_run: what IO80211 asked for (type x count, !errno); xnu 0172: printed in short chunks */
++static void
++a11_print_chunks(const char *tag, const char *text)
++{
++	size_t len = strlen(text);
++	for (size_t at = 0; at < len; at += 180) {
++		char part[184];
++		strlcpy(part, text + at, sizeof(part) < len - at + 1 ? sizeof(part) : len - at + 1);
++		part[180] = 0;
++		printf("SWEET 80211: %s%s %s\n", tag, at ? "+" : ":", part);
++	}
++}
++
+ static void
+ a11_summary(void)
+ {
+-	char line[480];
+-	int l = snprintf(line, sizeof(line), "SWEET 80211: %u requests, %u opens;%s; get", a11_total, a11_opens,
++	static char line[1200];
++	int l = snprintf(line, sizeof(line), "%u requests, %u opens, %u events;%s; get", a11_total, a11_opens, a11_events,
+ 	    a11_notes[0] ? a11_notes : " no notes");
+ 	for (int set = 0; set < 2; set++) {
+ 		if (set) {
+@@ -2608,8 +2657,8 @@ a11_summary(void)
+ 			}
+ 		}
+ 	}
+-	printf("%s\n", line);
+-	printf("SWEET 80211: order:%s\n", a11_seq[0] ? a11_seq : " (none)");
++	a11_print_chunks("stats", line);
++	a11_print_chunks("order", a11_seq[0] ? a11_seq : "(none)");
+ }
+ 
+ static void
+@@ -2757,6 +2806,10 @@ wifi_run(uint32_t panic_off)
+ 			printf("SWEET A8 WIFI: %s\n", d);
+ 			return;
+ 		}
++		if (a80211_on && a11_scan_done_post) {
++			a11_scan_done_post = 0;
++			a11_post(A11_EV_SCAN_DONE, NULL, 0);
++		}
+ 		if (a80211_on && a11_avail_due && now > a11_avail_due) {
+ 			a11_avail_due = 0;
+ 			a11_post_driver_available();
+diff --git a/iokit/Kernel/arm/SweetA8WiFi.cpp b/iokit/Kernel/arm/SweetA8WiFi.cpp
+index 7c1ce1b..309c718 100644
+--- a/iokit/Kernel/arm/SweetA8WiFi.cpp
++++ b/iokit/Kernel/arm/SweetA8WiFi.cpp
+@@ -210,6 +210,27 @@ SweetA80211UserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 	 * Selector 1 (Apple80211BindToInterfaceWithService, after the DRIVER_VERSION check): no input, one output byte
+ 	 * that IO80211 stores as "use the user client when possible" (handle+0x5c1, which the get/set wrappers test).
+ 	 */
++	/*
++	 * Selector 5 (Apple80211EventMonitoringInitIOUC): "use the IOUC event pipe?" (mapped ring + async method).
++	 * Not implemented: answer no, so IO80211 reads events from its kernel event socket (xnu 0166/0172).
++	 */
++	if (selector == 5) {
++		uint8_t no = 0;
++		sweet_a80211_note("eventpipe", out_cap, 0);
++		if (args->structureOutputDescriptor != NULL) {
++			IOMemoryDescriptor *md = args->structureOutputDescriptor;
++			if (md->prepare(kIODirectionIn) != kIOReturnSuccess) {
++				return kIOReturnVMError;
++			}
++			md->writeBytes(0, &no, 1);
++			md->complete(kIODirectionIn);
++			args->structureOutputDescriptorSize = 1;
++		} else if (args->structureOutput != NULL && args->structureOutputSize >= 1) {
++			*(uint8_t *)args->structureOutput = no;
++			args->structureOutputSize = 1;
++		}
++		return kIOReturnSuccess;
++	}
+ 	if (selector == 1) {
+ 		uint8_t yes = 1;
+ 		sweet_a80211_note("useiouc", out_cap, 0);
