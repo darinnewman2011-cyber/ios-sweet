@@ -1,0 +1,43 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2708,7 +2708,8 @@
+ 	 *	structures for pages we allocate to be page tables in
+ 	 *	pmap_expand().
+ 	 */
+-	_vm_object_allocate(mem_size, pmap_object);
++	/* xnu 0159: page-table pages are keyed by pa - vm_first_phys (the low bank sits below gPhysBase with a8lowram) */
++	_vm_object_allocate(vm_last_phys - vm_first_phys, pmap_object);
+ 	pmap_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+ 
+ 	/*
+--- a/osfmk/arm/pmap/pmap_data.c	2026-11-22 23:59:02
++++ b/osfmk/arm/pmap/pmap_data.c	2026-11-22 23:59:02
+@@ -1228,7 +1228,7 @@
+ 	vm_object_lock(pmap_object);
+ 	while (mem != VM_PAGE_NULL) {
+ 		const vm_object_offset_t offset =
+-		    (vm_object_offset_t) ((ptoa(VM_PAGE_GET_PHYS_PAGE(mem))) - gPhysBase);
++		    (vm_object_offset_t) ((ptoa(VM_PAGE_GET_PHYS_PAGE(mem))) - vm_first_phys);   /* xnu 0159 */
+ 
+ 		vm_page_insert_wired(mem, pmap_object, offset, VM_KERN_MEMORY_PTE);
+ 		m_prev = mem;
+@@ -1551,7 +1551,7 @@
+ 		 * Remove the page from the pmap's VM object and return it back to the
+ 		 * VM's global free list of pages.
+ 		 */
+-		mem = vm_page_lookup(pmap_object, (pa - gPhysBase));
++		mem = vm_page_lookup(pmap_object, (pa - vm_first_phys));                     /* xnu 0159 */
+ 		assert(mem != VM_PAGE_NULL);
+ 		assert(VM_PAGE_WIRED(mem));
+ 		vm_page_lock_queues();
+--- a/osfmk/arm/pmap/pmap_ppl_interface.c	2026-11-22 23:59:02
++++ b/osfmk/arm/pmap/pmap_ppl_interface.c	2026-11-22 23:59:02
+@@ -144,7 +144,7 @@
+ 		 */
+ 		vm_object_lock(pmap_object);
+ 
+-		mem = vm_page_lookup(pmap_object, (pa - gPhysBase));
++		mem = vm_page_lookup(pmap_object, (pa - vm_first_phys));                     /* xnu 0159 */
+ 		assert(mem != VM_PAGE_NULL);
+ 		assert(VM_PAGE_WIRED(mem));
+ 

@@ -1,0 +1,189 @@
+--- a/osfmk/arm64/arm_vm_init.c	2026-11-22 22:02:29
++++ b/osfmk/arm64/arm_vm_init.c	2026-11-22 22:14:35
+@@ -364,6 +364,51 @@
+ 
+ #define PTOV_TABLE_SIZE 8
+ SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
++#if defined(SWEET_JACKPOTLTE)
++#define SWEET_LOWRAM_NRANGES 6
++#define SWEET_LOWRAM_BASE 0x80000000ull
++#endif
++
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * xnu 0152: the Galaxy A8's low DRAM bank. S-Boot hands XNU only the upper bank (0x880000000, 2 GiB); the low
++ * bank (DT /memory 0x80000000 + 0x3da00000 and 0xc0000000 + 0x40000000) is free apart from Android's reserved
++ * carve-outs (reserved-memory: modem 0xf5400000+, framebuffer 0xec000000, WLBT/ABOX shared memory 0xe9000000,
++ * TIMA 0xb8000000, seclog 0xc0000000) and the ramoops log at 0x92400000. With boot-arg a8lowram=1 the six free
++ * ranges below are added: each becomes its own physmap (ptov) segment, the pmap's managed range starts at
++ * 0x80000000 (pv/attr tables cover the gap, ~20 MB), mem_size/max_mem grow by their size, and once the VM runs
++ * sweet_lowram_release() gives the pages to it with vm_page_create() (pages that carry their own address; the
++ * boot-time vm_pages[] array must stay gap-free). Nothing is mapped in the gaps.
++ */
++const struct sweet_lowram_range { pmap_paddr_t pa, len; } sweet_lowram_ranges[SWEET_LOWRAM_NRANGES] = {
++	{ 0x80004000ull, 0x92400000ull - 0x80004000ull },
++	{ 0x92500000ull, 0xb8000000ull - 0x92500000ull },
++	{ 0xb8200000ull, 0xbda00000ull - 0xb8200000ull },
++	{ 0xc0080000ull, 0xe9000000ull - 0xc0080000ull },
++	{ 0xe9800000ull, 0xec000000ull - 0xe9800000ull },
++	{ 0xed400000ull, 0xf5400000ull - 0xed400000ull },
++};
++SECURITY_READ_ONLY_LATE(uint64_t) sweet_lowram_size = 0;   /* bytes added; 0 = off */
++extern void vm_page_create(ppnum_t, ppnum_t);
++void sweet_lowram_release(void);
++
++/* Called once from the A8 storage setup (sweet_ufs.c), when the VM and its zones run. */
++void
++sweet_lowram_release(void)
++{
++	static int done;
++
++	if (!sweet_lowram_size || done) {
++		return;
++	}
++	done = 1;
++	for (int i = 0; i < SWEET_LOWRAM_NRANGES; i++) {
++		vm_page_create((ppnum_t)atop(sweet_lowram_ranges[i].pa), (ppnum_t)atop(sweet_lowram_ranges[i].pa + sweet_lowram_ranges[i].len));
++	}
++	printf("SWEET RAM: low bank added: %llu MiB in %d ranges from 0x%llx; max_mem %llu MiB\n", sweet_lowram_size >> 20,
++	    SWEET_LOWRAM_NRANGES, (unsigned long long)sweet_lowram_ranges[0].pa, (unsigned long long)(max_mem >> 20));
++}
++#endif
+ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+ 
+ 
+@@ -1026,7 +1071,11 @@
+ 		if ((pa + len) > real_avail_end) {
+ 			_end -= (pa + len - real_avail_end);
+ 		}
++#if defined(SWEET_JACKPOTLTE)
++		assert((start - gVirtBase + gPhysBase - pa_offset) >= (sweet_lowram_size ? SWEET_LOWRAM_BASE : gPhysBase));
++#else
+ 		assert((start - gVirtBase + gPhysBase - pa_offset) >= gPhysBase);
++#endif
+ 
+ 		/* Round up to the nearest PAGE_SIZE boundary when creating mappings:
+ 		 * PAGE_SIZE may be a multiple of ARM_PGBYTES, and we don't want to leave
+@@ -1603,6 +1652,14 @@
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
+ 
++#if defined(SWEET_JACKPOTLTE)
++	/* xnu 0152: one physmap segment per low-bank range (orig_va only carries pa - gPhysBase + gVirtBase) */
++	for (int i = 0; sweet_lowram_size && i < SWEET_LOWRAM_NRANGES; i++) {
++		arm_vm_physmap_slide(temp_ptov_table, sweet_lowram_ranges[i].pa - gPhysBase + gVirtBase, sweet_lowram_ranges[i].len,
++		    AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT);
++	}
++#endif
++
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+ 
+ 	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
+@@ -1919,6 +1976,18 @@
+ 	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 2)) {
+ 		panic("Unsupported memory configuration %lx", mem_size);
+ 	}
++#if defined(SWEET_JACKPOTLTE)
++	{
++		int lowram = 0;
++		if (PE_parse_boot_argn("a8lowram", &lowram, sizeof(lowram)) && lowram && gPhysBase > SWEET_LOWRAM_BASE) {
++			uint64_t total = 0;
++			for (int i = 0; i < SWEET_LOWRAM_NRANGES; i++) {
++				total += sweet_lowram_ranges[i].len;
++			}
++			sweet_lowram_size = total;
++		}
++	}
++#endif
+ 
+ #if defined(ARM_LARGE_MEMORY)
+ 	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
+@@ -1952,6 +2021,13 @@
+ #endif // ARM_LARGE_MEMORY
+ #endif
+ 
++#if defined(SWEET_JACKPOTLTE)
++	/* xnu 0152: room for the low-bank segments, each possibly padded to a twig for block alignment */
++	if (sweet_lowram_size) {
++		static_memory_end += sweet_lowram_size + SWEET_LOWRAM_NRANGES * ARM_TT_TWIG_SIZE;
++		physmap_end += sweet_lowram_size + SWEET_LOWRAM_NRANGES * ARM_TT_TWIG_SIZE;
++	}
++#endif
+ #if KASAN && !defined(ARM_LARGE_MEMORY)
+ 	/* add the KASAN stolen memory to the physmap */
+ 	dynamic_memory_begin = static_memory_end + (shadow_ptop - shadow_pbase);
+@@ -2018,6 +2094,9 @@
+ 	bzero(cpu_tte, ARM_PGBYTES);
+ 	avail_end = gPhysBase + mem_size;
+ 	assert(!(avail_end & PAGE_MASK));
++#if defined(SWEET_JACKPOTLTE)
++	mem_size += sweet_lowram_size;          /* xnu 0152: the low bank counts as RAM from here on (max_mem, sane_size) */
++#endif
+ 
+ #if KASAN
+ 	real_avail_end = gPhysBase + real_phys_size;
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -459,6 +459,9 @@
+ 
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)   vm_first_phys = (pmap_paddr_t) 0;
+ SECURITY_READ_ONLY_LATE(pmap_paddr_t)   vm_last_phys = (pmap_paddr_t) 0;
++#if defined(SWEET_JACKPOTLTE)
++extern uint64_t sweet_lowram_size;        /* xnu 0152, arm_vm_init.c */
++#endif
+ 
+ SECURITY_READ_ONLY_LATE(boolean_t)      pmap_initialized = FALSE;       /* Has pmap_init completed? */
+ 
+@@ -2205,6 +2208,16 @@
+ 	memset((char *)phystokv(pmap_struct_start), 0, avail_start - pmap_struct_start);
+ 
+ 	vm_first_phys = gPhysBase;
++#if defined(SWEET_JACKPOTLTE)
++	if (sweet_lowram_size) {
++		/*
++		 * xnu 0152: pa_valid()/pa_index() also cover the low bank (and the gap, ~20 MB of tables), so its pages
++		 * are managed normal memory. They are not handed out by pmap_next_page(): arm64's vm_pages[] derives a
++		 * page's address from its index and must stay gap-free; sweet_lowram_release() adds them later.
++		 */
++		vm_first_phys = 0x80000000ull;
++	}
++#endif
+ 	vm_last_phys = trunc_page(avail_end);
+ 
+ 	queue_init(&map_pmap_list);
+--- a/osfmk/arm/pmap/pmap_data.c	2026-11-22 22:02:29
++++ b/osfmk/arm/pmap/pmap_data.c	2026-11-22 22:11:12
+@@ -631,7 +631,13 @@
+ 	vm_size_t ptd_root_table_size = num_ptd_pages * PAGE_SIZE;
+ 
+ 	/* Number of VM pages that span all of kernel-managed memory. */
++#if defined(SWEET_JACKPOTLTE)
++	/* xnu 0152: with the low bank the managed range runs from 0x80000000 to avail_end, gap included */
++	extern uint64_t sweet_lowram_size;
++	const unsigned int npages = (unsigned int)atop(sweet_lowram_size ? (avail_end - 0x80000000ull) : mem_size);
++#else
+ 	const unsigned int npages = (unsigned int)atop(mem_size);
++#endif
+ 
+ 	/* The pv_head_table and pp_attr_table both have one entry per VM page. */
+ 	const vm_size_t pp_attr_table_size = npages * sizeof(pp_attr_t);
+--- a/bsd/dev/sweet_ufs.c	2026-11-22 22:14:52
++++ b/bsd/dev/sweet_ufs.c	2026-11-22 22:14:52
+@@ -57,6 +57,9 @@
+ extern void sweet_a8_gpu_init(void);
+ extern void sweet_mali_status(void);            /* sweet_a8gpu.c: one GPU line for wst_thread() */
+ extern void sweet_usb_probe(void);
++#if defined(SWEET_JACKPOTLTE)
++extern void sweet_lowram_release(void);
++#endif
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -2131,6 +2134,7 @@
+ 	sweet_a8_input_init();          /* GPIO keys and sec_ts touch (sweet_a8input.c) */
+ 	sweet_a8_gpu_init();            /* Mali-G71 probe, boot-arg sweetgpu (sweet_a8gpu.c) */
+ 	sweet_usb_probe();              /* xnu 0145: USB device mode, boot-arg sweetusb=2 (sweet_usb.c) */
++	sweet_lowram_release();         /* xnu 0152: the low DRAM bank to the VM, boot-arg a8lowram=1 (arm_vm_init.c) */
+ #endif
+ 	return 0;
+ }

@@ -1,0 +1,156 @@
+--- a/pexpert/pexpert/arm/protos.h	2026-11-22 22:27:35
++++ b/pexpert/pexpert/arm/protos.h	2026-11-22 22:27:36
+@@ -43,6 +43,14 @@
+ uint32_t sweet_gic_ack(void);
+ void sweet_gic_eoi(uint32_t iar);
+ void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++/* xnu 0154: device interrupts (SPIs) to kernel handlers, dispatched by sleh_irq() */
++#define SWEET_SPI_TABLE 256
++struct sweet_spi_handler {
++	void (*fn)(void *arg);
++	void *arg;
++};
++extern struct sweet_spi_handler sweet_spi_handlers[SWEET_SPI_TABLE];
++int sweet_gic_enable_spi(uint32_t intid, void (*fn)(void *arg), void *arg);
+ #endif
+ #endif
+ 
+--- a/pexpert/arm/pe_fiq.c	2026-11-22 22:27:35
++++ b/pexpert/arm/pe_fiq.c	2026-11-22 22:27:36
+@@ -243,6 +243,7 @@
+ 
+ /* GICv2 SGIs target CPU interfaces, not MPIDRs: each CPU records its own. */
+ static uint8_t sweet_gic_cpu_mask[MAX_CPUS];
++struct sweet_spi_handler sweet_spi_handlers[SWEET_SPI_TABLE];    /* xnu 0154 */
+ 
+ #define gicd_read32(offset) (*(volatile uint32_t *)(gicd_base + (offset)))
+ #define gicd_write32(offset, data) (*(volatile uint32_t *)(gicd_base + (offset)) = (data))
+@@ -353,6 +354,28 @@
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	gicd_write32(GICD_SGIR, ((uint32_t)mask << GICD_SGIR_TARGET_SHIFT) | sgi);
+ }
++
++/*
++ * xnu 0154: hand an SPI to a kernel handler. Level-triggered (GICD_ICFGR bit 2n+1 clear), priority 0xA0 like
++ * the timer and the IPI, routed to CPU 0's interface, then enabled. The secure firmware already put Android's
++ * SPIs in Group 1. The handler runs in sleh_irq() before the EOI and must quiet the device (mask or clear).
++ */
++int
++sweet_gic_enable_spi(uint32_t intid, void (*fn)(void *arg), void *arg)
++{
++	if (intid < 32 || intid >= SWEET_SPI_TABLE || fn == NULL || !gicd_base) {
++		return -1;
++	}
++	sweet_spi_handlers[intid].arg = arg;
++	sweet_spi_handlers[intid].fn = fn;
++	__builtin_arm_dsb(DSB_ISH);
++	uint32_t cfg = 0xC00 + (intid / 16) * 4;
++	gicd_write32(cfg, gicd_read32(cfg) & ~(2u << ((intid % 16) * 2)));
++	*(volatile uint8_t *)(gicd_base + 0x400 + intid) = 0xA0;
++	*(volatile uint8_t *)(gicd_base + 0x800 + intid) = sweet_gic_cpu_mask[0];
++	gicd_write32(0x100 + (intid / 32) * 4, 1u << (intid % 32));
++	return 0;
++}
+ #else
+ void
+ pe_init_fiq()
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1890,6 +1890,12 @@
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++#if defined(SWEET_GICV2)
++		/* xnu 0154: SPIs with a kernel handler (sweet_gic_enable_spi) */
++		if (intid < SWEET_SPI_TABLE && sweet_spi_handlers[intid].fn != NULL) {
++			sweet_spi_handlers[intid].fn(sweet_spi_handlers[intid].arg);
++		} else
++#endif
+ 		if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+--- a/bsd/dev/sweet_a8gpu.c	2026-11-22 22:27:35
++++ b/bsd/dev/sweet_a8gpu.c	2026-11-22 22:28:06
+@@ -334,6 +334,20 @@
+ static LCK_GRP_DECLARE(mali_grp, "sweet-mali");
+ static LCK_MTX_DECLARE(mali_lock, &mali_grp);  /* everything below */
+ static bool mali_up;
++/*
++ * xnu 0154: boot-arg sweetgpuirq=1 waits for the job interrupt (DT mali JOB = SPI 159, GIC ID 191) instead of
++ * spinning in 20 us delay() steps for as long as a job runs. The handler masks JOB_IRQ (level-triggered) and
++ * wakes the scheduler, which clears the slot and unmasks again; a 2 ms timeout stays as a safety net and MMU
++ * faults are still read on every wake-up.
++ */
++#define MALI_JOB_SPI    191u
++#define MALI_JOB_IRQS   0x00030003u     /* slots 0/1 done (bits 0-1) and failed (16-17) */
++static bool mali_irq;
++static int mali_irq_chan;
++static uint64_t stat_irqs;
++extern int sweet_gic_enable_spi(uint32_t intid, void (*fn)(void *arg), void *arg);
++
++static void mali_job_irq(void *arg);
+ static uint32_t mali_trace;
+ 
+ static struct {
+@@ -355,6 +369,14 @@
+ 	g_wr(g_gpu, off, v);
+ }
+ 
++static void
++mali_job_irq(__unused void *arg)
++{
++	mw(JOB_IRQ_MASK, 0);
++	stat_irqs++;
++	thread_wakeup((event_t)&mali_irq_chan);
++}
++
+ static bool
+ mpoll(uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
+ {
+@@ -890,7 +912,19 @@
+ 		unsigned slot = (running->requirements & SWEET_MALI_JOB_FS) ? 0 : 1;
+ 
+ 		lck_mtx_unlock(&mali_lock);
+-		delay(MALI_POLL_US);
++		if (mali_irq) {
++			uint64_t wait;
++			nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &wait);
++			(void)assert_wait_deadline((event_t)&mali_irq_chan, THREAD_UNINT, mach_absolute_time() + wait);
++			mw(JOB_IRQ_MASK, MALI_JOB_IRQS);
++			if (mr(JOB_IRQ_RAWSTAT) & MALI_JOB_IRQS) {
++				clear_wait(current_thread(), THREAD_AWAKENED);
++			} else {
++				thread_block(THREAD_CONTINUE_NULL);
++			}
++		} else {
++			delay(MALI_POLL_US);
++		}
+ 		lck_mtx_lock(&mali_lock);
+ 
+ 		uint32_t raw = mr(JOB_IRQ_RAWSTAT), mmu = mr(MMU_IRQ_RAWSTAT);
+@@ -995,8 +1029,8 @@
+ 	if (pt_root == NULL) {
+ 		return;                 /* sweetgpu < 4 */
+ 	}
+-	printf("SWEET MALI: %s at %u MHz; %llu jobs, %llu faults, %llu resets; self test %s\n", mali_up ? "up" : "DOWN",
+-	    g_mhz, stat_jobs, stat_faults, stat_resets, selftest_result);
++	printf("SWEET MALI: %s at %u MHz; %llu jobs, %llu faults, %llu resets; self test %s; job interrupts %s, %llu\n",
++	    mali_up ? "up" : "DOWN", g_mhz, stat_jobs, stat_faults, stat_resets, selftest_result, mali_irq ? "on" : "off", stat_irqs);
+ }
+ 
+ static void
+@@ -1083,6 +1117,14 @@
+ 	if (!mali_up) {
+ 		return;
+ 	}
++	{
++		int irq = 0;
++		if (PE_parse_boot_argn("sweetgpuirq", &irq, sizeof(irq)) && irq) {
++			mw(JOB_IRQ_MASK, 0);
++			mali_irq = sweet_gic_enable_spi(MALI_JOB_SPI, mali_job_irq, NULL) == 0;
++			printf("SWEET MALI: job interrupt (GIC %u): %s\n", MALI_JOB_SPI, mali_irq ? "on" : "NOT available, polling");
++		}
++	}
+ 	if (kernel_thread_start(mali_scheduler, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

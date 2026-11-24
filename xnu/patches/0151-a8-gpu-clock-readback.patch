@@ -1,0 +1,23 @@
+--- a/bsd/dev/sweet_a8acpm.c	2026-11-22 21:57:10
++++ b/bsd/dev/sweet_a8acpm.c	2026-11-22 21:57:10
+@@ -481,6 +481,20 @@
+ 		printf("SWEET DVFS: %s to %u MHz: %s (%d)\n", names[want[i].d], want[i].khz / 1000, e ? "failed" : "asked", e);
+ 	}
+ 	dvfs_report("after");
++	/*
++	 * xnu 0151: FREQ_GET always answers 0 here, so read what the GPU really runs at from CMU_G3D's PLL_G3D
++	 * (0x11400000 + 0x120: enable 31, lock 29, M 25:16, P 13:8, S 2:0; 26 MHz reference). With a8g3d (ACPM
++	 * domain 4) ACPM also sets vdd_g3d from its own table; 0126's sweetgpumhz wrote the PLL at 0.8 V only.
++	 */
++	{
++		vm_offset_t g3d = ml_io_map(0x11400000, 0x1000);
++		if (g3d != 0) {
++			uint32_t c = *(volatile uint32_t *)(g3d + 0x120);
++			uint32_t m = (c >> 16) & 0x3ff, pdiv = (c >> 8) & 0x3f, sdiv = c & 7;
++			printf("SWEET DVFS: G3D PLL_CON0 %#x (enable %u, lock %u): %u MHz\n", c, (c >> 31) & 1, (c >> 29) & 1,
++			    pdiv ? (26u * m / pdiv) >> sdiv : 0);
++		}
++	}
+ }
+ 
+ /* xnu 0138: any SPEEDY device behind ACPM (type = its 4-bit address: codec 3, codec's analog part 7, PMIC 1) */

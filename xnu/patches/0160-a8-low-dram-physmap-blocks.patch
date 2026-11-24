@@ -1,0 +1,16 @@
+--- a/osfmk/arm64/arm_vm_init.c	2026-11-23 00:18:06
++++ b/osfmk/arm64/arm_vm_init.c	2026-11-23 00:18:06
+@@ -1168,7 +1168,13 @@
+ 
+ 			tte2 = arm_kva_to_tte(align_start);
+ 
++#if defined(SWEET_JACKPOTLTE)
++			/* xnu 0160: the low-bank physmap segments sit below gPhysBase; their 32 MB blocks were skipped (ios117r:
++			 * level-2 translation fault zeroing pa 0x84004000 through phystokv) */
++			if ((pa >= (sweet_lowram_size ? SWEET_LOWRAM_BASE : gPhysBase)) && (pa < real_avail_end)) {
++#else
+ 			if ((pa >= gPhysBase) && (pa < real_avail_end)) {
++#endif
+ 				tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
+ 				    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX
+ 				    | ARM_TTE_BLOCK_AP(pte_prot_APX) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)

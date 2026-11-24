@@ -1,0 +1,49 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index efefcea..a4d326e 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2842,7 +2842,8 @@ pmap_init(
+ 	 *	structures for pages we allocate to be page tables in
+ 	 *	pmap_expand().
+ 	 */
+-	_vm_object_allocate(mem_size, pmap_object, VM_MAP_SERIAL_SPECIAL);
++	/* xnu 0159: page-table pages are keyed by pa - vm_first_phys (the low bank sits below gPhysBase with a8lowram) */
++	_vm_object_allocate(vm_last_phys - vm_first_phys, pmap_object, VM_MAP_SERIAL_SPECIAL);
+ 	pmap_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
+ 
+ 	/*
+diff --git a/osfmk/arm/pmap/pmap_data.c b/osfmk/arm/pmap/pmap_data.c
+index 9276b9d..72110dd 100644
+--- a/osfmk/arm/pmap/pmap_data.c
++++ b/osfmk/arm/pmap/pmap_data.c
+@@ -1241,7 +1241,7 @@ pmap_enqueue_pages(vm_page_t list)
+ 
+ 	_vm_page_list_foreach_consume(mem, &list) {
+ 		const vm_object_offset_t offset =
+-		    (vm_object_offset_t) ((ptoa(VM_PAGE_GET_PHYS_PAGE(mem))) - gPhysBase);
++		    (vm_object_offset_t) ((ptoa(VM_PAGE_GET_PHYS_PAGE(mem))) - vm_first_phys);   /* xnu 0159 */
+ 
+ 		vm_page_insert_internal(mem, pmap_object, offset,
+ 		    VM_KERN_MEMORY_PTE, VMPI_NONE, &delayed_acct);
+@@ -1559,7 +1559,7 @@ pmap_pages_free(pmap_paddr_t pa, __assert_only unsigned size)
+ 		 * Remove the page from the pmap's VM object and return it back to the
+ 		 * VM's global free list of pages.
+ 		 */
+-		mem = vm_page_lookup(pmap_object, (pa - gPhysBase));
++		mem = vm_page_lookup(pmap_object, (pa - vm_first_phys));                     /* xnu 0159 */
+ 		assert(mem != VM_PAGE_NULL);
+ 		assert(VM_PAGE_WIRED(mem));
+ 		vm_page_lock_queues();
+diff --git a/osfmk/arm/pmap/pmap_ppl_interface.c b/osfmk/arm/pmap/pmap_ppl_interface.c
+index ad24fbf..9f0fc5c 100644
+--- a/osfmk/arm/pmap/pmap_ppl_interface.c
++++ b/osfmk/arm/pmap/pmap_ppl_interface.c
+@@ -139,7 +139,7 @@ pmap_release_ppl_pages_to_kernel(void)
+ 		 */
+ 		vm_object_lock(pmap_object);
+ 
+-		mem = vm_page_lookup(pmap_object, (pa - gPhysBase));
++		mem = vm_page_lookup(pmap_object, (pa - vm_first_phys));                     /* xnu 0159 */
+ 		assert(mem != VM_PAGE_NULL);
+ 		assert(VM_PAGE_WIRED(mem));
+ 
