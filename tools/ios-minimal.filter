@@ -1,0 +1,37 @@
+# rsync filter for mkiosroot-mac.sh --minimal (Darin, 2026-11-24: bare minimum iOS 26: SpringBoard + wallpapers).
+# First matching rule wins. Patterns starting with / are relative to each copied image root (OS, cryptexes).
+# Never trim the dyld shared cache, launchd, daemons, frameworks or /Applications service apps.
+
+# Wallpaper / poster apps and Photos (photo wallpapers) stay; every other staged user app goes
++ /private/var/staged_system_apps/AegirProxyApp.app/
++ /private/var/staged_system_apps/EmojiPoster.app/
++ /private/var/staged_system_apps/GradientPoster.app/
++ /private/var/staged_system_apps/KaleidoscopePosterApp.app/
++ /private/var/staged_system_apps/PridePosterApp.app/
++ /private/var/staged_system_apps/UnityPosterApp.app/
++ /private/var/staged_system_apps/WeatherPosterApp.app/
++ /private/var/staged_system_apps/Photos.app/
++ /private/var/staged_system_apps/Calculator.app/
+- /private/var/staged_system_apps/*
+
+# Apple Watch faces, ringtones
+- /System/Library/NanoTimeKit/
+- /Library/Ringtones/
+
+# Speech, Siri trigger, voices, AirDrop/sharing device art
+- /System/Library/PreinstalledAssetsV2/RequiredByOs/com_apple_MobileAsset_SharingDeviceAssets/
+- /System/Library/PreinstalledAssetsV2/RequiredByOs/com_apple_MobileAsset_VoiceServices_*/
+- /System/Library/PreinstalledAssetsV2/RequiredByOs/com_apple_MobileAsset_VoiceTrigger*/
+- /System/Library/PreinstalledAssetsV2/RequiredByOs/com_apple_MobileAsset_SpeakerRecognitionAssets/
+
+# Dictionaries / keyboards: English only
++ /System/Library/LinguisticData/RequiredAssets_en.bundle/
+- /System/Library/LinguisticData/RequiredAssets_*
+
+# Localizations: English (and Base) only
++ en.lproj/
++ en_US.lproj/
++ en_GB.lproj/
++ English.lproj/
++ Base.lproj/
+- *.lproj/

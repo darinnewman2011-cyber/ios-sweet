@@ -5,13 +5,15 @@
 #   mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img SIZE_BYTES [--translate] [--tweaks]
 #
 # SIZE_BYTES must not exceed the phone's /data/sweet/root.img (the image is written into that file in place).
+# --minimal skips what ios-minimal.filter lists while copying (rsync filter rules: apps, languages, voices...),
+# so a big iOS (26) fits the slot; nothing is copied and then deleted.
 # --translate runs tools/a8xlate (arm64e -> ARMv8.0) on the mounted image; --tweaks runs sweet-root-tweaks.py.
 # Needs sudo (system files keep their owners). Older IPSWs without cryptexes: pass "-" for SYSTEMOS/APPOS.
 set -euo pipefail
 [[ $# -ge 5 ]] || { sed -n '2,10p' "$0"; exit 2; }
 os=$1 sysos=$2 appos=$3 out=$4 size=$5; shift 5
-translate=0 tweaks=0
-for a in "$@"; do case $a in --translate) translate=1 ;; --tweaks) tweaks=1 ;; esac; done
+translate=0 tweaks=0 minimal=0
+for a in "$@"; do case $a in --translate) translate=1 ;; --tweaks) tweaks=1 ;; --minimal) minimal=1 ;; esac; done
 here=$(cd "$(dirname "$0")" && pwd)
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
@@ -53,7 +55,11 @@ R=$work/root
 copy() {
 	echo "copying $1 -> ${2#"$R"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	if [[ $minimal == 1 ]]; then
+		sudo rsync -aH --numeric-ids --filter="merge $here/ios-minimal.filter" "$1/" "$2/"
+	else
+		sudo rsync -aH --numeric-ids "$1/" "$2/"
+	fi
 }
 copy "$work/os" "$R"
 [[ $sysos != - ]] && copy "$work/sysos" "$R/private/preboot/Cryptexes/OS"
