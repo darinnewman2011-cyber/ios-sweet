@@ -1,0 +1,24 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 7b59635..74effb9 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -401,7 +401,7 @@ const struct sweet_lowram_range { pmap_paddr_t pa, len; } sweet_lowram_ranges[SW
+ 	{ 0xed400000ull, 0xf5400000ull - 0xed400000ull },
+ };
+ SECURITY_READ_ONLY_LATE(uint64_t) sweet_lowram_size = 0;   /* bytes added; 0 = off */
+-extern void vm_page_create(ppnum_t, ppnum_t);
++extern void vm_page_create_canonical(ppnum_t);   /* xnu-12377: one page at a time */
+ void sweet_lowram_release(void);
+ 
+ /* Called once from the A8 storage setup (sweet_ufs.c), when the VM and its zones run. */
+@@ -415,7 +415,9 @@ sweet_lowram_release(void)
+ 	}
+ 	done = 1;
+ 	for (int i = 0; i < SWEET_LOWRAM_NRANGES; i++) {
+-		vm_page_create((ppnum_t)atop(sweet_lowram_ranges[i].pa), (ppnum_t)atop(sweet_lowram_ranges[i].pa + sweet_lowram_ranges[i].len));
++		for (ppnum_t pn = (ppnum_t)atop(sweet_lowram_ranges[i].pa); pn < (ppnum_t)atop(sweet_lowram_ranges[i].pa + sweet_lowram_ranges[i].len); pn++) {
++			vm_page_create_canonical(pn);
++		}
+ 	}
+ 	printf("SWEET RAM: low bank added: %llu MiB in %d ranges from 0x%llx; max_mem %llu MiB\n", sweet_lowram_size >> 20,
+ 	    SWEET_LOWRAM_NRANGES, (unsigned long long)sweet_lowram_ranges[0].pa, (unsigned long long)(max_mem >> 20));
