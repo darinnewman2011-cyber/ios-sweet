@@ -1,0 +1,40 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 4a7aeb9..3d0f3a8 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1546,8 +1546,13 @@ brk_out:
+ #undef MSG_FMT
+ }
+ 
++#if defined(SWEET)
++extern void proc_selfname(char *buf, int size);
++extern int proc_selfpid(void);
++#endif
++
+ static void
+-handle_breakpoint(arm_saved_state_t *state, uint32_t esr __unused)
++handle_breakpoint(arm_saved_state_t *state, uint32_t esr)
+ {
+ 	exception_type_t           exception = EXC_BREAKPOINT;
+ 	mach_exception_data_type_t codes[2]  = {EXC_ARM_BREAKPOINT};
+@@ -1561,6 +1566,20 @@ handle_breakpoint(arm_saved_state_t *state, uint32_t esr __unused)
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+ 	codes[1] = get_saved_state_pc(state);
++#if defined(SWEET)
++	/* A8: say which user instruction trapped (translated arm64e code: ptrauth check traps brk #0xc47x, asserts) */
++	if (PSR64_IS_USER(get_saved_state_cpsr(state))) {
++		uint64_t pc = get_saved_state_pc(state);
++		uint32_t insn[6] = { 0 };
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		(void)copyin((user_addr_t)(pc - 16), insn, sizeof(insn));
++		printf("SWEET TRAP: %s[%d] brk #0x%x pc 0x%llx lr 0x%llx x16 0x%llx x17 0x%llx x0 0x%llx code %08x %08x %08x %08x [%08x] %08x\n",
++		    name, proc_selfpid(), (unsigned)ISS_BRK_COMMENT(esr), pc, get_saved_state_lr(state),
++		    get_saved_state_reg(state, 16), get_saved_state_reg(state, 17), get_saved_state_reg(state, 0),
++		    insn[0], insn[1], insn[2], insn[3], insn[4], insn[5]);
++	}
++#endif
+ 	exception_triage(exception, codes, numcodes);
+ 	__builtin_unreachable();
+ }
