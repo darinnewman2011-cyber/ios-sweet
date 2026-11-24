@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_a8input.c b/bsd/dev/sweet_a8input.c
+--- a/bsd/dev/sweet_a8input.c
++++ b/bsd/dev/sweet_a8input.c
+@@ -326,7 +326,55 @@
+ 	}
+ 	if (error && (ts_errors++ % 200u) == 0) {
+ 		printf("SWEET A8 TOUCH: read error %d (stat %#x)\n", error, a8_rd(a8_i2c, IICSTAT));
++	}
++}
++
++/*
++ * xnu 0187: touch by interrupt (boot-arg sweettouchirq=1, default on). The attention line gpa0-0 is wakeup EINT 0 of
++ * the ALIVE pin controller (Android: pin function 0xf), GIC SPI 0 = INTID 32 (live FDT gpa0 interrupts <0 0 0>,
++ * parent the GIC). Exynos7 wakeup EINT registers: CON +0x700, FLTCON +0x800, MASK +0x900, PEND +0xA00 (gpa0 at
++ * +0x0). Falling edge. The handler masks + clears the pin and wakes the input thread at once (instead of up to 10 ms
++ * later, out of step with the 60 Hz panel); the thread reads the events and unmasks. The 10 ms poll stays as fallback.
++ */
++#define A8_TS_SPI_INTID 32u
++#define EINT_CON        0x700u
++#define EINT_MASK       0x900u
++#define EINT_PEND       0xA00u
++static int a8_ts_chan;
++static volatile uint32_t a8_ts_irqs;
++extern int sweet_gic_enable_spi(uint32_t intid, void (*fn)(void *arg), void *arg);
++
++static void
++a8_ts_irq(__unused void *arg)
++{
++	a8_wr(a8_alive, EINT_MASK, a8_rd(a8_alive, EINT_MASK) | 1u);
++	a8_wr(a8_alive, EINT_PEND, 1u);
++	a8_ts_irqs++;
++	thread_wakeup(&a8_ts_chan);
++}
++
++static bool
++a8_ts_irq_init(void)
++{
++	int irq = 1;
++	(void)PE_parse_boot_argn("sweettouchirq", &irq, sizeof(irq));
++	if (!irq) {
++		return false;
+ 	}
++	uint32_t con = a8_rd(a8_alive, A8_GPA0 + GPIO_CON);
++	if ((con & 0xfu) != 0xfu) {
++		a8_wr(a8_alive, A8_GPA0 + GPIO_CON, con | 0xfu);       /* EXT_INT function */
++	}
++	a8_wr(a8_alive, EINT_MASK, a8_rd(a8_alive, EINT_MASK) | 1u);
++	a8_wr(a8_alive, EINT_CON, (a8_rd(a8_alive, EINT_CON) & ~7u) | 2u);     /* falling edge */
++	a8_wr(a8_alive, EINT_PEND, 1u);
++	if (sweet_gic_enable_spi(A8_TS_SPI_INTID, a8_ts_irq, NULL) != 0) {
++		printf("SWEET A8 TOUCH: IRQ %u not available, polling\n", A8_TS_SPI_INTID);
++		return false;
++	}
++	a8_wr(a8_alive, EINT_MASK, a8_rd(a8_alive, EINT_MASK) & ~1u);
++	printf("SWEET A8 TOUCH: interrupt mode (gpa0-0 EINT, INTID %u)\n", A8_TS_SPI_INTID);
++	return true;
+ }
+ 
+ static void
+@@ -344,12 +392,26 @@
+ 	if (!ts_ok) {
+ 		printf("SWEET A8 TOUCH: off (sweettouch=%d)\n", touch);
+ 	}
++	bool ts_irq = ts_ok && a8_ts_irq_init();
++	uint32_t loops = 0;
+ 	for (;;) {
+ 		a8_keys_poll(keys);
+ 		if (ts_ok) {
+ 			ts_poll();
+ 		}
+-		a8_sleep_ms(10);
++		if (ts_irq) {
++			a8_wr(a8_alive, EINT_PEND, 1u);
++			a8_wr(a8_alive, EINT_MASK, a8_rd(a8_alive, EINT_MASK) & ~1u);
++			if (++loops == 3000) {
++				printf("SWEET A8 TOUCH: %u interrupts in the first ~30 s\n", a8_ts_irqs);
++			}
++			uint64_t deadline;
++			clock_interval_to_deadline(10, NSEC_PER_MSEC, &deadline);
++			(void)assert_wait_deadline(&a8_ts_chan, THREAD_UNINT, deadline);
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			a8_sleep_ms(10);
++		}
+ 	}
+ }
+ 
