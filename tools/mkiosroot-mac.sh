@@ -41,11 +41,13 @@ attach_ro "$os" "$work/os"
 echo "creating $out ($size bytes, case-sensitive journaled HFS+)"
 mkfile -n "$size" "$out"
 dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$out" | awk 'NR==1{print $1}')
-attached=("$dev" "${attached[@]}")
 newfs_hfs -s -J -v iOSRoot "$dev" >/dev/null
+hdiutil detach "$dev" >/dev/null
+# re-attach mounted with ownership enabled (system files keep their root/mobile/_logd owners)
 mkdir -p "$work/root"
-sudo mount -t hfs "$dev" "$work/root"
-sudo diskutil enableOwnership "$work/root" >/dev/null   # system files keep root/mobile/_logd owners
+dev=$(hdiutil attach -owners on -nobrowse -noautoopen -imagekey diskimage-class=CRawDiskImage -mountpoint "$work/root" "$out" | awk 'NR==1{print $1}')
+attached=("$dev" "${attached[@]}")
+diskutil info "$work/root" | grep -q 'Owners:.*Enabled' || { echo "ownership is not enabled on the new image" >&2; exit 1; }
 R=$work/root
 
 copy() {
@@ -99,9 +101,10 @@ if [[ $translate == 1 ]]; then
 fi
 
 df -h "$R" | tail -1
-sudo umount "$R"
-echo "checking the filesystem"
-sudo fsck_hfs -fy "$dev" | tail -3 || true
 hdiutil detach "$dev" >/dev/null
 attached=("${attached[@]:1}")
+echo "checking the filesystem"
+dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$out" | awk 'NR==1{print $1}')
+fsck_hfs -fy "$dev" | tail -3 || true
+hdiutil detach "$dev" >/dev/null
 echo "ROOT_OK $out"
