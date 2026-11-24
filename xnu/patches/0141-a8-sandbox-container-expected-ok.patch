@@ -1,0 +1,37 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cfb5cba..1a1b247 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -283,13 +283,13 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * data (container paths, extension tokens) fail with ENOENT. The first
+  * use of each operation number is logged.
+  */
+-static uint64_t sweet_sandbox_seen;
++static uint64_t sweet_sandbox_seen[2];
+ 
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ {
+-	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+-		sweet_sandbox_seen |= 1ULL << call;
++	if (call >= 0 && call < 128 && !(sweet_sandbox_seen[call >> 6] & (1ULL << (call & 63)))) {
++		sweet_sandbox_seen[call >> 6] |= 1ULL << (call & 63);
+ 		char name[32];
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+@@ -298,8 +298,14 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+-	case 0x43:      /* container expected */
+ 		return ENOENT;
++	case 0x43:
++		/*
++		 * xnu 0141: container expected. iOS 17's sandbox_get_container_expected() fails (and with it launchd's
++		 * _container_init: "initproc failed to start") on any error; on success it reads two pre-zeroed u64 out
++		 * slots as "container expected" flags. Success with both left zero = no container, as before.
++		 */
++		return 0;
+ 	default:
+ 		return 0;
+ 	}
