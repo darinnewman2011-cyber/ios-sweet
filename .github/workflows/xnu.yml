@@ -18,6 +18,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      export_iig:
+        description: only upload the oldest Xcode's iig + libclang (for local builds), no kernel build
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -38,7 +41,30 @@ env:
   SWEET_BOARD: ${{ inputs.board || 'sweet' }}
 
 jobs:
+  iig:
+    # local builds on a Mac with a newer Xcode need the iig that matches xnu-8796's IORPC ABI
+    if: ${{ inputs.export_iig == 'true' }}
+    runs-on: macos-15-intel
+    steps:
+      - name: Collect iig
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          T="$XC/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr"
+          "$XC/Contents/Developer/usr/bin/xcodebuild" -version
+          mkdir -p out/usr/bin out/usr/lib
+          cp "$T/bin/iig" out/usr/bin/
+          cp "$T/lib/libclang.dylib" out/usr/lib/
+          cp -R "$T/lib/clang" out/usr/lib/ 2>/dev/null || true
+          basename "$XC" > out/XCODE.txt
+          otool -L out/usr/bin/iig
+          (cd out && find . -type f | sort | xargs shasum -a 256 > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iig-oldest-xcode
+          path: out
+
   build:
+    if: ${{ inputs.export_iig != 'true' }}
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-15-intel   # macos-14 was retired (2026-11-12: "not supported"); the step below picks the oldest Xcode
