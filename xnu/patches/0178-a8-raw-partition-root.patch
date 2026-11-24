@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9794e7c..b67ffac 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1215,6 +1215,43 @@ ext4_map_file(uint32_t ino)
+ 	return error;
+ }
+ 
++/*
++ * xnu 0178 (boot-arg sweetrootraw=1): the iOS root is the partition itself, an HFS volume written raw onto
++ * USERDATA (no ext4, no root.img). One identity run maps all of it, so the file-backed read and write paths
++ * (bounds, multi-block transfers, read-back) work unchanged and sweetrootrw=1 makes it writable. Refused
++ * unless an HFS+ / HFSX volume header sits at byte 1024, so an Android ext4 USERDATA is never written.
++ */
++static int
++raw_map_partition(uint64_t part_blocks)
++{
++	uint8_t vh[512];
++	int error = part_read(1024, vh, sizeof(vh));
++
++	if (error) {
++		return error;
++	}
++	if (vh[0] != 'H' || (vh[1] != '+' && vh[1] != 'X')) {
++		printf("SWEET ROOT: sweetrootraw: no HFS volume header on the partition (0x%02x%02x), refusing\n",
++		    vh[0], vh[1]);
++		return EINVAL;
++	}
++	xf.bsz = 4096;
++	uint64_t fblocks = part_blocks * UFS_BLOCK / xf.bsz;
++	if (fblocks == 0 || fblocks > UINT32_MAX) {
++		return EINVAL;
++	}
++	xf.run = kalloc_data(sizeof(*xf.run), Z_WAITOK | Z_ZERO);
++	if (!xf.run) {
++		return ENOMEM;
++	}
++	xf.run[0].fblk = 0;
++	xf.run[0].len = (uint32_t)fblocks;
++	xf.run[0].pblk = 0;
++	xf.nrun = 1;
++	xf.size = fblocks * xf.bsz;
++	return 0;
++}
++
+ /*
+  * Partition sector of file sector lba, UINT64_MAX for a hole or an unwritten
+  * extent; *n = sectors (<= count) that continue the same way.
+@@ -2261,6 +2298,15 @@ sweet_ufs_init(void)
+ 			su.nblocks = xf.size / UFS_BLOCK;
+ 		}
+ 	}
++	uint32_t rootraw = 0;
++	if (!error && !rootino && PE_parse_boot_argn("sweetrootraw", &rootraw, sizeof(rootraw)) && rootraw) {
++		error = raw_map_partition(part_blocks);
++		if (!error) {
++			printf("SWEET ROOT: \"%s\" is the root itself (HFS raw on the partition): %llu MiB\n", want,
++			    xf.size >> 20);
++			su.nblocks = xf.size / UFS_BLOCK;
++		}
++	}
+ #endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+@@ -2302,7 +2348,7 @@ sweet_ufs_init(void)
+ 		}
+ 	} else {
+ 		if (rootrw) {
+-			printf("SWEET ROOT: sweetrootrw refused (no file root or not fully written)\n");
++			printf("SWEET ROOT: sweetrootrw refused (no file or raw root, or not fully written)\n");
+ 		}
+ 		su.writable = ovl_init();
+ 	}
