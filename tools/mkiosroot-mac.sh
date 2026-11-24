@@ -104,6 +104,12 @@ fi
 if [[ $translate == 1 ]]; then
 	echo "translating arm64e code in place (a8xlate)"
 	sudo python3 "$here/a8xlate/a8xlate.py" inplace "$R" --cache "$HOME/.a8xlate-cache"
+	# corecrypto's FIPS self-test HMACs its own (now rewritten) code and fails; launchd panics on that boot task
+	if [[ -f "$R/usr/libexec/cc_fips_test" && -f "$here/stubs/cc_fips_test_stub" ]]; then
+		sudo mv "$R/usr/libexec/cc_fips_test" "$R/usr/libexec/cc_fips_test.orig"
+		sudo install -o 0 -g 0 -m 0755 "$here/stubs/cc_fips_test_stub" "$R/usr/libexec/cc_fips_test"
+		echo "cc_fips_test replaced by the always-pass stub (original kept as .orig)"
+	fi
 fi
 
 df -h "$R" | tail -1
