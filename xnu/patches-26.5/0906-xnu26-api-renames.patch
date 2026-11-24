@@ -39,6 +39,18 @@ index 666b7e7..2d0d464 100644
  		SWEET_GIC_EOI(iar);
  	} else if (intid < 16) {
  		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index defad01..fca531f 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -38,7 +38,6 @@ osfmk/arm64/lz4_encode_arm64.s  standard
+ osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
+ osfmk/arm64/amcc_rorgn_ppl_amcc.c optional nos_arm_asm config_pmap_ppl
+ osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
+-osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm
+ osfmk/arm64/bcopy.s standard
+ osfmk/arm64/bzero.s standard
+ osfmk/arm/caches.c		standard
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 index 0a57277..0fe8a97 100644
 --- a/osfmk/kern/exception.c
