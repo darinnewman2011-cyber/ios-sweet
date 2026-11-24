@@ -1,0 +1,110 @@
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+index c1c3929..c70f88e 100644
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -254,6 +254,16 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ 
+ 	p = current_proc();
+ 
++#if defined(SWEET)
++	/* A8: a8xlate rewrites translated arm64e binaries in place; their page hashes no longer match. Allow the
++	 * page and keep CS_VALID (launchd refuses boot tasks without platform-binary status). */
++	(void)flags; (void)send_kill; (void)retval; (void)verbose;
++	if (cs_killed) {
++		*cs_killed = FALSE;
++	}
++	return 0;
++#endif
++
+ 	if (verbose) {
+ 		printf("CODE SIGNING: cs_invalid_page(0x%llx): p=%d[%s]\n",
+ 		    vaddr, proc_getpid(p), p->p_comm);
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+index 2c16ff7..1859e1b 100644
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -1805,11 +1805,15 @@ parse_machfile(
+ 								printf("CODE SIGNING: %s[%d]: invalid initial page at offset %lld validated:%d tainted:%d csflags:0x%x\n",
+ 								    vp->v_name, proc_getpid(p), (long long)(file_offset + off), valid, tainted, result->csflags);
+ 							}
++#if defined(SWEET)
++							/* A8: translated binaries (rewritten header/code) keep CS_VALID and platform status */
++#else
+ 							if (cs_process_global_enforcement() ||
+ 							    (result->csflags & (CS_HARD | CS_KILL | CS_ENFORCEMENT))) {
+ 								ret = LOAD_FAILURE;
+ 							}
+ 							result->csflags &= ~CS_VALID;
++#endif
+ 						}
+ 						off += PAGE_SIZE;
+ 					}
+diff --git a/osfmk/vm/vm_dyld_pager.c b/osfmk/vm/vm_dyld_pager.c
+index d3cd6e8..d8d84b5 100644
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -60,7 +60,7 @@
+ 
+ #include <sys/kdebug_triage.h>
+ #include <mach-o/fixup-chains.h>
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(SWEET)
+ #include <ptrauth.h>
+ #include <arm/misc_protos.h>
+ #endif /* defined(HAS_APPLE_PAC) */
+@@ -557,9 +557,12 @@ fixupPage32(
+ 	return KERN_SUCCESS;
+ }
+ 
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(SWEET)
+ /*
+  * Sign a pointer needed for fixups.
++ *
++ * SWEET (Galaxy A8, ARMv8.0, no pointer authentication): translated iPhone arm64e binaries keep their arm64e
++ * chained-fixup formats. Apply them with plain pointers; the kernel arm64e emulator (0140) treats AUT/PAC as no-ops.
+  */
+ static kern_return_t
+ signPointer(
+@@ -577,6 +580,15 @@ signPointer(
+ 		return KERN_SUCCESS;
+ 	}
+ 
++#if !defined(HAS_APPLE_PAC)
++	(void)loc; (void)addrDiv; (void)diversity; (void)pager;
++	if (key != ptrauth_key_asia && key != ptrauth_key_asda) {
++		printf("%s(): Invalid ptr auth key %d\n", __func__, key);
++		return KERN_FAILURE;
++	}
++	*signedAddr = unsignedAddr;
++	return KERN_SUCCESS;
++#else
+ 	uint64_t extendedDiscriminator = diversity;
+ 	if (addrDiv) {
+ 		extendedDiscriminator = __builtin_ptrauth_blend_discriminator(loc, extendedDiscriminator);
+@@ -601,6 +613,7 @@ signPointer(
+ 		return KERN_FAILURE;
+ 	}
+ 	return KERN_SUCCESS;
++#endif /* !HAS_APPLE_PAC */
+ }
+ 
+ /*
+@@ -813,7 +826,7 @@ fixupCachePageAuth64(
+ 	} while (valid_chain);
+ 	return KERN_SUCCESS;
+ }
+-#endif /* defined(HAS_APPLE_PAC) */
++#endif /* defined(HAS_APPLE_PAC) || defined(SWEET) */
+ 
+ 
+ /*
+@@ -922,7 +935,7 @@ fixup_page(
+ 	 * Route to the appropriate fixup routine
+ 	 */
+ 	switch (hdr->mwli_pointer_format) {
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(SWEET)
+ 	case DYLD_CHAINED_PTR_ARM64E:
+ 		fixupPageAuth64(userVA, contents, pager, segInfo, pageIndex, false);
+ 		break;
