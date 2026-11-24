@@ -66,6 +66,8 @@ jobs:
           if [ "${{ inputs.vanilla }}" = true ]; then
             # vanilla: no A8/SWEET changes, only our new-compiler compatibility patches (Xcode 16+ vs older xnu)
             cp xnu/patches/*new-clang*.patch "$pdir"/
+            # version-specific copies of those patches replace them (e.g. patches-12.5/0002 for xnu-8020)
+            for f in xnu/patches-"$MACOS_VERSION"/*new-clang*.patch; do [ -f "$f" ] && cp -v "$f" "$pdir"/; done
             echo "vanilla build: compiler-compat patches only"; ls "$pdir" > patchlist.txt; cat patchlist.txt
           else
           cp xnu/patches/*.patch xnu/patches/*.sh "$pdir"/
