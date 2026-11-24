@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 9eff2b5..c85458b 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -861,7 +861,7 @@ wl_signal(uint32_t sig, uint32_t sig_len, const uint8_t *dat, uint32_t dat_len)
+ 			}
+ 			t[k] = 0;
+ 			printf("SWEET A8 WIFI: fw %04x %04x %04x: %s\n", rd16(sig + 10), rd16(sig + 12), rd16(sig + 14), t);
+-			if (rd16(sig + 10) == 0x0001) {
++			if (rd16(sig + 10) == 0x0001 || rd16(sig + 10) == 0x0004) {  /* xnu 0183: module 4 (debug records) too */
+ 				/* xnu 0180: frame records (module 1) in hex too: rates, capability, status codes */
+ 				char h[3 * 48 + 1];
+ 				for (uint32_t off = 0; off < dat_len && off < 192; off += 48) {
