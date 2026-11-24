@@ -1,0 +1,20 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index af7fa3e..2385312 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -463,11 +463,15 @@ ARM64_PLKSEG_ADDR  = 0xfffffff004004000
+ ARM64_LINK_ADDR    = 0xfffffff007004000
+ 
+ # Use ARM_LARGE_MEMORY config for all MacOSX targets.
++# SWEET_BOARD=jackpotlte (Galaxy A8): keep the iOS 4K small-memory layout (0xfffffff007004000, T1SZ 26); the
++# -2 TB large-memory kernel VA cannot be reached with its 38-bit TTBR1 (see 0087).
+ ifneq ($(filter $(PLATFORM),MacOSX),)
++ifneq ($(SWEET_BOARD),jackpotlte)
+ ARM64_LARGE_MEMORY = 1
+ ARM64_PLKSEG_ADDR  = 0xfffffe0004004000
+ ARM64_LINK_ADDR    = 0xfffffe0007004000
+ endif
++endif
+ 
+ 
+ ifeq ($(ARM64_LARGE_MEMORY),1)
