@@ -1,0 +1,17 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index cf4d1ab..ed8eb25 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -161,7 +161,11 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_MAX_CHUNK_ALLOC_NUM        (10)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if   XNU_PLATFORM_MacOSX
++/*
++ * SWEET_JACKPOTLTE uses the iOS 4K kernel VA layout (0087): ~112 GB of kernel
++ * VA in total, so the 128 GB macOS zone map cannot be placed. Use iOS sizes.
++ */
++#if XNU_PLATFORM_MacOSX && !defined(SWEET_JACKPOTLTE)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else
