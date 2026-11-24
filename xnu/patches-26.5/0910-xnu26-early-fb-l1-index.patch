@@ -1,0 +1,14 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 74effb9..22dbd67 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1910,7 +1910,8 @@ static void
+ sweet_early_map_block(vm_map_address_t va, pmap_paddr_t pa, unsigned int attr)
+ {
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+-	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	/* xnu-12377: ARM_TT_L1_INDEX_MASK no longer follows __ARM64_PMAP_SUBPAGE_L1__ (38-bit TTBR1 on the A8) */
++	tt_entry_t l1 = cpu_tte[L1_TABLE_T1_INDEX(va, TCR_EL1_BOOT)];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
