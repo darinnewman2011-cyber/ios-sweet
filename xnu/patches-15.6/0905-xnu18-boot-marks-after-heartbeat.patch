@@ -1,0 +1,109 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index e7e92c8..64796d2 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -110,11 +110,11 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled || stage > 39) {
+ 		return;
+ 	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++	for (unsigned int y = EARLY_HEIGHT - 32; (stage + 1) * 48 <= EARLY_WIDTH && y < EARLY_HEIGHT; y++) {
+ 		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+ 			EARLY_FB[y * EARLY_STRIDE + x] = color;
+ 		}
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index e1cd16c..372af81 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -686,6 +686,9 @@ void sweet_a8_snapshot(void);
+ void sweet_a8_reboot_recovery(void) __dead2;
+ 
+ #define SWEET_STAGE(label) do { sweet_boot_stage = (label); } while (0)
++#include <arm64/sweet_early.h>
++/* on-screen marks after the heartbeat: the log stops there when the kernel hangs hard (xnu18 bring-up) */
++#define SWEET_MARK(n, label) sweet_early_mark((n), (label))
+ 
+ static void
+ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+@@ -723,6 +726,7 @@ sweet_boot_hb_start(void)
+ }
+ #else
+ #define SWEET_STAGE(label) do { } while (0)
++#define SWEET_MARK(n, label) do { } while (0)
+ #endif
+ 
+ static void
+@@ -847,16 +851,20 @@ kernel_bootstrap_thread(void)
+ 	/*
+ 	 * This will start displaying progress to the user, start as early as possible
+ 	 */
++	SWEET_MARK(21, "heartbeat armed; initialize_screen");
+ 	initialize_screen(NULL, kPEAcquireScreen);
+ 
+ 	/*
+ 	 *	Initialize the shared region module.
+ 	 */
+ 	SWEET_STAGE("initialize_screen done");
++	SWEET_MARK(22, "screen done; vm_commpage_init");
+ 	vm_commpage_init();
++	SWEET_MARK(23, "vm_commpage_text_init");
+ 	vm_commpage_text_init();
+ 
+ 	SWEET_STAGE("commpage done");
++	SWEET_MARK(24, "commpage done; mac_policy_initmach");
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_initmach");
+ 	mac_policy_initmach();
+@@ -865,6 +873,7 @@ kernel_bootstrap_thread(void)
+ 	vnguard_policy_init();
+ #endif
+ #endif
++	SWEET_MARK(25, "MAC policies done");
+ 
+ #if CONFIG_DTRACE
+ 	kernel_bootstrap_log("dtrace_early_init");
+@@ -890,12 +899,15 @@ kernel_bootstrap_thread(void)
+ 	kernel_bootstrap_log("trust_cache_init");
+ 
+ 	/* Initialize the runtime for the trust cache interface */
++	SWEET_MARK(26, "trust_cache_runtime_init");
+ 	trust_cache_runtime_init();
+ 
+ 	/* Load the static and engineering trust caches */
+ 	load_static_trust_cache();
+ 
++	SWEET_MARK(27, "startup upto LOCKDOWN");
+ 	kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN);
++	SWEET_MARK(28, "LOCKDOWN subsystems done");
+ 
+ 	/*
+ 	 * Get rid of segments used to bootstrap kext loading. This removes
+@@ -916,6 +928,7 @@ kernel_bootstrap_thread(void)
+ 
+ 	/* No changes to kernel text and rodata beyond this point. */
+ 	SWEET_STAGE("kext bootstrap removed");
++	SWEET_MARK(29, "machine_lockdown");
+ 	kernel_bootstrap_log("machine_lockdown");
+ 	machine_lockdown();
+ 
+@@ -930,6 +943,7 @@ kernel_bootstrap_thread(void)
+ 
+ #ifdef  IOKIT
+ 	SWEET_STAGE("machine_lockdown done");
++	SWEET_MARK(30, "machine_lockdown done");
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
+ #endif
+@@ -938,6 +952,7 @@ kernel_bootstrap_thread(void)
+ 	 * at the latest
+ 	 */
+ 	SWEET_STAGE("PE_lockdown_iokit returned");
++	SWEET_MARK(31, "PE_lockdown_iokit returned");
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 
+ 
