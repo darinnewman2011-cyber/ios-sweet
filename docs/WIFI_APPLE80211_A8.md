@@ -24,7 +24,11 @@ networks and runs DHCP in the kernel (`bsd/dev/sweet_a8wlbt.c`, xnu 0139); what 
   value becomes the error. Without a bound user client the framework falls back to the classic socket ioctl.
 - `Apple80211GetIfListCopy`: `getifaddrs()`, skips lo0/gif0/stf0/faith0, keeps interfaces whose `SIOCGIFMEDIA`
   says IEEE 802.11.
-- Event monitoring (`Apple80211EventMonitoringInitIOUC`, `_openEventSocket`) still to be read: stage 2.
+- Events: `_Apple80211IOUCResume` asks the driver "useIOUCWhenPossible" / "useIOUCEventPipe" (a mapped ring buffer
+  + IOConnectCallAsyncMethod); without it the framework uses `_openEventSocket`: `socket(PF_SYSTEM, SOCK_RAW,
+  SYSPROTO_EVENT)` + `SIOCSKEVFILT {vendor 1 (Apple), class 6 (KEV_IEEE80211_CLASS), subclass 1}`. So the kernel can
+  post `kev_post_msg` events with APPLE80211_M_* codes (4 LINK_CHANGED, 9 ASSOC_DONE, 10 SCAN_DONE, ...); the payload
+  layout is read from `__eventReadCallbackCF` in stage 2.
 - Request numbers and structure layouts: AirportItlwm's reverse-engineered headers (OpenIntelWireless/itlwm,
   `include/Airport/apple80211_*.h`), read for facts; macOS-era, so iOS differences are expected.
 

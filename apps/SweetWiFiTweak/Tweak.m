@@ -54,6 +54,23 @@ static NSString *SWWrite(const char *name, NSString *cmd)
 	return [NSString stringWithFormat:@"The kernel refused it: %s", strerror(errno)];
 }
 
+/* diagnostics: the kernel prints every command written to kern.sweet_wifi ("SWEET A8 NET: wifi: diag ..."), and its
+ * Wi-Fi handler ignores unknown words, so this lands in the kernel log (ramoops) without side effects. */
+static void SWDiag(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void SWDiag(NSString *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+	va_end(ap);
+	m = [@"diag sweetwifi " stringByAppendingString:[m stringByReplacingOccurrencesOfString:@"\n" withString:@" "]];
+	const char *c = m.UTF8String;
+	char buf[250];
+	strlcpy(buf, c, sizeof(buf));
+	sysctlbyname("kern.sweet_wifi", NULL, NULL, buf, strlen(buf));
+	SWLog(@"%@", m);
+}
+
 typedef struct {
 	NSString *state, *detail, *ip;
 	NSArray<NSArray<NSString *> *> *items;
@@ -104,10 +121,16 @@ static NSString *SWBTConnected(SWStatus s)
 	return names.count ? [names componentsJoinedByString:@", "] : nil;
 }
 
+static NSMutableString *SWHookReport;
+
 static void SWSwizzle(NSString *cls, NSString *sel, IMP imp, IMP *orig)
 {
 	Class c = NSClassFromString(cls);
 	Method m = c ? class_getInstanceMethod(c, NSSelectorFromString(sel)) : NULL;
+	if (SWHookReport == nil) {
+		SWHookReport = [NSMutableString string];
+	}
+	[SWHookReport appendFormat:@" %@%@", m ? @"+" : @"-", sel];
 	if (m == NULL) {
 		SWLog(@"no -[%@ %@], that part stays off", cls, sel);
 		return;
@@ -360,6 +383,18 @@ static IMP origSpecifiers, origDidSelect;
 static id SWSpecifiers(id self, SEL _cmd)
 {
 	NSArray *specs = ((id (*)(id, SEL))origSpecifiers)(self, _cmd);
+	static BOOL reported;
+	if (!reported && specs.count) {
+		reported = YES;
+		NSMutableArray *ids = [NSMutableArray array];
+		for (id spec in specs) {
+			NSString *ident = SWSpecifierID(spec);
+			if (ident.length && ids.count < 24) {
+				[ids addObject:ident];
+			}
+		}
+		SWDiag(@"rows %@", [ids componentsJoinedByString:@","]);
+	}
 	for (id spec in specs) {
 		NSString *ident = SWSpecifierID(spec);
 		if (SWIsWiFi(ident)) {
@@ -378,6 +413,7 @@ static void SWDidSelect(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip)
 		spec = ((id (*)(id, SEL, id))objc_msgSend)(self, @selector(specifierAtIndexPath:), ip);
 	}
 	NSString *ident = SWSpecifierID(spec);
+	SWDiag(@"tap %@ (%@)", ident ?: @"?", spec ? NSStringFromClass([spec class]) : @"no specifier");
 	if (SWIsWiFi(ident) || SWIsBT(ident)) {
 		[tv deselectRowAtIndexPath:ip animated:YES];
 		SWListController *vc = [SWListController new];
@@ -417,7 +453,7 @@ static void SWSettingsInit(void)
 			}
 		}
 	}];
-	SWLog(@"Settings hooks in");
+	SWDiag(@"Settings hooks%@", SWHookReport);
 }
 
 /* ---------------------------------------------------------------- SpringBoard: configd + status bar */
@@ -452,7 +488,10 @@ static void SWPublish(NSString *ip)
 	if (ok) {
 		SWPosted = ip ?: @"";
 	} else {
-		SWLog(@"configd refused: %s", SCErrorString(SCError()));
+		static int told;
+		if (told++ < 3) {
+			SWDiag(@"configd refused: %s", SCErrorString(SCError()));
+		}
 	}
 	CFRelease(st);
 }
@@ -500,6 +539,10 @@ static void SWSpringBoardInit(void)
 	dispatch_source_set_event_handler(t, ^{
 		SWStatus s = SWParse(SWRead("kern.sweet_wifi"), @"net");
 		SWPublish(s.ip);
+		static unsigned ticks;
+		if (ticks++ % 20 == 0) {   /* every 60 s, so the kernel log's tail (ramoops) always holds one */
+			SWDiag(@"sb alive%@ joined %@ posted %@", SWHookReport, SWJoinedNet.firstObject ?: @"-", SWPosted.length ? @"yes" : @"no");
+		}
 		NSArray<NSString *> *j = SWIsOn(s.state) && s.ip ? SWJoined(s) : nil;
 		BOOL changed = !((j == nil && SWJoinedNet == nil) || [j isEqualToArray:SWJoinedNet]);
 		if (changed) {
@@ -513,12 +556,15 @@ static void SWSpringBoardInit(void)
 	static dispatch_source_t keep;
 	keep = t;
 	(void)keep;
-	SWLog(@"SpringBoard hooks in");
+	Class agg = NSClassFromString(@"SBStatusBarStateAggregator");
+	SWDiag(@"SpringBoard hooks%@ agg %d/%d", SWHookReport, agg != Nil,
+	       [agg respondsToSelector:@selector(sharedInstance)]);
 }
 
 __attribute__((constructor)) static void SWInit(void)
 {
 	NSString *bid = NSBundle.mainBundle.bundleIdentifier;
+	SWDiag(@"loaded in %@ pid %d", bid ?: @"?", getpid());
 	if ([bid isEqualToString:@"com.apple.Preferences"]) {
 		SWSettingsInit();
 	} else if ([bid isEqualToString:@"com.apple.springboard"]) {

@@ -173,7 +173,7 @@ pick_kernel() {
 	[ -f "$HOME/iOS/art-xnu17e/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu17e/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 17 era + storage + arm64e emulator + sandbox fixes (xnu17, 0139-0143) - recommended for 17"); }
 	[ -f "$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 17 era + fast storage only (xnu17, no sandbox fixes: launchd stops at _container_init)"); }
 	[ -d "$T/ipad17/art97" ] && { ks+=("$T/ipad17/art97"); names+=("iPadOS 17 era, older (xnu17 #97, patches up to 0138, no Wi-Fi)"); }
-	[ -f "$HOME/iOS/art-xnu18f/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu18f/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era, newest (xnu18 + CPU start fix 11-24; still freezes after 'boot heartbeat armed')"); }
+	[ -f "$HOME/iOS/art-xnu18f/xnu-kernel-jackpotlte-15.6/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu18f/xnu-kernel-jackpotlte-15.6"); names+=("iOS/iPadOS 18 era, newest (xnu18 + CPU start fix 11-24; still freezes after 'boot heartbeat armed')"); }
 	[ -f "$HOME/iOS/art-xnu18s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu18s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era + fast storage (xnu18, patches to 0138 + storage backport) - recommended for 18"); }
 	[ -d "$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte" ] && { ks+=("$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era, older (xnu18, patches up to 0138, no Wi-Fi)"); }
 	[ -f "$HOME/iOS/xnu-local/out-DEVELOPMENT/kernel.development.sweet" ] && { ks+=("$HOME/iOS/xnu-local/out-DEVELOPMENT"); names+=("Local Mac build (~/iOS/xnu-local)"); }
