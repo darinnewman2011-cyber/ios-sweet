@@ -1,3 +1,16 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 72f3ee9..af7fa3e 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -224,6 +224,8 @@ WARNFLAGS_STD := \
+ 	-Wno-ms-bitfield-padding \
+ 	-Wno-partial-availability \
+ 	-Wno-reserved-id-macro \
++	-Wno-reserved-identifier \
++	-Wno-reserved-macro-identifier \
+ 	-Wno-shift-sign-overflow \
+ 	-Wno-switch-enum \
+ 	-Wno-unaligned-access \
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
 index 631716e..71248f2 100644
 --- a/osfmk/arm64/cpu.c
