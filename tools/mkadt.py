@@ -119,7 +119,7 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', fb=None, mem=Non
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     if jp:
         timebase = JP_TIMEBASE
-    seed = seed if seed is not None else os.urandom(64)
+    seed = seed if seed is not None else os.urandom(256)   # xnu-12377 (iOS 26) wants 256 seed bytes; older kernels read 64
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
