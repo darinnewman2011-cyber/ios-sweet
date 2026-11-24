@@ -192,6 +192,15 @@ flash_boot() {
 	esac
 	[ -s "$base" ] || base=$T/ios121.cmdline
 	local cmd tag; cmd=$(tr -d '\r\n' < "$base")
+	if [ "$adt" = "$T/ipad17/jackpotlte-ipad7.adt" ]; then
+		# iPadOS: full screen (the A8's real 1080x2220 panel) unless the iPad 7's own 4:3 canvas is wanted
+		if [ "$(ask "Full screen (fill the phone's whole panel)? (Y/n; n = iPad 4:3, letterboxed)")" != n ]; then
+			cmd=$(echo "$cmd" | sed 's/ *sweetfb_ipad=1//; s/ *sweetfb_fit=1//')
+			echo "$cmd" | grep -q 'sweetfb_native=' || cmd="$cmd sweetfb_native=1"
+		fi
+		echo "$cmd" | grep -q 'sweetmmcdma=' || cmd="$cmd sweetmmcdma=1"
+	fi
+	cmd=$(echo "$cmd" | sed "s/sweettime=[0-9]*/sweettime=$(date +%s)/")
 	if [ "$(ask "Test mode: return to TWRP after 5 minutes so logs can be pulled? (Y/n)")" != n ]; then
 		echo "$cmd" | grep -q 'sweetreboot=' && cmd=$(echo "$cmd" | sed 's/sweetreboot=[0-9]*/sweetreboot=300/') || cmd="$cmd sweetreboot=300"
 		tag=t
