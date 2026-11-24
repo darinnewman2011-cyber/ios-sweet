@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 49cf946..166cced 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -842,6 +842,38 @@ wl_signal(uint32_t sig, uint32_t sig_len, const uint8_t *dat, uint32_t dat_len)
+ 		}
+ 		snprintf(wl_status, sizeof(wl_status), "%d networks found (%u results)", n_nets, wl_scan_inds);
+ 		printf("SWEET A8 WIFI: scan done: %u results, %d networks\n", wl_scan_inds, n_nets);
++		{
++			/*
++			 * xnu 0179: every 4th scan, each network as IO80211 gets it (why Settings lists some and not
++			 * others): MHz, RSSI, capability, secure, IE ids (and the first 6 bytes of vendor elements, 221).
++			 */
++			static uint32_t dump_n;
++			if ((dump_n++ & 3) == 0) {
++				for (int i = 0; i < n_nets; i++) {
++					struct wnet *w = &nets[i];
++					char ids[200];
++					size_t k = 0;
++					ids[0] = 0;
++					for (uint32_t p = 0; p + 2 <= w->ie_len && k + 24 < sizeof(ids);) {
++						uint8_t id = w->ie[p], il = w->ie[p + 1];
++						if (p + 2 + il > w->ie_len) {
++							break;
++						}
++						if (id == 221 && il >= 4) {
++							k += (size_t)snprintf(ids + k, sizeof(ids) - k, " 221:%02x%02x%02x%02x", w->ie[p + 2],
++							    w->ie[p + 3], w->ie[p + 4], w->ie[p + 5]);
++						} else if (id == 255 && il >= 1) {
++							k += (size_t)snprintf(ids + k, sizeof(ids) - k, " 255.%u", w->ie[p + 2]);
++						} else {
++							k += (size_t)snprintf(ids + k, sizeof(ids) - k, " %u", id);
++						}
++						p += 2u + il;
++					}
++					printf("SWEET A8 WIFI: net '%s' %u MHz %d dBm cap %04x bint %u sec %u ies %u:%s\n", w->ssid,
++					    w->mhz, w->rssi, w->cap, w->bint, w->secure, w->ie_len, ids);
++				}
++			}
++		}
+ 		wl_publish("on", wl_status);
+ 		if (auto_join > 0 && !connected && !joining) {
+ 			auto_join--;
