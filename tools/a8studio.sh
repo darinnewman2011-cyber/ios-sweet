@@ -8,7 +8,7 @@
 #   - the phone must report ro.product.device == jackpotlte before anything touches it
 #   - the iOS root is only ever written into /data/sweet/root.img in place, then SHA-compared with the Mac copy
 #   - installing another iOS overwrites iOS 16 on the phone: it asks you to type YES, and "Back to iOS 16"
-#     restores it from the Mac backup (~/iOS/a8-root-backups/phone-pull.img)
+#     restores it from the Mac backup (~/iOS/a8-root-backups/a8-root-2026-11-23.img)
 set -u
 export PATH="$HOME/platform-tools:$HOME/bin:/usr/local/bin:$PATH"
 REPO=$HOME/iOS/ios-sweet-a8; T=$HOME/iOS/_tmp; STUDIO=$HOME/iOS/studio; IPSWDIR=$HOME/iOS/ipsw
@@ -157,9 +157,9 @@ stream_root() {	# image sha256 -> writes it into /data/sweet/root.img in place a
 install_root() {
 	[ -n "$NAME" ] && [ -s "$STUDIO/$NAME/root.img" ] || { echo "Build the root image first (4)."; return; }
 	say "This REPLACES iOS 16 on the phone with $NAME."
-	echo "iOS 16 comes back with 'Back to iOS 16' (restores $BK/phone-pull.img, ~15 minutes)."
-	[ -s "$BK/phone-pull.img" ] || { echo "No iOS 16 backup at $BK/phone-pull.img. Stopping."; return; }
-	echo "Backup: $BK/phone-pull.img from $(stat -f %Sm "$BK/phone-pull.img")."
+	echo "iOS 16 comes back with 'Back to iOS 16' (restores $BK/a8-root-2026-11-23.img, ~15 minutes)."
+	[ -s "$BK/a8-root-2026-11-23.img" ] || { echo "No iOS 16 backup at $BK/a8-root-2026-11-23.img. Stopping."; return; }
+	echo "Backup: $BK/a8-root-2026-11-23.img from $(stat -f %Sm "$BK/a8-root-2026-11-23.img")."
 	[ "$(ask "Type YES to replace iOS 16 on the phone:")" = YES ] || { echo "Cancelled."; return; }
 	need_a8 || return
 	stream_root "$STUDIO/$NAME/root.img" "$(cut -d' ' -f1 "$STUDIO/$NAME/root.sha")" && echo "$NAME" > "$STUDIO/.on-phone"
@@ -170,8 +170,10 @@ pick_kernel() {
 	local ks=() names=() d
 	d=$(ls -d "$HOME"/iOS/art1[0-9][0-9]/xnu-kernel-jackpotlte 2>/dev/null | sort -V | tail -1)
 	[ -n "$d" ] && { ks+=("$d"); names+=("iOS 16 era - current A8 kernel ($(basename "$(dirname "$d")")): Wi-Fi work, fast storage, logging"); }
-	[ -f "$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 17 era + fast storage (xnu17, patches to 0138 + storage backport) - recommended for 17"); }
+	[ -f "$HOME/iOS/art-xnu17e/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu17e/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 17 era + storage + arm64e emulator + sandbox fixes (xnu17, 0139-0143) - recommended for 17"); }
+	[ -f "$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 17 era + fast storage only (xnu17, no sandbox fixes: launchd stops at _container_init)"); }
 	[ -d "$T/ipad17/art97" ] && { ks+=("$T/ipad17/art97"); names+=("iPadOS 17 era, older (xnu17 #97, patches up to 0138, no Wi-Fi)"); }
+	[ -f "$HOME/iOS/art-xnu18f/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu18f/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era, newest (xnu18 + CPU start fix 11-24; still freezes after 'boot heartbeat armed')"); }
 	[ -f "$HOME/iOS/art-xnu18s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu18s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era + fast storage (xnu18, patches to 0138 + storage backport) - recommended for 18"); }
 	[ -d "$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte" ] && { ks+=("$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era, older (xnu18, patches up to 0138, no Wi-Fi)"); }
 	[ -f "$HOME/iOS/xnu-local/out-DEVELOPMENT/kernel.development.sweet" ] && { ks+=("$HOME/iOS/xnu-local/out-DEVELOPMENT"); names+=("Local Mac build (~/iOS/xnu-local)"); }
@@ -225,14 +227,14 @@ flash_boot() {
 # ---------------------------------------------------------------------------------------------------------- 7
 back_to_ios16() {
 	say "Back to iOS 16"
-	[ -s "$BK/phone-pull.img" ] || { echo "No backup at $BK/phone-pull.img."; return; }
+	[ -s "$BK/a8-root-2026-11-23.img" ] || { echo "No backup at $BK/a8-root-2026-11-23.img."; return; }
 	need_a8 || return
 	local on; on=$(cat "$STUDIO/.on-phone" 2>/dev/null || echo "iOS 16")
 	if [ "$on" != "iOS 16" ]; then
 		echo "The phone has $on. Restoring the iOS 16 root from the Mac backup."
 		echo "Checksumming the Mac backup first (about a minute)..."
-		local h; h=$(shasum -a 256 "$BK/phone-pull.img" | cut -d' ' -f1)
-		stream_root "$BK/phone-pull.img" "$h" || return
+		local h; h=$(shasum -a 256 "$BK/a8-root-2026-11-23.img" | cut -d' ' -f1)
+		stream_root "$BK/a8-root-2026-11-23.img" "$h" || return
 		echo "iOS 16" > "$STUDIO/.on-phone"
 	else
 		echo "The phone's root is already iOS 16; only the boot image is restored."
