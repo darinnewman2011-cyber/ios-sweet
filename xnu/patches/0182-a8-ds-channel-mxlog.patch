@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index fa017a8..f7f2d58 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -603,6 +603,13 @@ scan_result(int16_t rssi, uint16_t freq_half_mhz, const uint8_t *f, uint32_t len
+ 			w.ssid[l] = 0;
+ 		} else if (id == 48) {
+ 			w.secure = 2;
++		} else if (id == 3 && l == 1 && w.mhz < 3000 && f[p + 2] >= 1 && f[p + 2] <= 14) {
++			/*
++			 * xnu 0182: a 2.4 GHz beacon is heard on neighbouring channels too; the DS Parameter Set names
++			 * the network's own channel (the join went out on 7 for an AP on 6 in ios141b)
++			 */
++			uint8_t c = f[p + 2];
++			w.mhz = (uint16_t)(c == 14 ? 2484 : 2407 + 5 * c);
+ 		}
+ 		p += 2u + l;
+ 	}
+@@ -760,6 +767,7 @@ send_connect(void)
+ 	memcpy(d + 2, nets[join_idx].ssid, l);
+ 	send_assoc_ies();
+ 	fwlog_left = 150;                       /* firmware debug text during the join */
++	mxlog_left = 600;                       /* xnu 0182: and the firmware's mxlog records */
+ 	e = sig_send(s, 34, d, 2 + l);
+ 	printf("SWEET A8 WIFI: connect request to %s on %u MHz: error %d\n", nets[join_idx].ssid, nets[join_idx].mhz, e);
+ }
+@@ -796,6 +804,35 @@ start_join(void)
+ 	}
+ }
+ 
++/*
++ * xnu 0182: the firmware's mxlog stream (to-AP, 4-byte packets): always drained so it never fills, printed
++ * as raw words while a join is in progress (mxlog_left lines). Records are | sync 0x9669 | lvl | len || tstamp ||
++ * offset into debug/common/log-strings.bin || args |; tools/a8-mxlog.py decodes them on the Mac.
++ */
++static int mxlog_left = 150;            /* the first records after Wi-Fi starts, too */
++
++static void
++mxlog_drain(void)
++{
++	uint32_t r = rd(shm, log_in.ridx) % log_in.num, w = rd(shm, log_in.widx) % log_in.num;
++	uint32_t v[8], n = 0;
++
++	while (r != w) {
++		v[n++] = rd(shm, log_in.buf + r * 4);
++		r = (r + 1) % log_in.num;
++		if (n == 8 || r == w) {
++			if (mxlog_left > 0) {
++				mxlog_left--;
++				printf("SWEET A8 MXLOG: %08x %08x %08x %08x %08x %08x %08x %08x /%u\n", v[0], n > 1 ? v[1] : 0,
++				    n > 2 ? v[2] : 0, n > 3 ? v[3] : 0, n > 4 ? v[4] : 0, n > 5 ? v[5] : 0, n > 6 ? v[6] : 0,
++				    n > 7 ? v[7] : 0, n);
++			}
++			n = 0;
++		}
++	}
++	wr(shm, log_in.ridx, r);
++}
++
+ static void
+ join_failed(const char *what, uint16_t res)
+ {
+@@ -2922,6 +2959,7 @@ wifi_run(uint32_t panic_off)
+ 	for (;;) {
+ 		wl_drain(Q_TH_CTRL);
+ 		wl_drain(Q_TH_DAT);
++		mxlog_drain();
+ 		q_set(Q_FH_RFB, 1, q_idx(Q_FH_RFB, 0));     /* host buffers given back: our pool is round-robin */
+ 		now = mach_absolute_time();
+ 		if (scanning && now - scan_t0 > lim15) {
