@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 9fa6d28..49cf946 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -2248,6 +2248,8 @@ bt_cmd(const char *cmd)
+ #define A11_LINK_CHANGED_EVENT_DATA 156
+ #define A11_CHANNELS_INFO 207
+ #define A11_HW_SUPPORTED_CHANNELS 254
++#define A11_SET_PROPERTY 383
++#define A11_6G_MODE 422
+ 
+ struct a11_stat {
+ 	uint16_t type;
+@@ -2428,6 +2430,7 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 					memcpy(join_ssid, (const uint8_t *)in + 16, l);
+ 					join_ssid[l] = 0;
+ 					join_req = 1;
++					a11_leave_req = 0;      /* xnu 0177: wifid sends DISASSOCIATE right before; don't undo this join */
+ 					break;
+ 				}
+ 			}
+@@ -2435,6 +2438,12 @@ sweet_a80211_request(int set, uint32_t type, uint32_t val, const void *in, uint3
+ 			break;
+ 		case A11_DISASSOCIATE:          /* xnu 0173: leave the network (done in the Wi-Fi thread) */
+ 			a11_leave_req = 1;
++			join_req = 0;
++			break;
++		case A11_COUNTRY_CODE:          /* xnu 0177: wifid sets US every second until this succeeds */
++		case A11_LOCALE:
++		case A11_6G_MODE:               /* no 6 GHz radio: accepting "off" lets _performAssociation go on (it failed 0x66) */
++		case A11_SET_PROPERTY:          /* IO80211InterfaceExternelPowerState / HeartBeat hints */
+ 			break;
+ 		default:
+ 			err = EOPNOTSUPP;
