@@ -26,9 +26,9 @@ trap cleanup EXIT
 attach_ro() {	# image mountpoint
 	mkdir -p "$2"
 	local dev
-	if ! dev=$(hdiutil attach -readonly -nobrowse -noverify -noautoopen -mountpoint "$2" "$1" 2>/dev/null | awk 'NR==1{print $1}'); then
+	if ! dev=$(hdiutil attach -readonly -owners on -nobrowse -noverify -noautoopen -mountpoint "$2" "$1" 2>/dev/null | awk 'NR==1{print $1}'); then
 		# the cryptexes are raw APFS images
-		dev=$(hdiutil attach -readonly -nobrowse -noverify -noautoopen -imagekey diskimage-class=CRawDiskImage \
+		dev=$(hdiutil attach -readonly -owners on -nobrowse -noverify -noautoopen -imagekey diskimage-class=CRawDiskImage \
 			-mountpoint "$2" "$1" | awk 'NR==1{print $1}')
 	fi
 	attached+=("$dev")
@@ -44,7 +44,8 @@ dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$out" | a
 attached=("$dev" "${attached[@]}")
 newfs_hfs -s -J -v iOSRoot "$dev" >/dev/null
 mkdir -p "$work/root"
-sudo mount -t hfs -o owners "$dev" "$work/root"
+sudo mount -t hfs "$dev" "$work/root"
+sudo diskutil enableOwnership "$work/root" >/dev/null   # system files keep root/mobile/_logd owners
 R=$work/root
 
 copy() {

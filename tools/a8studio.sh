@@ -170,8 +170,10 @@ pick_kernel() {
 	local ks=() names=() d
 	d=$(ls -d "$HOME"/iOS/art1[0-9][0-9]/xnu-kernel-jackpotlte 2>/dev/null | sort -V | tail -1)
 	[ -n "$d" ] && { ks+=("$d"); names+=("iOS 16 era - current A8 kernel ($(basename "$(dirname "$d")")): Wi-Fi work, fast storage, logging"); }
-	[ -d "$T/ipad17/art97" ] && { ks+=("$T/ipad17/art97"); names+=("iPadOS 17 era (xnu17 branch, A8 patches up to 0138, no Wi-Fi)"); }
-	[ -d "$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte" ] && { ks+=("$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era (xnu18 branch, A8 patches up to 0138, no Wi-Fi)"); }
+	[ -f "$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu17s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 17 era + fast storage (xnu17, patches to 0138 + storage backport) - recommended for 17"); }
+	[ -d "$T/ipad17/art97" ] && { ks+=("$T/ipad17/art97"); names+=("iPadOS 17 era, older (xnu17 #97, patches up to 0138, no Wi-Fi)"); }
+	[ -f "$HOME/iOS/art-xnu18s/xnu-kernel-jackpotlte/kernel.development.sweet" ] && { ks+=("$HOME/iOS/art-xnu18s/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era + fast storage (xnu18, patches to 0138 + storage backport) - recommended for 18"); }
+	[ -d "$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte" ] && { ks+=("$HOME/iOS/art-xnu18/xnu-kernel-jackpotlte"); names+=("iOS/iPadOS 18 era, older (xnu18, patches up to 0138, no Wi-Fi)"); }
 	[ -f "$HOME/iOS/xnu-local/out-DEVELOPMENT/kernel.development.sweet" ] && { ks+=("$HOME/iOS/xnu-local/out-DEVELOPMENT"); names+=("Local Mac build (~/iOS/xnu-local)"); }
 	local i=1; for n in "${names[@]}"; do printf '  %d) %s\n' $i "$n"; i=$((i + 1)); done
 	local c; c=$(ask "Kernel? (number)")
