@@ -1,8 +1,8 @@
 diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
-index f51b4b0..645b81d 100644
+index 504b3fa..db4fd38 100644
 --- a/osfmk/prng/prng_random.c
 +++ b/osfmk/prng/prng_random.c
-@@ -280,6 +280,140 @@ early_random_init(void)
+@@ -226,6 +226,141 @@ early_random_init(void)
  	cc_clear(sizeof(earlyseed), earlyseed);
  }
  
@@ -140,29 +140,7 @@ index f51b4b0..645b81d 100644
 +STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sweet_prng_startup);
 +#endif /* SWEET */
 +
- static void read_erandom(void * buf, size_t nbytes);
++
+ __static_testable void read_erandom(void * buf, size_t nbytes);
  
  /*
-@@ -463,12 +597,22 @@ int
- write_random(void * buffer, u_int numbytes)
- {
- 	uint8_t seed[SHA256_DIGEST_LENGTH];
-+#if defined(SWEET)
-+	/* Hash without depending on the absent corecrypto kext's dispatch table. */
-+	const struct ccdigest_info *di = &ccsha256_ltc_di;
-+	ccdigest_di_decl(di, ctx);
-+	ccdigest_init(di, ctx);
-+	ccdigest_update(di, ctx, numbytes, buffer);
-+	ccdigest_final(di, ctx, seed);
-+	ccdigest_di_clear(di, ctx);
-+#else
- 	SHA256_CTX ctx;
- 
- 	/* hash the input to minimize the time we need to hold the lock */
- 	SHA256_Init(&ctx);
- 	SHA256_Update(&ctx, buffer, numbytes);
- 	SHA256_Final(seed, &ctx);
-+#endif
- 
- 	prng_funcs.reseed(prng_ctx, sizeof(seed), seed);
- 	cc_clear(sizeof(seed), seed);

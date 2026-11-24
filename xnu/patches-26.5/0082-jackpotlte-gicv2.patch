@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..a4e76a4 100644
+index 7c2e74c..9248dec 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -20,6 +20,9 @@
@@ -32,12 +32,12 @@ index 2545cf9..a4e76a4 100644
  
  kern_return_t
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 25b18b3..ce88665 100644
+index b068f7e..aca7c1e 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
-@@ -81,7 +81,15 @@ MACHINE_FLAGS_ARM64_T6041 = -DARM64_BOARD_CONFIG_T6041			-mcpu=apple-m4
- MACHINE_FLAGS_ARM64_T8122 = -DARM64_BOARD_CONFIG_T8122_T8130		-mcpu=apple-m3
- MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
+@@ -93,7 +93,15 @@ MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
+ MACHINE_FLAGS_ARM64_T8142 = -DARM64_BOARD_CONFIG_T8142 			-mcpu=apple-m4+memtag+predres2
+ 
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a+sme2
 +# SWEET_BOARD=jackpotlte (environment): Galaxy A8 2018 variant of the same
 +# platform code. Cortex-A73/A53 are ARMv8.0: no LSE atomics, PAN or RDM.
@@ -52,10 +52,10 @@ index 25b18b3..ce88665 100644
  
  #
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 1ef1d80..b2dc51a 100644
+index c25aae7..644abb6 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -2524,8 +2524,16 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3014,8 +3014,16 @@ sleh_irq(arm_saved_state_t *state)
  	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
  	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
  	 */
@@ -72,7 +72,7 @@ index 1ef1d80..b2dc51a 100644
  
  	if (intid >= 1020 && intid <= 1023) {
  		return; /* spurious */
-@@ -2536,11 +2544,11 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3026,11 +3034,11 @@ sleh_irq(arm_saved_state_t *state)
  		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
  		rtclock_intr(TRUE);
  		INTERRUPT_MASKED_DEBUG_END();
@@ -86,7 +86,7 @@ index 1ef1d80..b2dc51a 100644
  		__builtin_arm_isb(ISB_SY);
  		cpu_signal_handler();
  	} else {
-@@ -2551,9 +2559,10 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3041,9 +3049,10 @@ sleh_irq(arm_saved_state_t *state)
  			    cdp->interrupt_nub,
  			    intid);
  		}
@@ -99,7 +99,7 @@ index 1ef1d80..b2dc51a 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 5c005ef..f310170 100644
+index 2a8e5a0..49ed0b6 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -316,11 +316,13 @@ LEXT(sweet_secondary_entry)

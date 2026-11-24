@@ -1,9 +1,9 @@
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index ce88665..c1b6327 100644
+index aca7c1e..92edce2 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
-@@ -385,6 +385,15 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
- ARM64_LINK_ADDR    =0xfffffe0007004000
+@@ -387,6 +387,15 @@ endif
+ 
  endif
  
 +# SWEET_BOARD=jackpotlte: 4K pages and __ARM64_PMAP_SUBPAGE_L1__ give a 38-bit
@@ -16,5 +16,5 @@ index ce88665..c1b6327 100644
 +endif
 +
  
- CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
- 				$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel \
+ BUILD_STATIC_LINK := 1
+ 

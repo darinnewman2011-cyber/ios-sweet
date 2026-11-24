@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index bbe6515..0da3b8b 100644
+index bbe6515..30209a2 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -1,7 +1,7 @@
@@ -243,10 +243,10 @@ index bbe6515..0da3b8b 100644
  
  void
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 8d2cad3..a96274e 100644
+index 53f9ce5..631716e 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -895,6 +895,19 @@ cpu_start(int cpu)
+@@ -918,6 +918,19 @@ cpu_start(int cpu)
  		cpu_data_ptr->cpu_pmap_cpu_data.cpu_nested_pmap = NULL;
  #endif
  #endif /* !CONFIG_SPTM */
@@ -266,7 +266,7 @@ index 8d2cad3..a96274e 100644
  
  		if (processor->startup_thread != THREAD_NULL) {
  			first_thread = processor->startup_thread;
-@@ -948,6 +961,21 @@ cpu_start(int cpu)
+@@ -971,6 +984,21 @@ cpu_start(int cpu)
  }
  
  
@@ -289,10 +289,10 @@ index 8d2cad3..a96274e 100644
  cpu_timebase_init(boolean_t from_boot)
  {
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index 1d9341a..8be7751 100644
+index 4406fde..61d1764 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -1131,6 +1131,16 @@ ml_parse_cpu_topology(void)
+@@ -1154,6 +1154,16 @@ ml_parse_cpu_topology(void)
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
  
@@ -309,7 +309,7 @@ index 1d9341a..8be7751 100644
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
  	if (cpus_boot_arg_present && cpumask_boot_arg_present) {
-@@ -1258,10 +1268,15 @@ ml_parse_cpu_topology(void)
+@@ -1289,10 +1299,15 @@ ml_parse_cpu_topology(void)
  		}
  #endif
  
@@ -325,10 +325,10 @@ index 1d9341a..8be7751 100644
 +#endif
 +		cluster->die_cluster_id = cpu->die_cluster_id;
  
- 		cluster->num_cpus++;
- 		cluster->cpu_mask |= 1ULL << cpu->cpu_id;
+ 		cpu->cpu_pset_id = PSET_ID_INVALID; /* initialized by ml_bootstrap_processors() */
+ 
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 8b14a5a..5c005ef 100644
+index 92f5d4b..2a8e5a0 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -143,8 +143,8 @@ LEXT(reset_vector)
@@ -345,7 +345,7 @@ index 8b14a5a..5c005ef 100644
 @@ -289,6 +289,56 @@ LEXT(LowExceptionVectorBase)
  LEXT(bootstrap_instructions)
  
- #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR) */
 +#if defined(SWEET)
 +/* PSCI CPU_ON entry (physical): x0=context_id, no stack, MMU/caches off.
 + * Keep this separate from __start (which requires x0=boot_args PA).
@@ -399,7 +399,7 @@ index 8b14a5a..5c005ef 100644
  	.align 2
  	.globl EXT(resume_idle_cpu)
  LEXT(resume_idle_cpu)
-@@ -748,6 +798,12 @@ common_start:
+@@ -750,6 +800,12 @@ common_start:
  	ic		iallu
  #endif
  

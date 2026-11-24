@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index eaa4d7d..be7471f 100644
+index f139b12..d97be0a 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -698,6 +698,12 @@ bsd_init(void)
+@@ -701,6 +701,12 @@ bsd_init(void)
  	bsd_init_kprintf("calling vfsinit\n");
  	vfsinit();
  
@@ -476,14 +476,12 @@ index 0000000..6186541
 +}
 +#endif /* SWEET */
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index b8be8f8..f391c66 100644
+index c72f22d..0e3245e 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+@@ -10,4 +10,5 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
  iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
  
  iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
 +iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
  
- # tightbeamc generated implementation files
- ./Exclaves/IOService.tightbeam.c		optional iokitcpp config_exclaves

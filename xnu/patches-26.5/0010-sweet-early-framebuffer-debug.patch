@@ -1,8 +1,8 @@
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 02ab93c..7019f22 100644
+index 6690846..ee8ec77 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -59,6 +59,7 @@
+@@ -58,6 +58,7 @@
  #include <pexpert/arm/consistent_debug.h>
  #include <pexpert/device_tree.h>
  #include <arm64/proc_reg.h>
@@ -10,16 +10,16 @@ index 02ab93c..7019f22 100644
  #include <arm/pmap.h>
  #include <arm/caches_internal.h>
  #include <arm/cpu_internal.h>
-@@ -357,6 +358,8 @@ arm_init(
+@@ -356,6 +357,8 @@ arm_init(
  	DTEntry chosen = NULL;
  	unsigned int dt_entry_size = 0;
  
 +	sweet_early_mark(1, "arm_init entered (MMU on)");
 +
- 	arm_setup_pre_sign();
- 
  	arm_slide_rebase_and_sign_image();
-@@ -377,6 +380,7 @@ arm_init(
+ 
+ 	arm_static_if_init(args);
+@@ -376,6 +379,7 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -27,15 +27,15 @@ index 02ab93c..7019f22 100644
  
  #if __arm64__
  	configure_timer_apple_regs();
-@@ -444,6 +448,7 @@ arm_init(
+@@ -459,6 +463,7 @@ arm_init(
  #endif
  
  	ml_parse_cpu_topology();
 +	sweet_early_mark(3, "ml_parse_cpu_topology done");
  
  
- 	master_cpu = ml_get_boot_cpu_number();
-@@ -475,11 +480,13 @@ arm_init(
+ 	boot_cpu_id = ml_get_boot_cpu_number();
+@@ -490,11 +495,13 @@ arm_init(
  	 */
  	thread->machine.preemption_count = 0;
  	cpu_bootstrap();
@@ -49,7 +49,7 @@ index 02ab93c..7019f22 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -488,6 +495,7 @@ arm_init(
+@@ -503,6 +510,7 @@ arm_init(
  
  	cpu_init();
  
@@ -57,7 +57,7 @@ index 02ab93c..7019f22 100644
  	processor_bootstrap();
  
  	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
-@@ -551,6 +559,7 @@ arm_init(
+@@ -569,6 +577,7 @@ arm_init(
  	gDramSize = *dram_size;
  	pmap_first_pnum = (ppnum_t)atop(gDramBase);
  
@@ -66,7 +66,7 @@ index 02ab93c..7019f22 100644
  
  	if (debug_boot_arg) {
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index e050e53..0c2befd 100644
+index 756af52..8470a5f 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
 @@ -41,6 +41,7 @@
@@ -77,7 +77,7 @@ index e050e53..0c2befd 100644
  #include <arm/cpu_data_internal.h>
  #include <arm/misc_protos.h>
  #include <pexpert/arm64/boot.h>
-@@ -2179,6 +2180,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2166,6 +2167,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  	ml_enable_monitor();
  
@@ -87,7 +87,7 @@ index e050e53..0c2befd 100644
  
  	flush_mmu_tlb();
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 3a6062f..8b14a5a 100644
+index 3a7d3ea..92f5d4b 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -474,6 +474,25 @@ LEXT(start_first_cpu)
@@ -305,10 +305,10 @@ index 0000000..fbbc827
 +
 +#endif
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index 4806f20..ea33c33 100644
+index 878b515..defad01 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
-@@ -50,6 +50,7 @@ osfmk/arm64/dbgwrap.c		standard
+@@ -52,6 +52,7 @@ osfmk/arm64/dbgwrap.c		standard
  osfmk/arm/arm_timer.c		standard
  osfmk/arm/arm_init.c	optional config_pmap_ppl
  osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
@@ -317,7 +317,7 @@ index 4806f20..ea33c33 100644
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 331291b..bee3b71 100644
+index 48f9405..e816c9f 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
 @@ -86,6 +86,9 @@
@@ -328,9 +328,9 @@ index 331291b..bee3b71 100644
 +#include <arm64/sweet_early.h>
 +#endif
  #include <IOKit/IOBSD.h>
+ #include <libkern/crc.h>
  
- #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
-@@ -1219,6 +1222,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -1253,6 +1256,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  {
  #pragma clang diagnostic pop
  

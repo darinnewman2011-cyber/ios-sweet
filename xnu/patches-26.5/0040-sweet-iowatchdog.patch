@@ -115,14 +115,12 @@ index f7df238..bb99d13 100644
      "   {"
      "     'IOClass'         = IOPanicPlatform;"
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index 59026c0..2ec25e4 100644
+index 21cfa4f..8fdfa9d 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -12,6 +12,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+@@ -12,4 +12,5 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
  iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
  iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
  iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
 +iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
  
- # tightbeamc generated implementation files
- ./Exclaves/IOService.tightbeam.c		optional iokitcpp config_exclaves

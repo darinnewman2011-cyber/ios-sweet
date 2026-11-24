@@ -193,14 +193,12 @@ index 4709a64..4da6023 100644
      "   {"
      "     'IOClass'         = IOPanicPlatform;"
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index bde47a3..b8be8f8 100644
+index 70a975f..c72f22d 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -9,5 +9,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+@@ -9,3 +9,5 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
  # SWEET device-tree platform (empty translation unit on other boards)
  iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
  
 +iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
 +
- # tightbeamc generated implementation files
- ./Exclaves/IOService.tightbeam.c		optional iokitcpp config_exclaves
