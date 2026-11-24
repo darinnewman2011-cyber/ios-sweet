@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796 iOS 16, 14.6 = xnu-10063 iOS 17, 15.6 = xnu-11417 iOS 18)
+        description: macOS release whose xnu to build (13.5 = xnu-8796 iOS 16, 14.6 = xnu-10063 iOS 17, 15.6 = xnu-11417 iOS 18, 12.5 = xnu-8020 iOS 15)
         default: "13.5"
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
@@ -18,6 +18,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      vanilla:
+        description: "true = Apple's xnu with only the build tool's own patches (no SWEET/A8 series): a base for a new iOS version"
+        default: "false"
   push:
     branches: [main]
     paths:
@@ -60,6 +63,9 @@ jobs:
             *) echo "unsupported macos_version $MACOS_VERSION"; exit 1 ;;
           esac
           echo "PATCH_DIR=$pdir" >> "$GITHUB_ENV"
+          if [ "${{ inputs.vanilla }}" = true ]; then
+            echo "vanilla build: none of our patches"; ls "$pdir" > patchlist.txt; cat patchlist.txt
+          else
           cp xnu/patches/*.patch xnu/patches/*.sh "$pdir"/
           # xnu/patches-<macOS>/ ports the series to a newer xnu: NAME.patch
           # replaces the base patch of that name, NAME.patch.drop removes it
@@ -76,6 +82,7 @@ jobs:
             echo "no xnu/patches-$MACOS_VERSION: the series targets xnu-8796 (13.5)"; exit 1
           fi
           ls "$pdir" > patchlist.txt
+          fi
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
