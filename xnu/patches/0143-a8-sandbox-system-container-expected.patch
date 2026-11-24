@@ -1,0 +1,47 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index af088e7..bce6e26 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -304,7 +305,34 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		 * xnu 0141: container expected. iOS 17+ sandbox_get_container_expected() fails (and with it launchd's
+ 		 * _container_init: "initproc failed to start") on any error; on success it reads two pre-zeroed u64 out
+ 		 * slots as "container expected" flags. Success with both left zero = no container, as before.
++		 *
++		 * xnu 0143: processes entitled com.apple.security.system-container (backboardd, ...) do expect one: iOS 17
++		 * backboardd crashes on a nil -[BSPathProviderFactory pathProviderForSystemContainerForCurrentProcess]
++		 * cachesPath. arg -> { u64 *flag1, u64 *flag2 }; boot-arg sweetsysctr picks which flag(s) to set for them
++		 * (bit 0 = first, bit 1 = second; default 1, 0 = never).
+ 		 */
++		{
++			static uint32_t sysctr_mode = 0xFFFFFFFFu;
++			if (sysctr_mode == 0xFFFFFFFFu) {
++				uint32_t m = 1;
++				PE_parse_boot_argn("sweetsysctr", &m, sizeof(m));
++				sysctr_mode = m & 3;
++			}
++			void *ent = sweet_proc_entitlements(p);
++			if (sysctr_mode && ent != NULL && arg != USER_ADDR_NULL &&
++			    sweet_entitlements_bool(ent, "com.apple.security.system-container")) {
++				uint64_t ptrs[2] = { 0, 0 }, one = 1;
++				if (copyin(arg, ptrs, sizeof(ptrs)) == 0) {
++					if ((sysctr_mode & 1) && ptrs[0]) {
++						(void)copyout(&one, (user_addr_t)ptrs[0], sizeof(one));
++					}
++					if ((sysctr_mode & 2) && ptrs[1]) {
++						(void)copyout(&one, (user_addr_t)ptrs[1], sizeof(one));
++					}
++					printf("SWEET Sandbox: %s: system container expected (flags %u)\n", proc_best_name(p), sysctr_mode);
++				}
++			}
++		}
+ 		return 0;
+ 	default:
+ 		return 0;
