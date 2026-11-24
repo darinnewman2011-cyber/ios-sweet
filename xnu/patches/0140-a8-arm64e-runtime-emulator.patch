@@ -14,7 +14,7 @@ index f82e873..16dbe3e 100644
 + *   LSE atomics   CAS{A,L,AL}{B,H}, CASP{A,L,AL}, LD{ADD,CLR,EOR,SET,SMAX,SMIN,UMAX,UMIN}{A,L,AL}{B,H}, SWP, ST* aliases
 + *   RCpc          LDAPR{B,H}, LDAPUR*, STLUR*
 + *   FJCVTZS       JavaScript double -> int32 (integer-only arithmetic: no FP in the kernel)
-+ *   PAC fallback  RETAA/RETAB, BRAA..BLRABZ, LDRAA/LDRAB, PAC*/AUT*/XPAC* (no-ops), PACGA (eor): pointers stay
++ *   PAC fallback  RETAA/RETAB, BRAA..BLRABZ, LDRAA/LDRAB, PAC, AUT, XPAC (no-ops), PACGA (eor): pointers stay
 + *                 unsigned, consistently, so code the translator didn't see still runs (just slower)
 + * The atomics run as LDAXR/STLXR loops directly on the user address: ARMv8.0 has no PAN, and the user map is
 + * live in TTBR0 while handling the thread's own exception. The page is touched first with copyin/copyout so it
@@ -137,7 +137,7 @@ index f82e873..16dbe3e 100644
 +		uint64_t t = se_reg(state, rn);
 +		s->lr = pc + 4; s->pc = t; se_count(3); return true;
 +	}
-+	if ((w & 0xFFFFC000) == 0xDAC10000 || (w & 0xFFFFFBE0) == 0xDAC143E0) {  /* PAC*/AUT*/XPAC*: no-op */
++	if ((w & 0xFFFFC000) == 0xDAC10000 || (w & 0xFFFFFBE0) == 0xDAC143E0) {  /* PAC, AUT, XPAC: no-op */
 +		s->pc = pc + 4; se_count(3); return true;
 +	}
 +	if ((w & 0xFFE0FC00) == 0x9AC03000) {                           /* PACGA -> EOR */
