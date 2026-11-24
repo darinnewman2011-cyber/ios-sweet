@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index af088e7..bce6e26 100644
+index 1a1b247..772c0bd 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
 @@ -35,6 +35,7 @@
@@ -11,7 +11,7 @@ index af088e7..bce6e26 100644
  /* iokit/Kernel/arm/SweetEntitlements.cpp */
  void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
 @@ -304,7 +305,34 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
- 		 * xnu 0141: container expected. iOS 17+ sandbox_get_container_expected() fails (and with it launchd's
+ 		 * xnu 0141: container expected. iOS 17's sandbox_get_container_expected() fails (and with it launchd's
  		 * _container_init: "initproc failed to start") on any error; on success it reads two pre-zeroed u64 out
  		 * slots as "container expected" flags. Success with both left zero = no container, as before.
 +		 *
