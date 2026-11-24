@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index c85458b..45ddd2a 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -687,6 +687,24 @@ short_sig(uint16_t id)
+  * (unifiDefaultCountry, PSID 0x1F4D) right after Wi-Fi starts; the firmware otherwise stays on its world
+  * domain. The confirm (0x2102) carries the rejected entries, if any (printed as a plain signal).
+  */
++/*
++ * xnu 0184: unifiSupportedDataRates (PSID 0x07F9) has no default in this firmware's MIB (mib_out.xml) and the
++ * hcf does not set it; the pre-join probe advertised only OFDM rates and every 2.4 GHz join died in mlme_conmgr
++ * Synchronising -> Detached (APs there require the CCK basic rates). Octet string N, rates in 500 kb/s units.
++ */
++static void
++wl_set_rates(void)
++{
++	static const uint8_t m[20] = { 0xf9, 0x07, 15, 0, 0xa1, 13, 12, 0x02, 0x04, 0x0b, 0x0c, 0x12, 0x16, 0x18,
++		                       0x24, 0x30, 0x48, 0x60, 0x6c, 0 };
++	uint8_t s[64];
++	int e;
++
++	sig_hdr(s, 0x2002, 0);
++	e = sig_send(s, 24, m, sizeof(m));
++	printf("SWEET A8 WIFI: supported rates (1-54 Mb/s) set: error %d\n", e);
++}
++
+ static void
+ wl_set_country(const char *cc)
+ {
+@@ -2941,7 +2959,11 @@ wifi_run(uint32_t panic_off)
+ 	{
+ 		/* xnu 0181: boot-arg a8country=XX (default US, a8country=0 skips); a8bton=1 starts the BT service too */
+ 		char cc[4] = "US";
+-		uint32_t bton = 0;
++		uint32_t bton = 0, rates = 1;
++		PE_parse_boot_argn("a8rates", &rates, sizeof(rates));  /* xnu 0184: a8rates=0 skips */
++		if (rates) {
++			wl_set_rates();
++		}
+ 		PE_parse_boot_argn("a8country", cc, sizeof(cc));
+ 		if (cc[0] != '0' && cc[0] && cc[1]) {
+ 			wl_set_country(cc);
