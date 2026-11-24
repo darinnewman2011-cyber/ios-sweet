@@ -64,7 +64,9 @@ jobs:
           esac
           echo "PATCH_DIR=$pdir" >> "$GITHUB_ENV"
           if [ "${{ inputs.vanilla }}" = true ]; then
-            echo "vanilla build: none of our patches"; ls "$pdir" > patchlist.txt; cat patchlist.txt
+            # vanilla: no A8/SWEET changes, only our new-compiler compatibility patches (Xcode 16+ vs older xnu)
+            cp xnu/patches/*new-clang*.patch "$pdir"/
+            echo "vanilla build: compiler-compat patches only"; ls "$pdir" > patchlist.txt; cat patchlist.txt
           else
           cp xnu/patches/*.patch xnu/patches/*.sh "$pdir"/
           # xnu/patches-<macOS>/ ports the series to a newer xnu: NAME.patch
