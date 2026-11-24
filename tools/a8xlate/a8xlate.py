@@ -244,6 +244,43 @@ def dsc_code_ranges(main):
     return ranges
 
 
+def relabel_arm64(path):
+    """arm64e -> arm64 in Mach-O and fat headers (the A8 kernel is a plain arm64 build and won't exec arm64e).
+    Returns the number of headers changed. CPU_SUBTYPE_ARM64E is 2, with the PTRAUTH ABI flag in the top bits."""
+    n = 0
+    with open(path, "r+b") as f:
+        head = f.read(8)
+        if len(head) < 8:
+            return 0
+        if struct.unpack(">I", head[:4])[0] == FAT_MAGIC:
+            cnt = struct.unpack(">I", head[4:8])[0]
+            for k in range(cnt):
+                f.seek(8 + 20 * k)
+                ctype, csub, foff = struct.unpack(">iII", f.read(12))
+                if ctype == CPU_TYPE_ARM64 and (csub & 0xFF) == 2:
+                    f.seek(8 + 20 * k + 4)
+                    f.write(struct.pack(">I", 0))
+                    n += 1
+                if ctype == CPU_TYPE_ARM64:
+                    n += _relabel_thin(f, foff)
+        else:
+            n += _relabel_thin(f, 0)
+    return n
+
+
+def _relabel_thin(f, base):
+    f.seek(base)
+    h = f.read(12)
+    if len(h) < 12 or struct.unpack("<I", h[:4])[0] != MH_MAGIC_64:
+        return 0
+    ctype, csub = struct.unpack("<iI", h[4:12])
+    if ctype == CPU_TYPE_ARM64 and (csub & 0xFF) == 2:
+        f.seek(base + 8)
+        f.write(struct.pack("<I", 0))
+        return 1
+    return 0
+
+
 def collect_ranges(paths):
     out = []
     for p in paths:
@@ -391,6 +428,12 @@ def main():
     t.add_argument("out")
     t.add_argument("--jobs", type=int, default=6)
     t.add_argument("--cache", default=os.path.expanduser("~/.a8xlate-cache"))
+    t.add_argument("--keep-arm64e", action="store_true", help="don't relabel headers as plain arm64")
+    ip = sub.add_parser("inplace", help="translate a directory (e.g. a mounted root image) in place")
+    ip.add_argument("dir")
+    ip.add_argument("--jobs", type=int, default=6)
+    ip.add_argument("--cache", default=os.path.expanduser("~/.a8xlate-cache"))
+    ip.add_argument("--keep-arm64e", action="store_true")
     sub.add_parser("selftest")
     a = ap.parse_args()
     if a.cmd == "selftest":
@@ -399,6 +442,15 @@ def main():
         ranges = collect_ranges(a.paths)
         chunks, nbytes, totals, patched, hits = run(ranges, a.jobs, None, False)
         report(nbytes, totals, patched, hits, len(chunks))
+        return
+    if a.cmd == "inplace":
+        ranges = collect_ranges([a.dir])
+        chunks, nbytes, totals, patched, hits = run(ranges, a.jobs, a.cache, True)
+        report(nbytes, totals, patched, hits, len(chunks))
+        if not a.keep_arm64e:
+            files = sorted(set(f for f, o, s, lab in ranges))
+            n = sum(relabel_arm64(f) for f in files)
+            print("relabelled arm64e -> arm64: %d headers in %d files" % (n, len(files)))
         return
     if os.path.exists(a.out):
         sys.exit("output %s exists; refusing to overwrite" % a.out)
@@ -419,6 +471,15 @@ def main():
         ranges = file_code_ranges(a.out)
     chunks, nbytes, totals, patched, hits = run(ranges, a.jobs, a.cache, True)
     report(nbytes, totals, patched, hits, len(chunks))
+    if not a.keep_arm64e:
+        files = sorted(set(f for f, o, s, lab in ranges))
+        relabeled = 0
+        for f in files:
+            try:
+                relabeled += relabel_arm64(f)
+            except OSError:
+                pass
+        print("relabelled arm64e -> arm64: %d headers in %d files" % (relabeled, len(files)))
 
 
 if __name__ == "__main__":
