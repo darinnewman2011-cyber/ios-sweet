@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_a8wlbt.c b/bsd/dev/sweet_a8wlbt.c
+index 45ddd2a..d670a2b 100644
+--- a/bsd/dev/sweet_a8wlbt.c
++++ b/bsd/dev/sweet_a8wlbt.c
+@@ -397,6 +397,7 @@ struct wnet {
+ 	uint8_t secure;
+ 	uint16_t mhz;
+ 	uint16_t bint, cap;                     /* xnu 0175: beacon interval and capability info */
++	uint8_t probe_resp, beacon;             /* xnu 0185: frames heard (probe responses only come if our TX works) */
+ 	uint16_t ie_len;                        /* xnu 0175: the frame's information elements, for IO80211 */
+ 	uint8_t ie[1024];
+ };
+@@ -588,6 +589,8 @@ scan_result(int16_t rssi, uint16_t freq_half_mhz, const uint8_t *f, uint32_t len
+ 	w.secure = (f[34] & 0x10) ? 1 : 0;        /* capability: privacy */
+ 	w.bint = (uint16_t)(f[32] | f[33] << 8);
+ 	w.cap = (uint16_t)(f[34] | f[35] << 8);
++	w.probe_resp = (f[0] & 0xfc) == 0x50;
++	w.beacon = (f[0] & 0xfc) == 0x80;
+ 	w.ie_len = (uint16_t)MIN(len - 36, sizeof(w.ie));
+ 	memcpy(w.ie, f + 36, w.ie_len);
+ 	for (uint32_t p = 36; p + 2 <= len;) {
+@@ -618,6 +621,8 @@ scan_result(int16_t rssi, uint16_t freq_half_mhz, const uint8_t *f, uint32_t len
+ 	}
+ 	for (i = 0; i < n_nets; i++) {
+ 		if (memcmp(nets[i].bssid, w.bssid, 6) == 0) {
++			w.probe_resp |= nets[i].probe_resp;
++			w.beacon |= nets[i].beacon;
+ 			nets[i] = w;
+ 			return;
+ 		}
+@@ -954,8 +959,9 @@ wl_signal(uint32_t sig, uint32_t sig_len, const uint8_t *dat, uint32_t dat_len)
+ 						}
+ 						p += 2u + il;
+ 					}
+-					printf("SWEET A8 WIFI: net '%s' %u MHz %d dBm cap %04x bint %u sec %u ies %u:%s\n", w->ssid,
+-					    w->mhz, w->rssi, w->cap, w->bint, w->secure, w->ie_len, ids);
++					printf("SWEET A8 WIFI: net '%s' %u MHz %d dBm cap %04x bint %u sec %u heard %s%s ies %u:%s\n",
++					    w->ssid, w->mhz, w->rssi, w->cap, w->bint, w->secure, w->probe_resp ? "probe-resp " : "",
++					    w->beacon ? "beacon" : "", w->ie_len, ids);
+ 				}
+ 			}
+ 		}
