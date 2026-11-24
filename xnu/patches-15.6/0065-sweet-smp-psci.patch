@@ -130,7 +130,7 @@ index bbe6515..0da3b8b 100644
 +	for (unsigned int i = 0; i < topology->num_cpus; i++) {
 +		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
 +		kern_return_t kr = processor_start(cpu->machProcessor);
-+		if (kr != KERN_SUCCESS) {
++		if (kr != KERN_SUCCESS && kr != KERN_FAILURE) { /* xnu-11417: kext processor_start() is a no-op returning KERN_FAILURE; ml_processor_register already booted the CPU */
 +			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
 +		}
 +		/* processor_start() is asynchronous for secondaries in this XNU. */
