@@ -21,3 +21,24 @@ diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
  	if (verbose) {
  		printf("CODE SIGNING: cs_invalid_page(0x%llx): p=%d[%s]\n",
  		    vaddr, proc_getpid(p), p->p_comm);
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -1339,11 +1339,17 @@
+ 								printf("CODE SIGNING: %s[%d]: invalid initial page at offset %lld validated:%d tainted:%d csflags:0x%x\n",
+ 								    vp->v_name, proc_getpid(p), (long long)(file_offset + off), valid, tainted, result->csflags);
+ 							}
++#if defined(SWEET)
++							/* A8: a8xlate rewrites translated arm64e binaries (header CPU subtype, code) in
++							 * place; their initial page no longer matches the signature. Keep CS_VALID so the
++							 * process keeps its platform-binary status (launchd checks it for boot tasks). */
++#else
+ 							if (cs_process_global_enforcement() ||
+ 							    (result->csflags & (CS_HARD | CS_KILL | CS_ENFORCEMENT))) {
+ 								ret = LOAD_FAILURE;
+ 							}
+ 							result->csflags &= ~CS_VALID;
++#endif
+ 						}
+ 						off += PAGE_SIZE;
+ 					}
