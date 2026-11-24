@@ -1,0 +1,341 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index f82e873..16dbe3e 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -973,6 +973,317 @@ sleh_synchronous(arm_context_t *context, uint32_t esr, vm_offset_t far, __unused
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+  */
++#if defined(SWEET_JACKPOTLTE)
++/*
++ * xnu 0140 (iOS 17/18 era): the A8's Cortex-A53/A73 are ARMv8.0. arm64e code (iPhone XS / iPhone 11 roots) uses
++ * instructions those cores raise as undefined; tools/a8xlate rewrites most of them ahead of time, and this
++ * emulates the rest when a user thread hits one (stage 2 of the translator plan):
++ *   LSE atomics   CAS{A,L,AL}{B,H}, CASP{A,L,AL}, LD{ADD,CLR,EOR,SET,SMAX,SMIN,UMAX,UMIN}{A,L,AL}{B,H}, SWP, ST* aliases
++ *   RCpc          LDAPR{B,H}, LDAPUR*, STLUR*
++ *   FJCVTZS       JavaScript double -> int32 (integer-only arithmetic: no FP in the kernel)
++ *   PAC fallback  RETAA/RETAB, BRAA..BLRABZ, LDRAA/LDRAB, PAC*/AUT*/XPAC* (no-ops), PACGA (eor): pointers stay
++ *                 unsigned, consistently, so code the translator didn't see still runs (just slower)
++ * The atomics run as LDAXR/STLXR loops directly on the user address: ARMv8.0 has no PAN, and the user map is
++ * live in TTBR0 while handling the thread's own exception. The page is touched first with copyin/copyout so it
++ * is resident and writable (copy-on-write resolved). Counts are printed every 2^20 emulations.
++ */
++static uint64_t sweet_emul_n[4];        /* lse, rcpc, fjcvtzs, pac */
++
++static inline uint64_t
++se_reg(arm_saved_state_t *s, unsigned r)        /* r 31 = XZR */
++{
++	return r == 31 ? 0 : (uint64_t)saved_state64(s)->x[r];
++}
++
++static inline uint64_t
++se_base(arm_saved_state_t *s, unsigned r)       /* r 31 = SP */
++{
++	return r == 31 ? (uint64_t)saved_state64(s)->sp : (uint64_t)saved_state64(s)->x[r];
++}
++
++static inline void
++se_set(arm_saved_state_t *s, unsigned r, uint64_t v)
++{
++	if (r != 31) {
++		saved_state64(s)->x[r] = v;
++	}
++}
++
++static inline uint64_t
++se_ldx(uint64_t a, unsigned sz)
++{
++	uint64_t v;
++	switch (sz) {
++	case 0: __asm__ volatile ("ldaxrb %w0, [%1]" : "=&r"(v) : "r"(a) : "memory"); break;
++	case 1: __asm__ volatile ("ldaxrh %w0, [%1]" : "=&r"(v) : "r"(a) : "memory"); break;
++	case 2: __asm__ volatile ("ldaxr %w0, [%1]" : "=&r"(v) : "r"(a) : "memory"); break;
++	default: __asm__ volatile ("ldaxr %0, [%1]" : "=&r"(v) : "r"(a) : "memory"); break;
++	}
++	return v;
++}
++
++static inline uint32_t
++se_stx(uint64_t a, uint64_t v, unsigned sz)
++{
++	uint32_t st;
++	switch (sz) {
++	case 0: __asm__ volatile ("stlxrb %w0, %w1, [%2]" : "=&r"(st) : "r"(v), "r"(a) : "memory"); break;
++	case 1: __asm__ volatile ("stlxrh %w0, %w1, [%2]" : "=&r"(st) : "r"(v), "r"(a) : "memory"); break;
++	case 2: __asm__ volatile ("stlxr %w0, %w1, [%2]" : "=&r"(st) : "r"(v), "r"(a) : "memory"); break;
++	default: __asm__ volatile ("stlxr %w0, %1, [%2]" : "=&r"(st) : "r"(v), "r"(a) : "memory"); break;
++	}
++	return st;
++}
++
++static inline uint64_t
++se_sext(uint64_t v, unsigned sz)
++{
++	unsigned bits = 8u << sz;
++	return bits == 64 ? v : (uint64_t)(((int64_t)(v << (64 - bits))) >> (64 - bits));
++}
++
++/* fault in + make writable (resolves copy-on-write) the naturally aligned operand; 0 = OK */
++static int
++se_touch(uint64_t a, unsigned bytes, bool write)
++{
++	uint8_t tmp[16];
++	if (bytes > sizeof(tmp) || (a & (bytes - 1))) {
++		return EFAULT;
++	}
++	if (copyin((user_addr_t)a, tmp, bytes)) {
++		return EFAULT;
++	}
++	if (write && copyout(tmp, (user_addr_t)a, bytes)) {
++		return EFAULT;
++	}
++	return 0;
++}
++
++static uint64_t
++se_amo(unsigned op, uint64_t old, uint64_t rs, unsigned sz)
++{
++	uint64_t mask = sz == 3 ? ~0ull : ((1ull << (8u << sz)) - 1);
++	switch (op) {
++	case 0: return (old + rs) & mask;                                       /* ADD */
++	case 1: return old & ~rs & mask;                                        /* CLR */
++	case 2: return (old ^ rs) & mask;                                       /* EOR */
++	case 3: return (old | rs) & mask;                                       /* SET */
++	case 4: return ((int64_t)se_sext(old, sz) > (int64_t)se_sext(rs, sz) ? old : rs) & mask;  /* SMAX */
++	case 5: return ((int64_t)se_sext(old, sz) < (int64_t)se_sext(rs, sz) ? old : rs) & mask;  /* SMIN */
++	case 6: return ((old & mask) > (rs & mask) ? old : rs) & mask;          /* UMAX */
++	default: return ((old & mask) < (rs & mask) ? old : rs) & mask;         /* UMIN */
++	}
++}
++
++static void
++se_count(unsigned k)
++{
++	uint64_t n = __atomic_add_fetch(&sweet_emul_n[k], 1, __ATOMIC_RELAXED);
++	if ((n & 0xFFFFF) == 0) {
++		printf("SWEET EMUL: %llu lse, %llu rcpc, %llu fjcvtzs, %llu pac\n", sweet_emul_n[0], sweet_emul_n[1],
++		    sweet_emul_n[2], sweet_emul_n[3]);
++	}
++}
++
++/* true: handled (state updated, pc advanced or redirected) */
++static bool
++sweet_emulate(arm_saved_state_t *state, uint32_t w)
++{
++	arm_saved_state64_t *s = saved_state64(state);
++	unsigned rt = w & 31, rn = (w >> 5) & 31, rs = (w >> 16) & 31, sz = w >> 30;
++	uint64_t pc = s->pc;
++
++	/* ---- PAC fallback */
++	if (w == 0xD65F0BFF || w == 0xD65F0FFF) {                       /* RETAA/RETAB */
++		s->pc = s->lr; se_count(3); return true;
++	}
++	if ((w & 0xFFFFF800) == 0xD71F0800 || (w & 0xFFFFF81F) == 0xD61F081F) {  /* BRAA/BRAB(Z) */
++		s->pc = se_reg(state, rn); se_count(3); return true;
++	}
++	if ((w & 0xFFFFF800) == 0xD73F0800 || (w & 0xFFFFF81F) == 0xD63F081F) {  /* BLRAA/BLRAB(Z) */
++		uint64_t t = se_reg(state, rn);
++		s->lr = pc + 4; s->pc = t; se_count(3); return true;
++	}
++	if ((w & 0xFFFFC000) == 0xDAC10000 || (w & 0xFFFFFBE0) == 0xDAC143E0) {  /* PAC*/AUT*/XPAC*: no-op */
++		s->pc = pc + 4; se_count(3); return true;
++	}
++	if ((w & 0xFFE0FC00) == 0x9AC03000) {                           /* PACGA -> EOR */
++		se_set(state, rt, se_reg(state, rn) ^ (rs == 31 ? (uint64_t)s->sp : se_reg(state, rs)));
++		s->pc = pc + 4; se_count(3); return true;
++	}
++	if ((w & 0xFF200400) == 0xF8200400) {                           /* LDRAA/LDRAB */
++		int64_t off = (int64_t)(((w >> 22) & 1) << 9 | ((w >> 12) & 0x1FF));
++		if (off & 0x200) {
++			off -= 0x400;
++		}
++		off *= 8;
++		uint64_t a = se_base(state, rn) + (uint64_t)off, v;
++		if (copyin((user_addr_t)a, &v, 8)) {
++			return false;
++		}
++		if ((w >> 11) & 1) {
++			if (rn == 31) { s->sp = a; } else { s->x[rn] = a; }
++		}
++		se_set(state, rt, v); s->pc = pc + 4; se_count(3); return true;
++	}
++
++	/* ---- RCpc: LDAPR{B,H} (inside the LSE space, so first), LDAPUR / STLUR */
++	if ((w & 0x3FFFFC00) == 0x38BFC000) {
++		uint64_t a = se_base(state, rn), v = 0;
++		if (copyin((user_addr_t)a, &v, 1u << sz)) {
++			return false;
++		}
++		__asm__ volatile ("dmb ishld" ::: "memory");
++		se_set(state, rt, v); s->pc = pc + 4; se_count(1); return true;
++	}
++	if ((w & 0x3F200C00) == 0x19000000) {
++		unsigned opc = (w >> 22) & 3;
++		int64_t off = (int64_t)((w >> 12) & 0x1FF);
++		if (off & 0x100) {
++			off -= 0x200;
++		}
++		uint64_t a = se_base(state, rn) + (uint64_t)off, v = 0;
++		if (opc == 0) {                                         /* STLUR */
++			v = se_reg(state, rt);
++			__asm__ volatile ("dmb ish" ::: "memory");
++			if (copyout(&v, (user_addr_t)a, 1u << sz)) {
++				return false;
++			}
++		} else {
++			if (copyin((user_addr_t)a, &v, 1u << sz)) {
++				return false;
++			}
++			__asm__ volatile ("dmb ishld" ::: "memory");
++			if (opc == 2) {
++				v = se_sext(v, sz);                             /* LDAPURS, 64-bit result */
++			} else if (opc == 3) {
++				v = se_sext(v, sz) & 0xFFFFFFFFull;             /* LDAPURS, 32-bit result */
++			}
++			se_set(state, rt, v);
++		}
++		s->pc = pc + 4; se_count(1); return true;
++	}
++
++	/* ---- LSE: CAS */
++	if ((w & 0x3FA07C00) == 0x08A07C00) {
++		uint64_t a = se_base(state, rn), mask = sz == 3 ? ~0ull : ((1ull << (8u << sz)) - 1);
++		uint64_t cmp = se_reg(state, rs) & mask, nv = se_reg(state, rt) & mask, old;
++		if (se_touch(a, 1u << sz, true)) {
++			return false;
++		}
++		for (;;) {
++			old = se_ldx(a, sz);
++			if (old != cmp) {
++				__asm__ volatile ("clrex" ::: "memory");
++				break;
++			}
++			if (se_stx(a, nv, sz) == 0) {
++				break;
++			}
++		}
++		se_set(state, rs, old); s->pc = pc + 4; se_count(0); return true;
++	}
++	/* ---- LSE: CASP (register pairs; 32-bit pairs are one 64-bit exclusive) */
++	if ((w & 0xBFA07C00) == 0x08207C00) {
++		uint64_t a = se_base(state, rn);
++		if ((rs & 1) || (rt & 1)) {
++			return false;
++		}
++		if ((w >> 30) & 1) {                                    /* 64-bit pairs: LDAXP/STLXP */
++			uint64_t c0 = se_reg(state, rs), c1 = se_reg(state, rs + 1), n0 = se_reg(state, rt), n1 = se_reg(state, rt + 1);
++			uint64_t o0, o1; uint32_t st;
++			if (se_touch(a, 16, true)) {
++				return false;
++			}
++			for (;;) {
++				__asm__ volatile ("ldaxp %0, %1, [%2]" : "=&r"(o0), "=&r"(o1) : "r"(a) : "memory");
++				if (o0 != c0 || o1 != c1) {
++					__asm__ volatile ("clrex" ::: "memory");
++					break;
++				}
++				__asm__ volatile ("stlxp %w0, %1, %2, [%3]" : "=&r"(st) : "r"(n0), "r"(n1), "r"(a) : "memory");
++				if (st == 0) {
++					break;
++				}
++			}
++			se_set(state, rs, o0); se_set(state, rs + 1, o1);
++		} else {
++			uint64_t cmp = (se_reg(state, rs) & 0xFFFFFFFFull) | se_reg(state, rs + 1) << 32;
++			uint64_t nv = (se_reg(state, rt) & 0xFFFFFFFFull) | se_reg(state, rt + 1) << 32, old;
++			if (se_touch(a, 8, true)) {
++				return false;
++			}
++			for (;;) {
++				old = se_ldx(a, 3);
++				if (old != cmp) {
++					__asm__ volatile ("clrex" ::: "memory");
++					break;
++				}
++				if (se_stx(a, nv, 3) == 0) {
++					break;
++				}
++			}
++			se_set(state, rs, old & 0xFFFFFFFFull); se_set(state, rs + 1, old >> 32);
++		}
++		s->pc = pc + 4; se_count(0); return true;
++	}
++	/* ---- LSE: LD<op>, SWP (and ST<op> = LD<op> with Rt = XZR) */
++	if ((w & 0x3F200C00) == 0x38200000) {
++		unsigned o3 = (w >> 15) & 1, opc = (w >> 12) & 7;
++		uint64_t a = se_base(state, rn), v = se_reg(state, rs), old, nv;
++		if (o3 && opc != 0) {
++			return false;                                   /* LDAPR is above; nothing else here */
++		}
++		if (se_touch(a, 1u << sz, true)) {
++			return false;
++		}
++		do {
++			old = se_ldx(a, sz);
++			nv = o3 ? (v & (sz == 3 ? ~0ull : ((1ull << (8u << sz)) - 1))) : se_amo(opc, old, v, sz);
++		} while (se_stx(a, nv, sz) != 0);
++		se_set(state, rt, old); s->pc = pc + 4; se_count(0); return true;
++	}
++
++	/* ---- FJCVTZS Wd, Dn (JavaScript ToInt32), integer arithmetic only */
++	if ((w & 0xFFFFFC00) == 0x1E7E0000) {
++		arm_context_t *ctx = (arm_context_t *)(void *)state;   /* ss is the first member of arm_context_t */
++		_Static_assert(__builtin_offsetof(arm_context_t, ss) == 0, "ss must come first");
++		uint64_t bits = (uint64_t)ctx->ns.ns_64.v.q[rn];
++		unsigned exp = (bits >> 52) & 0x7FF;
++		uint64_t mant = bits & ((1ull << 52) - 1);
++		bool neg = bits >> 63, exact = false;
++		uint32_t res = 0;
++		if (exp == 0x7FF) {
++			res = 0; exact = false;                         /* NaN, Inf */
++		} else if (exp == 0) {
++			res = 0; exact = (mant == 0);                   /* zero exact, subnormal not */
++		} else {
++			int e = (int)exp - 1075;
++			uint64_t m = mant | (1ull << 52), mag;
++			bool frac;
++			if (e >= 0) {
++				mag = e >= 64 ? 0 : (m << e); frac = false;     /* >= 2^52: never in int32 range */
++				res = (uint32_t)mag;
++				exact = false;
++			} else {
++				int sh = -e;
++				mag = sh >= 64 ? 0 : (m >> sh);
++				frac = sh >= 64 ? true : (m & ((1ull << sh) - 1)) != 0;
++				res = (uint32_t)mag;
++				exact = !frac && (neg ? mag <= 0x80000000ull : mag <= 0x7FFFFFFFull);
++			}
++			if (neg) {
++				res = (uint32_t)(0u - res);
++			}
++		}
++		se_set(state, rt, res);
++		s->cpsr = (s->cpsr & ~0xF0000000u) | (exact ? 0x40000000u : 0);    /* Z = exact, N = C = V = 0 */
++		s->pc = pc + 4; se_count(2); return true;
++	}
++	return false;
++}
++#endif /* SWEET_JACKPOTLTE */
++
+ static void
+ handle_uncategorized(arm_saved_state_t *state)
+ {
+@@ -983,6 +1294,18 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
++#if defined(SWEET_JACKPOTLTE)
++	/* xnu 0140: emulate arm64e / ARMv8.1+ instructions the A8's ARMv8.0 cores don't have */
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++		boolean_t ie = ml_set_interrupts_enabled(TRUE);
++		bool done = sweet_emulate(state, instr);
++		ml_set_interrupts_enabled(ie);
++		if (done) {
++			return;
++		}
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
