@@ -1,0 +1,23 @@
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -254,6 +254,19 @@
+ 
+ 	p = current_proc();
+ 
++#if defined(SWEET)
++	/*
++	 * Galaxy A8: arm64e system binaries are rewritten in place by the a8xlate translator, so their page
++	 * hashes no longer match the (unchanged) signature. Allow the page and keep CS_VALID, or launchd
++	 * refuses every translated boot task ("boot task is not a platform binary").
++	 */
++	(void)flags; (void)send_kill; (void)retval; (void)verbose;
++	if (cs_killed) {
++		*cs_killed = FALSE;
++	}
++	return 0;
++#endif
++
+ 	if (verbose) {
+ 		printf("CODE SIGNING: cs_invalid_page(0x%llx): p=%d[%s]\n",
+ 		    vaddr, proc_getpid(p), p->p_comm);
