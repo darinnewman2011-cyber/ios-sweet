@@ -23,6 +23,26 @@ index 631716e..71248f2 100644
  		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
  		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
  		__builtin_arm_dsb(DSB_SY);
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 9cd443e..7015086 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -3433,3 +3433,15 @@ ml_unsafe_kernel_text(void)
+ 	return false;
+ }
+ #endif /* DEVELOPMENT || DEBUG || CONFIG_DTRACE || CONFIG_CSR_FROM_DT */
++
++#if defined(SWEET)
++/*
++ * A8: Apple supplies this from the per-SoC support library (libT*.os.*.a), which has no SWEET flavour.
++ * Report a production-fused (retail) device, like a shipping iPhone.
++ */
++boolean_t
++ml_device_is_prod_fused(void)
++{
++	return TRUE;
++}
++#endif /* SWEET */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index 666b7e7..2d0d464 100644
 --- a/osfmk/arm64/sleh.c
@@ -83,3 +103,23 @@ index 0a57277..0fe8a97 100644
  	if (sig == 6 || sig == 5) {
  		sweet_crash_strings(name);
  	}
+diff --git a/osfmk/kern/exclaves.c b/osfmk/kern/exclaves.c
+index 6247d29..7fb879b 100644
+--- a/osfmk/kern/exclaves.c
++++ b/osfmk/kern/exclaves.c
+@@ -3336,6 +3336,7 @@ STARTUP(TUNABLES, STARTUP_RANK_MIDDLE, exclaves_requirement_startup);
+  * Tightbeam needs to initialize for kernel transports (xnu and AFK).
+  * Only the XNU transport is specific to exclaves - AFK is not.
+  */
++#if !defined(SWEET) /* A8: no Tightbeam library is linked (0903) */
+ __startup_func
+ static void
+ tightbeam_startup(void)
+@@ -3343,6 +3344,7 @@ tightbeam_startup(void)
+ 	tb_transport_startup();
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, tightbeam_startup);
++#endif /* !SWEET */
+ 
+ #endif /* __has_include(<Tightbeam/tightbeam.h> */
+ 
