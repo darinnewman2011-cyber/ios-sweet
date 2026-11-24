@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1,9 +1,23 @@
+ 	if (entered++ || !a8_pmu) {
+ 		return;
+ 	}
++	/*
++	 * xnu 0144: the panic text (cause, CPU, backtrace) goes to the panic buffer, not the console
++	 * ring, so the ramoops snapshot used to end before it. Copy its first 6 KiB into the ring first.
++	 */
++	{
++		extern char *debug_buf_base, *debug_buf_ptr;
++		if (debug_buf_base && debug_buf_ptr > debug_buf_base) {
++			int n = (int)MIN((uint64_t)(debug_buf_ptr - debug_buf_base), 6144ull);
++			static const char tag[] = "\n==== SWEET PANIC TEXT ====\n";
++			sweet_log_append(tag, sizeof(tag) - 1);
++			sweet_log_append(debug_buf_base, n);
++			sweet_log_append("\n", 1);
++		}
++	}
+ 	sweet_a8_snapshot();
+ 	PE_parse_boot_argn("sweetpanicsecs", &secs, sizeof(secs));
+ 	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &deadline);
+ 	deadline += mach_absolute_time();
+ 	while (mach_absolute_time() < deadline) {
+ 	}
