@@ -1,0 +1,18 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index a4d326e..080fa20 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6053,7 +6053,13 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_WCOMB:
++#if defined(SWEET)
++		/* A8: write-combined stays Normal non-cacheable everywhere, as before xnu-12377. Its carve-outs above the
++		 * managed DRAM (panic log /pram, framebuffer) are RAM; as Device-GRE, bzero's DC ZVA takes an alignment fault. */
++		if (true) {
++#else
+ 		if (is_dram_addr(pa)) {
++#endif
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ #if HAS_FEAT_XS
