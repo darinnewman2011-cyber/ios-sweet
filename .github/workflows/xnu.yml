@@ -83,6 +83,11 @@ jobs:
           fi
           ls "$pdir" > patchlist.txt
           fi
+          # the KDK mirror (dortania/KdkSupportPkg) starts at macOS 13: build 12.x (iOS 15) against the 13.0 KDK
+          case "$MACOS_VERSION" in 12.*)
+            sed -i '' "s/KDK_NAME='Kernel Debug Kit 12.5 build 21G72'/KDK_NAME='Kernel Debug Kit 13.0 build 22A380'/; s|KDKROOT='/Library/Developer/KDKs/KDK_12.5_21G72.kdk'|KDKROOT='/Library/Developer/KDKs/KDK_13.0_22A380.kdk'|" dxb/build.sh
+            grep -n "KDK_13.0_22A380" dxb/build.sh ;;
+          esac
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
