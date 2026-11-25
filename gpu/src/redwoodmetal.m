@@ -4313,6 +4313,31 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 - (BOOL)metalAssertionsEnabled { return _assertions; }
 - (void)setMetalAssertionsEnabled:(BOOL)enabled { _assertions = enabled; }
 
+/* iOS 26: +[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:] asks every device
+ * for -targetDeviceArchitecture and asserts ("Target device architecture is nil") on _MTLDevice's
+ * default nil, which aborted backboardd in a loop (r26-gpu1). It reads cpuType, subType,
+ * driverVersion and versionCombined to pick GPU-binary slices. Built the way AGXA13FamilyDevice
+ * builds its own (opt_new + setCpuType 0x1000013 = CPU_TYPE_APPLE_GPU), with a subtype no Apple
+ * GPU uses, so no Apple GPU binary ever matches this device. iOS 16's Metal never asks. */
+- (id)targetDeviceArchitecture
+{
+	Class cls = objc_getClass("MTLTargetDeviceArchitecture");
+	id a;
+
+	if (cls == Nil) {
+		return nil;
+	}
+	a = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("new"));
+	if (a == nil) {
+		return nil;
+	}
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, sel_registerName("setCpuType:"), 0x1000013u);
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, sel_registerName("setSubType:"), 0xA8u);
+	((void (*)(id, SEL, uint64_t))objc_msgSend)(a, sel_registerName("setDriverVersion:"), 1u);
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, sel_registerName("setVersion:"), 1u);
+	return [a autorelease];
+}
+
 /* Without this the device inherits _MTLDevice's own answer, which is "Apple GPU" -- true of
  * the code and false of the hardware. The name is Mesa's renderer string for this chip
  * (docs/air.md: `Adreno 7c+ Gen 3, chip 0x06030500`), and the identifier beside it is asked

@@ -148,6 +148,12 @@ def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
+    # the root's own build (was hard-coded to iOS 16's 20H392: on an iOS 26 root DataMigration then saw an
+    # iOS 16 -> 26 upgrade on every boot)
+    global BUILD, VERSION
+    sv = load(os.path.join(root, 'System/Library/CoreServices/SystemVersion.plist'))
+    BUILD, VERSION = sv['ProductBuildVersion'], sv['ProductVersion']
+    print('root build', BUILD, VERSION)
     launchd(root)
     containers(root)
     activation(root)

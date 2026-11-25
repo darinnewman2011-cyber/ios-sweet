@@ -444,6 +444,11 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_fmin") || !strcmp(op, "fmin") || !strcmp(op, "min")) {
       r = is_float ? nir_fmin(&c->b, a[0], a[1])
                    : (is_signed ? nir_imin(&c->b, a[0], a[1]) : nir_umin(&c->b, a[0], a[1]));
+   } else if (!strcmp(op, "fast_fmax3") || !strcmp(op, "fmax3")) {
+      /* iOS 26 QuartzCore fixed_frag_*: air.fmax3.f16 / air.fast_fmax3.f32 */
+      r = nir_fmax(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]);
+   } else if (!strcmp(op, "fast_fmin3") || !strcmp(op, "fmin3")) {
+      r = nir_fmin(&c->b, nir_fmin(&c->b, a[0], a[1]), a[2]);
    } else if (!strcmp(op, "fast_fmax") || !strcmp(op, "fmax") || !strcmp(op, "max")) {
       r = is_float ? nir_fmax(&c->b, a[0], a[1])
                    : (is_signed ? nir_imax(&c->b, a[0], a[1]) : nir_umax(&c->b, a[0], a[1]));
@@ -500,6 +505,10 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
                    nir_fabs(&c->b, nir_ddy(&c->b, a[0])));
    } else if (!strcmp(op, "get_simd_width") || !strcmp(op, "get_thread_execution_width")) {
       r = nir_load_subgroup_size(&c->b);
+   } else if (!strcmp(op, "get_simdgroup_size")) {
+      /* iOS 26 QuartzCore tile_simd_blur_*: air.get_simdgroup_size.i16 */
+      r = nir_u2uN(&c->b, nir_load_subgroup_size(&c->b),
+                   air_type_bit_size(air_type_scalar(in->base.type)));
    } else if (!strcmp(op, "all")) {
       r = nir_ball(&c->b, a[0]);
    } else if (!strcmp(op, "any")) {
@@ -1638,6 +1647,15 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
          return false;
       arg++;
    }
+   /* iOS 26 read form: (tex, read sampler, coord, offset, lod/sample, 0); older: (tex, coord, lod/sample, ...) */
+   bool read_v28 = false;
+   if (!strcmp(t.op, "read") && in->num_operands > arg) {
+      struct air_val *sv = air_get(c, in->operands[arg]);
+      if (sv && sv->kind == AIR_VAL_PTR && sv->ptr.class == AIR_PTR_SAMPLER) {
+         read_v28 = true;
+         arg++;
+      }
+   }
 
    /* A depth texture takes a plane or aspect selector before the coordinate,
     * and every call in the corpus passes 1. What else it can be is not known
@@ -1729,7 +1747,17 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    if (!coord)
       return false;
 
+   nir_def *read_offset = NULL;
+   if (read_v28) {
+      if (in->num_operands <= arg || !(read_offset = air_get_ssa(c, in->operands[arg++])))
+         return air_error(c, "intrinsic: air.%s (iOS 26 form) without its offset", n->part[0]);
+      if (all_zero(read_offset))
+         read_offset = NULL;
+   }
+
    if (!strcmp(t.op, "read") && tex.is_image) {
+      if (read_offset)
+         return air_error(c, "intrinsic: air.%s on an image with a nonzero offset", n->part[0]);
       uint64_t extra;
       if (!tex_flag(c, in, arg, &extra))
          return false;
@@ -1912,6 +1940,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
          .src_type = t.is_ms ? nir_tex_src_ms_index : nir_tex_src_lod,
          .src = nir_src_for_ssa(which),
       };
+      if (read_offset)
+         srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_offset,
+                                       .src = nir_src_for_ssa(nir_u2u32(&c->b, read_offset)) };
    }
 
    nir_tex_instr *tex_instr = nir_tex_instr_create(c->nir, nsrc);
@@ -1987,6 +2018,16 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
+   if (!strcmp(n.part[0], "get_read_sampler")) {
+      /* iOS 26 (air64_v28): texture reads take a sampler argument, and this is where it comes from:
+       *   %7 = call ptr addrspace(2) @air.get_read_sampler()
+       *   call { <4 x half>, i8 } @air.read_texture_2d.v4f16(ptr as(1) %tex, ptr as(2) %7, <2 x i32> %coord,
+       *                                                      <2 x i32> zeroinitializer, i32 %lod, i32 0)
+       * A read is a texel fetch, which uses no sampler state, so this is a placeholder that texture_op skips. */
+      struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = ~0u };
+      air_set(c, &in->base, air_val_ptr(c, p));
+      return true;
+   }
 
    bool handled = false;
    /* before math_op, which resolves every argument as a number: these take a
