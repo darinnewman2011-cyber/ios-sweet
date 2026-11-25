@@ -1,0 +1,89 @@
+From e9d40d7a61903a07c719547ecde220f7d43080dd Mon Sep 17 00:00:00 2001
+From: x <x>
+Date: Wed, 25 Nov 2026 07:15:47 -0600
+Subject: [PATCH] 0188 quiet boot
+
+---
+ osfmk/arm64/sweet_early.c      | 33 ++++++++++++++++++++++++++++++++-
+ osfmk/console/serial_console.c |  7 +++++--
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index e7e92c8..3088d04 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -10,6 +10,8 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <pexpert/arm64/boot.h>
++#include <string.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PA;
+ #define EARLY_FB early_fb
+@@ -48,6 +50,35 @@ sweet_early_present(void)
+ }
+ #endif
+ 
++/*
++ * xnu 0188 (Project Beryllium 10): quiet boot. The shim leaves Samsung's boot logo up and then shows the Apple logo;
++ * the kernel draws no boot text over it unless the command line has -v or sweetverbose=1 (like iOS). Panics always
++ * draw. Before BootArgs is set nothing is drawn (the text still reaches the console log).
++ */
++static int sweet_verbose = -1;
++
++int sweet_early_verbose(void);
++int
++sweet_early_verbose(void)
++{
++	extern boot_args *BootArgs;
++	if (sweet_verbose < 0) {
++		if (BootArgs == NULL) {
++			return 0;
++		}
++		const char *cl = BootArgs->CommandLine;
++		size_t n = strnlen(cl, BOOT_LINE_LENGTH);
++		int v = strnstr(cl, "sweetverbose=1", n) != NULL;
++		for (size_t i = 0; !v && i + 1 < n; i++) {
++			if (cl[i] == '-' && cl[i + 1] == 'v' && (i == 0 || cl[i - 1] == ' ') && (i + 2 == n || cl[i + 2] == ' ')) {
++				v = 1;
++			}
++		}
++		sweet_verbose = v;
++	}
++	return sweet_verbose;
++}
++
+ static void
+ sweet_early_clear_row(void)
+ {
+@@ -62,7 +93,7 @@ sweet_early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled || (!early_panicking && !sweet_early_verbose())) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..4d613be 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -283,8 +283,11 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+-	if (sweet_console_muted && !panic_active()) {
+-		return;
++	{
++		extern int sweet_early_verbose(void);      /* xnu 0188: quiet boot unless -v / sweetverbose=1 */
++		if ((sweet_console_muted || !sweet_early_verbose()) && !panic_active()) {
++			return;
++		}
+ 	}
+ #endif
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -3,6 +3,13 @@
 set -euo pipefail
 [ -z "${PAYLOAD:-}" ] || PAYLOAD="$(cd "$(dirname "$PAYLOAD")" && pwd)/$(basename "$PAYLOAD")"
 cd "$(dirname "$0")"
+mkdir -p out
+# Quiet boot logo (Project Beryllium 10): A8_LOGO_IPSW=<your IPSW> + EXTRA_CFLAGS=-DA8_QUIET. The logo is read from
+# that IPSW at build time into out/logo.h (not in the repo).
+if [ -n "${A8_LOGO_IPSW:-}" ]; then
+	python3 -I ../../tools/a8logo.py "$A8_LOGO_IPSW" out/logo.h >&2
+	EXTRA_CFLAGS="${EXTRA_CFLAGS:-} -DA8_LOGO"
+fi
 CFLAGS="--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib -fno-pic -fno-stack-protector \
  -mgeneral-regs-only -mstrict-align -Wall -Wextra \
  -DFB_BASE=0xEC000000UL -DFB_H=2220 ${EXTRA_CFLAGS:-}"

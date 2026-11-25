@@ -243,6 +243,36 @@ void loader_hook_jump(void)
 	a8_present();
 }
 
+#ifdef A8_QUIET
+/*
+ * Project Beryllium 10 quiet boot (EXTRA_CFLAGS=-DA8_QUIET): no diagnostic screen. S-Boot's "Samsung Galaxy A8"
+ * logo stays up while the shim works, then the boot logo is drawn white on black, centred, right before XNU starts
+ * (XNU 0188 draws no text over it). The logo comes from the user's own IPSW at build time (tools/a8logo.py ->
+ * out/logo.h); without it the screen just turns black.
+ */
+#ifdef A8_LOGO
+#include "out/logo.h"
+#endif
+static void a8_show_logo(void)
+{
+	volatile uint32_t *fb = (volatile uint32_t *)FB_BASE;
+
+	for (unsigned y = 0; y < FB_H; y++)
+		for (unsigned x = 0; x < FB_W; x++)
+			fb[y * (FB_STRIDE / 4) + x] = 0xff000000u;
+#ifdef A8_LOGO
+	unsigned x0 = (FB_W - a8_logo_w) / 2, y0 = (FB_H - a8_logo_h) / 2;
+
+	for (unsigned y = 0; y < a8_logo_h; y++)
+		for (unsigned x = 0; x < a8_logo_w; x++) {
+			uint32_t c = a8_logo[y * a8_logo_w + x];
+			fb[(y0 + y) * (FB_STRIDE / 4) + x0 + x] = 0xff000000u | c << 16 | c << 8 | c;
+		}
+#endif
+	a8_present();
+}
+#endif
+
 static void a8_boot_xnu(void)
 {
 #ifdef A8_BUTTON_PROBE
@@ -256,11 +286,15 @@ static void a8_boot_xnu(void)
 			menu_run(base);	/* may set loader_cmdline_override */
 	}
 #endif
+#ifdef A8_QUIET
+	a8_show_logo();
+#else
 	con_clear(BLUE);
 	con_str("A8 SHIM", "milestone 4: xnu loader");
 	con_hex2("CPU", "el=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
 	con_hex2("PAYLOAD", "at=", (uintptr_t)a8_payload, "size=", (uint32_t)a8_payload_size);
 	a8_present();
+#endif
 	const char *why = loader_boot_payload((uintptr_t)a8_payload, (uintptr_t)a8_payload + a8_payload_size);
 	con_str("LOADER", why);
 	con_str("DONE", "halted. hold power+vol down");
