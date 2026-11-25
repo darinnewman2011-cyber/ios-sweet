@@ -1,0 +1,35 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 3e7d860..cee62d7 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -144,6 +144,15 @@ sweet_early_note(const char *s)
+ 	sweet_early_putc('\n');
+ }
+ 
++#if defined(SWEET_JACKPOTLTE)
++extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++static void
++sweet_early_logc(char c)
++{
++	sweet_log_append(&c, 1);
++}
++#endif
++
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+@@ -159,6 +168,14 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	sweet_early_putc('\n');
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_present();
++#if defined(SWEET_JACKPOTLTE)
++	/* xnu26 0913: also into the console ring, so the ramoops snapshot TWRP reads keeps the panic text */
++	sweet_log_append("SWEET EARLY PANIC: ", 19);
++	va_copy(copy, *args);
++	_doprnt(fmt, &copy, sweet_early_logc, 16);
++	va_end(copy);
++	sweet_log_append("\n", 1);
++#endif
+ }
+ 
+ void

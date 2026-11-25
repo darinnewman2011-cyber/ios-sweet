@@ -1,0 +1,36 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1505,6 +1505,11 @@
+ 	return NULL;
+ }
+ 
++#if defined(SWEET)
++extern int proc_selfpid(void);
++extern void proc_selfname(char *buf, int size);
++#endif
++
+ static void
+ handle_user_breakpoint(arm_saved_state_t *state, uint64_t esr __unused)
+ {
+@@ -1541,6 +1546,21 @@
+ #endif /* __has_feature(ptrauth_calls) */
+ 		}
+ 	}
++
++#if defined(SWEET)
++	/* Diagnostic only: log user BRK traps, then keep normal exception delivery. */
++	if (ESR_EC(esr) == ESR_EC_BRK_AARCH64 && PSR64_IS_USER(get_saved_state_cpsr(state))) {
++		uint32_t insn[4] = { 0 };
++		char name[32] = { 0 };
++		uint64_t pc = get_saved_state_pc(state);
++		proc_selfname(name, sizeof(name));
++		if (pc >= sizeof(insn)) (void)copyin((user_addr_t)(pc - sizeof(insn)), insn, sizeof(insn));
++		printf("SWEET USER BRK: %s[%d] imm 0x%x pc 0x%llx lr 0x%llx x16 0x%llx x17 0x%llx x0 0x%llx insn %08x %08x %08x [%08x]\n",
++		    name, proc_selfpid(), (unsigned)ISS_BRK_COMMENT(esr), pc, get_saved_state_lr(state),
++		    get_saved_state_reg(state, 16), get_saved_state_reg(state, 17), get_saved_state_reg(state, 0),
++		    insn[0], insn[1], insn[2], insn[3]);
++	}
++#endif
+ 
+ 	codes[1] = get_saved_state_pc(state);
+ 	exception_triage(exception, codes, numcodes);
