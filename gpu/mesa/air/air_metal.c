@@ -24,6 +24,9 @@
  * reason in an NSError that an application will show a person.
  */
 
+#include <sys/stat.h>
+#include <stdlib.h>
+#include "util/os_time.h"
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -642,6 +645,16 @@ rwa_device_open(char *why, size_t why_size)
     */
    bool software = debug_get_bool_option("RWA_SOFTWARE", false);
    device->software = software;
+
+   /* Mesa's on-disk shader cache (panfrost-darwin-disk-cache.patch, -Dshader-cache=enabled): a
+    * compiled stage is kept, so iOS 26 CoreAnimation's multi-minute fixed_frag compiles once per build
+    * and not on every boot. One directory for every process (backboardd, SpringBoard, apps), so 0777. */
+   if (!getenv("MESA_SHADER_CACHE_DIR")) {
+      static const char dir[] = "/private/var/tmp/sweet-mesa-cache";
+      mkdir(dir, 0777);
+      chmod(dir, 0777);
+      setenv("MESA_SHADER_CACHE_DIR", dir, 0);
+   }
 
 #ifdef GALLIUM_FREEDRENO
    if (!software) {
@@ -6499,7 +6512,9 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, const unsigned *color
       retype_integer_outputs(clone, color_format, color_count);
    if (clone->info.stage == MESA_SHADER_FRAGMENT && no_depth)
       drop_depth_outputs(clone);
+   int64_t rwa_t0 = os_time_get_nano();
    finalize_for_gallium(clone, device->screen);
+   int64_t rwa_t1 = os_time_get_nano();
    /* RWA_PRINT_NIR=1: every stage as it is handed to the driver, on stderr */
    if (getenv("RWA_PRINT_NIR"))
       nir_print_shader(clone, stderr);
@@ -6519,6 +6534,15 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, const unsigned *color
    void *cso = nir->info.stage == MESA_SHADER_VERTEX
                   ? pipe->create_vs_state(pipe, &templ)
                   : pipe->create_fs_state(pipe, &templ);
+   int64_t rwa_t2 = os_time_get_nano();
+   if (rwa_t2 - rwa_t0 > 1000000000ll) {
+      unsigned ninstr = 0;
+      nir_foreach_function_impl(impl, nir) nir_foreach_block(b, impl) nir_foreach_instr(ins, b) ninstr++;
+      /* slow stages only: where a multi-minute pipeline spends its time (r26-0957: 245 s) */
+      fprintf(stderr, "RWA TIME %s stage: %u NIR instrs in, finalize %.1f ms, driver compile %.1f ms\n",
+              nir->info.stage == MESA_SHADER_VERTEX ? "vertex" : "fragment", ninstr,
+              (rwa_t1 - rwa_t0) / 1e6, (rwa_t2 - rwa_t1) / 1e6);
+   }
    if (!cso)
       say(why, why_size, "%s would not compile the %s stage",
           device->screen->get_name(device->screen),
@@ -7397,9 +7421,13 @@ rwa_render_create(struct rwa_device *device,
                             shape->fragment_constant_count);
    const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
    const char *error;
+   int64_t rwa_ta = os_time_get_nano();
    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
                                fragment_entry, &fopts, device->nir_options, &render->finfo,
                                &error);
+   if (os_time_get_nano() - rwa_ta > 1000000000ll)
+      fprintf(stderr, "RWA TIME fragment %s: air_to_nir %.1f ms (%zu B of AIR)\n",
+              fragment_entry ? fragment_entry : "?", (os_time_get_nano() - rwa_ta) / 1e6, fragment_size);
    if (!fs) {
       say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
       goto fail;

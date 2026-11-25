@@ -1,0 +1,22 @@
+--- a/src/gallium/drivers/panfrost/pan_disk_cache.c
++++ b/src/gallium/drivers/panfrost/pan_disk_cache.c
+@@ -163,6 +163,11 @@
+ #ifdef ENABLE_SHADER_CACHE
+    const char *renderer = screen->base.get_name(&screen->base);
+ 
++#ifdef __APPLE__
++   /* Mach-O has no ELF build-id note: the build's own date and time keep a cache from
++    * one build away from the next (redwood: iOS 26 CoreAnimation shaders take minutes) */
++   const char *timestamp = "redwood-" __DATE__ " " __TIME__;
++#else
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(panfrost_disk_cache_init);
+    assert(note && build_id_length(note) == 20); /* sha1 */
+@@ -172,6 +177,7 @@
+ 
+    char timestamp[41];
+    _mesa_sha1_format(timestamp, id_sha1);
++#endif
+ 
+    /* Consider any flags affecting the compile when caching */
+    uint64_t driver_flags = screen->dev.debug;

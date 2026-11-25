@@ -3266,6 +3266,31 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 	    &shape, &info, why, sizeof(why));
 
 	t_compile = rw_now_ns() - t_compile;
+	/* A pipeline that took more than 10 s: keep its stages as Metal handed them to us (the specialised
+	 * bitcode) and its constants, in /private/var/tmp/sweet-air, so the compile can be timed and
+	 * profiled on the Mac (gpu-host/prof). iOS 26 CoreAnimation's fixed_frag took 245 s in r26-0957. */
+	if (t_compile > 10000000000ull) {
+		static unsigned dumped;
+		if (dumped < 16) {
+			NSString *dir = @"/private/var/tmp/sweet-air";
+			[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+			    attributes:@{ NSFilePosixPermissions: @0777 } error:NULL];
+			NSString *base = [NSString stringWithFormat:@"%@/%u-%d-%s", dir, dumped++, getpid(),
+			    [[fragment name] UTF8String]];
+			[fragment_air writeToFile:[base stringByAppendingString:@".fs.bc"] atomically:NO];
+			if (vertex_air != nil) {
+				[vertex_air writeToFile:[base stringByAppendingString:@".vs.bc"] atomically:NO];
+			}
+			NSMutableString *txt = [NSMutableString stringWithFormat:@"fs %s vs %s %.1f ms\n",
+			    [[fragment name] UTF8String], vertex != nil ? [[vertex name] UTF8String] : "-", t_compile / 1e6];
+			for (unsigned k = 0; k < shape.fragment_constant_count; k++) {
+				[txt appendFormat:@"fc %d %s %llu\n", shape.fragment_constants[k].index,
+				    shape.fragment_constants[k].name ? shape.fragment_constants[k].name : "-",
+				    (unsigned long long)shape.fragment_constants[k].bits];
+			}
+			[txt writeToFile:[base stringByAppendingString:@".txt"] atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+		}
+	}
 	pthread_mutex_lock(&rw_stats_lock);
 	rw_perf.compiles++;
 	rw_perf.compile_ns += t_compile;
