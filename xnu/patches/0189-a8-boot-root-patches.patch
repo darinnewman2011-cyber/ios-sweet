@@ -1,0 +1,239 @@
+From ab32fa62ae2624e4464996cecb9035e06966ad62 Mon Sep 17 00:00:00 2001
+From: x <x>
+Date: Wed, 25 Nov 2026 13:32:57 -0600
+Subject: [PATCH] 0189 boot-time root patches (port of xnu26 0937/0940/0941)
+
+---
+ bsd/conf/files         |   1 +
+ bsd/kern/kern_exec.c   |   6 ++
+ bsd/kern/sweet_patch.c | 189 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 196 insertions(+)
+ create mode 100644 bsd/kern/sweet_patch.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 29262bf..246917e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
++bsd/kern/sweet_patch.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_a8input.c			standard
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 89750f1..9bad3b5 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7002,6 +7002,12 @@ load_init_program(proc_t p)
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
+ 	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
++#if defined(SWEET)
++	{
++		extern void sweet_apply_root_patches(void);     /* xnu 0189: root patches from /chosen before launchd */
++		sweet_apply_root_patches();
++	}
++#endif
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+diff --git a/bsd/kern/sweet_patch.c b/bsd/kern/sweet_patch.c
+new file mode 100644
+index 0000000..b9b4f20
+--- /dev/null
++++ b/bsd/kern/sweet_patch.c
+@@ -0,0 +1,189 @@
++/*
++ * Project Beryllium (xnu 0189, port of xnu26 0937/0940/0941): root patches applied by the kernel at boot, before launchd runs.
++ *
++ * The patch list rides in the boot image's device tree (/chosen "sweet-patches", built by tools/sweetpatch.py from a
++ * JSON file), so changing patches only needs a BOOT flash, not a 17 GB root rewrite. Format (little endian):
++ *   "SWPATCH1" u32 count, then per entry: u16 path_len, path (no NUL), u64 offset, u32 len, old[len], new[len]
++ * Each entry is written only if the file still holds `old` at `offset`; `new` already there = skipped; anything else is
++ * refused. Every result goes to the console ring ("SWEET PATCH ..."). Boot-arg sweetpatch=0 turns it off.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/mount.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <sys/buf.h>
++#include <sys/ubc.h>
++#include <sys/mount_internal.h>
++
++/* iOS 16 kernel (xnu 0189): console printf reaches the persistent log here */
++#define sweet_logf printf
++void sweet_apply_root_patches(void);
++
++
++/*
++ * xnu 0940: before launchd remounts the root read-write the file can't be opened for writing (EROFS). Then write the
++ * checked bytes straight into the root device: VNOP_BLOCKMAP gives the device block of each device-block-sized piece,
++ * which is read, changed and written back (an in-place overwrite: no allocation, no metadata change), and the file's
++ * cached pages are dropped.
++ */
++static int
++sweet_patch_raw(vnode_t vp, uint64_t off, uint32_t len, const uint8_t *old, const uint8_t *new, vfs_context_t ctx)
++{
++	mount_t mp = vnode_mount(vp);
++	vnode_t devvp = mp ? mp->mnt_devvp : NULLVP;
++	uint32_t bsize = mp ? vfs_devblocksize(mp) : 0;
++	if (devvp == NULLVP || bsize == 0 || bsize > 65536) {
++		return ENXIO;
++	}
++	uint32_t done = 0;
++	while (done < len) {
++		uint64_t pos = off + done;
++		uint64_t base = pos - (pos % bsize);
++		uint32_t in = (uint32_t)(pos - base);
++		uint32_t n = MIN(len - done, bsize - in);
++		daddr64_t bpn = -1;
++		size_t run = 0;
++		int err = VNOP_BLOCKMAP(vp, (off_t)base, bsize, &bpn, &run, NULL, VNODE_READ, ctx);
++		if (err || bpn < 0) {
++			return err ? err : EIO;
++		}
++		buf_t bp = NULL;
++		err = (int)buf_bread(devvp, bpn, (int)bsize, NOCRED, &bp);
++		if (err) {
++			if (bp) {
++				buf_brelse(bp);
++			}
++			return err;
++		}
++		if (memcmp((uint8_t *)buf_dataptr(bp) + in, old + done, n) != 0) {
++			/* the device block must hold the file's original bytes: a wrong mapping writes nothing */
++			buf_brelse(bp);
++			return EFTYPE;
++		}
++		memcpy((uint8_t *)buf_dataptr(bp) + in, new + done, n);
++		err = (int)buf_bwrite(bp);
++		if (err) {
++			return err;
++		}
++		done += n;
++	}
++	(void)ubc_msync(vp, 0, ubc_getsize(vp), NULL, UBC_INVALIDATE | UBC_SYNC);
++	return 0;
++}
++
++static int
++sweet_patch_one(const char *path, uint64_t off, uint32_t len, const uint8_t *old, const uint8_t *new)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int oflags = FREAD | FWRITE;
++	int err = vnode_open(path, oflags | O_NOFOLLOW, 0, 0, &vp, ctx);
++	if (err == EROFS) {
++		oflags = FREAD;
++		err = vnode_open(path, oflags | O_NOFOLLOW, 0, 0, &vp, ctx);
++	}
++	if (err) {
++		sweet_logf("SWEET PATCH: %s: open failed %d\n", path, err);
++		return err;
++	}
++	uint8_t *cur = kalloc_data(len, Z_WAITOK);
++	int resid = 0;
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)cur, (int)len, (off_t)off, UIO_SYSSPACE, IO_NOCACHE, vfs_context_ucred(ctx),
++	    &resid, vfs_context_proc(ctx));
++	if (!err && resid) {
++		err = EIO;
++	}
++	if (err) {
++		sweet_logf("SWEET PATCH: %s @0x%llx: read failed %d\n", path, off, err);
++	} else if (memcmp(cur, new, len) == 0) {
++		sweet_logf("SWEET PATCH: %s @0x%llx (%u bytes): already applied\n", path, off, len);
++	} else if (memcmp(cur, old, len) != 0) {
++		sweet_logf("SWEET PATCH: %s @0x%llx (%u bytes): original bytes differ, NOT patched\n", path, off, len);
++		err = EINVAL;
++	} else {
++		const char *how = "applied";
++		if (oflags & FWRITE) {
++			err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)new, (int)len, (off_t)off, UIO_SYSSPACE,
++			    IO_NOCACHE | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		} else {
++			err = sweet_patch_raw(vp, off, len, old, new, ctx);
++			how = "applied (raw, root read-only)";
++		}
++		sweet_logf("SWEET PATCH: %s @0x%llx (%u bytes): %s (%d)\n", path, off, len, err ? "WRITE FAILED" : how, err);
++	}
++	kfree_data(cur, len);
++	vnode_close(vp, oflags, ctx);
++	return err;
++}
++
++void
++sweet_apply_root_patches(void)
++{
++	uint32_t on = 1;
++	DTEntry chosen;
++	const void *blob = NULL;
++	unsigned int size = 0;
++
++	PE_parse_boot_argn("sweetpatch", &on, sizeof(on));
++	if (!on) {
++		sweet_logf("SWEET PATCH: off (sweetpatch=0)\n");
++		return;
++	}
++	int r1 = SecureDTLookupEntry(NULL, "/chosen", &chosen);
++	if (r1 != kSuccess) {
++		sweet_logf("SWEET PATCH: no /chosen (%d)\n", r1);
++		return;
++	}
++	int r2 = SecureDTGetProperty(chosen, "sweet-patches", &blob, &size);
++	if (r2 != kSuccess || size < 12) {
++		sweet_logf("SWEET PATCH: no sweet-patches property (%d, size %u)\n", r2, size);
++		return;
++	}
++	sweet_logf("SWEET PATCH: blob %u bytes\n", size);
++	const uint8_t *p = blob, *end = p + size;
++	if (memcmp(p, "SWPATCH1", 8) != 0) {
++		sweet_logf("SWEET PATCH: bad blob magic\n");
++		return;
++	}
++	uint32_t count;
++	memcpy(&count, p + 8, 4);
++	p += 12;
++	uint32_t ok = 0;
++	for (uint32_t i = 0; i < count; i++) {
++		uint16_t plen;
++		uint64_t off;
++		uint32_t len;
++		char path[MAXPATHLEN];
++		if (p + 2 > end) {
++			break;
++		}
++		memcpy(&plen, p, 2);
++		p += 2;
++		if (plen == 0 || plen >= sizeof(path) || p + plen + 12 > end) {
++			sweet_logf("SWEET PATCH: entry %u malformed\n", i);
++			break;
++		}
++		memcpy(path, p, plen);
++		path[plen] = 0;
++		p += plen;
++		memcpy(&off, p, 8);
++		memcpy(&len, p + 8, 4);
++		p += 12;
++		if (len == 0 || len > 65536 || p + 2 * (size_t)len > end) {
++			sweet_logf("SWEET PATCH: entry %u (%s) bad length %u\n", i, path, len);
++			break;
++		}
++		if (sweet_patch_one(path, off, len, p, p + len) == 0) {
++			ok++;
++		}
++		p += 2 * (size_t)len;
++	}
++	sweet_logf("SWEET PATCH: %u/%u entries applied or already present\n", ok, count);
++}
+-- 
+2.50.1 (Apple Git-155)
+
