@@ -3733,8 +3733,25 @@ plan_globals(struct air_ctx *c)
 
          uint64_t word = 0;
          if (g->init && !air_const_uint(g->init, &word)) {
-            air_error(c, "interface: an inline sampler whose state is not a constant");
-            return;
+            /* iOS 26 (air64_v28): the state is [2 x i64] { state word, 0 }, e.g. QuartzCore brim_init_lph:
+             *   @__air_sampler_state.3 = internal addrspace(2) constant [2 x i64] [i64 34901797601017856, i64 0]
+             * The first word has the same layout as the older single i64; the second is taken as an extension
+             * that is zero in every CoreAnimation shader. */
+            const struct air_constant *k = air_value_as_constant(g->init);
+            bool ok = false;
+            if (k && k->ckind == AIR_CONST_DATA && k->num_elems >= 1 && k->data) {
+               word = k->data[0];
+               ok = true;
+            } else if (k && k->ckind == AIR_CONST_AGGREGATE && k->num_elems >= 1) {
+               ok = air_const_uint(k->elems[0], &word);
+            } else if (k && k->ckind == AIR_CONST_NULL) {
+               word = 0;
+               ok = true;
+            }
+            if (!ok) {
+               air_error(c, "interface: an inline sampler whose state is not a constant");
+               return;
+            }
          }
          struct air_shader_info *info = c->info;
          info->resources = reralloc(c->mem_ctx, info->resources, struct air_resource,
