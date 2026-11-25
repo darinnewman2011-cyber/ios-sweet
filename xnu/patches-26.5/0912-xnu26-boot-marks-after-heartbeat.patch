@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index a312375..fd87f67 100644
+index 1272988..798873c 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -532,7 +532,8 @@ bsd_init(void)
+@@ -535,7 +535,8 @@ bsd_init(void)
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
  #elif defined(SWEET_JACKPOTLTE)
  /* A8 bring-up: show where bsd_init stops (no other log channel yet). */
@@ -64,10 +64,19 @@ index 572f463..a2a9261 100644
  void sweet_early_panic(const char *fmt, va_list *args);
  void sweet_early_relocate(uint64_t base, uint64_t decon_base);
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index e1cd16c..75fe516 100644
+index 715c368..793edf5 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -686,6 +686,9 @@ void sweet_a8_snapshot(void);
+@@ -703,6 +703,8 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
+ #if defined(SWEET_JACKPOTLTE)
+ #include <kern/thread_call.h>
+ void sweet_early_kick(void);     /* osfmk/arm64/sweet_early.c */
++void sweet_a8_snapshot(void);           /* bsd/dev (0095): console tail to ramoops */
++void sweet_a8_reboot_recovery(void) __dead2;
+ 
+ /*
+  * A8 bring-up: xnu6-8 stop printing after IOKit's drivers register and never
+@@ -722,6 +724,9 @@ void sweet_a8_snapshot(void);
  void sweet_a8_reboot_recovery(void) __dead2;
  
  #define SWEET_STAGE(label) do { sweet_boot_stage = (label); } while (0)
@@ -77,15 +86,28 @@ index e1cd16c..75fe516 100644
  
  static void
  sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
-@@ -694,6 +697,7 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+@@ -730,6 +735,20 @@ sweet_boot_hb(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
  	uint64_t deadline;
  
  	sweet_boot_hb_secs += 5;
 +	sweet_early_note("heartbeat tick (timer interrupts work)");
++	{
++		/* xnu26 0912: test boots come back to TWRP on their own, even when the boot stalls (no one at the phone) */
++		static uint32_t reboot_after = 0xffffffffu;
++		if (reboot_after == 0xffffffffu) {
++			reboot_after = 0;
++			(void)PE_parse_boot_argn("sweetreboot", &reboot_after, sizeof(reboot_after));
++		}
++		if (reboot_after && sweet_boot_hb_secs >= reboot_after) {
++			printf("SWEET A8: %us reached (sweetreboot): back to TWRP\n", sweet_boot_hb_secs);
++			sweet_a8_snapshot();
++			sweet_a8_reboot_recovery();
++		}
++	}
  	printf("SWEET A8: %us stage '%s' state 0x%x event 0x%llx hint %d\n",
  	    sweet_boot_hb_secs, sweet_boot_stage, t->state, (unsigned long long)t->wait_event,
  	    (int)t->block_hint);
-@@ -723,6 +727,7 @@ sweet_boot_hb_start(void)
+@@ -759,6 +778,7 @@ sweet_boot_hb_start(void)
  }
  #else
  #define SWEET_STAGE(label) do { } while (0)
@@ -93,7 +115,7 @@ index e1cd16c..75fe516 100644
  #endif
  
  static void
-@@ -847,16 +852,20 @@ kernel_bootstrap_thread(void)
+@@ -883,16 +903,20 @@ kernel_bootstrap_thread(void)
  	/*
  	 * This will start displaying progress to the user, start as early as possible
  	 */
@@ -114,7 +136,7 @@ index e1cd16c..75fe516 100644
  #if CONFIG_MACF
  	kernel_bootstrap_log("mac_policy_initmach");
  	mac_policy_initmach();
-@@ -865,6 +874,7 @@ kernel_bootstrap_thread(void)
+@@ -901,6 +925,7 @@ kernel_bootstrap_thread(void)
  	vnguard_policy_init();
  #endif
  #endif
@@ -122,7 +144,7 @@ index e1cd16c..75fe516 100644
  
  #if CONFIG_DTRACE
  	kernel_bootstrap_log("dtrace_early_init");
-@@ -890,12 +900,15 @@ kernel_bootstrap_thread(void)
+@@ -930,12 +955,15 @@ kernel_bootstrap_thread(void)
  	kernel_bootstrap_log("trust_cache_init");
  
  	/* Initialize the runtime for the trust cache interface */
@@ -138,7 +160,7 @@ index e1cd16c..75fe516 100644
  
  	/*
  	 * Get rid of segments used to bootstrap kext loading. This removes
-@@ -916,6 +929,7 @@ kernel_bootstrap_thread(void)
+@@ -956,6 +984,7 @@ kernel_bootstrap_thread(void)
  
  	/* No changes to kernel text and rodata beyond this point. */
  	SWEET_STAGE("kext bootstrap removed");
@@ -146,7 +168,7 @@ index e1cd16c..75fe516 100644
  	kernel_bootstrap_log("machine_lockdown");
  	machine_lockdown();
  
-@@ -930,6 +944,7 @@ kernel_bootstrap_thread(void)
+@@ -970,6 +999,7 @@ kernel_bootstrap_thread(void)
  
  #ifdef  IOKIT
  	SWEET_STAGE("machine_lockdown done");
@@ -154,7 +176,7 @@ index e1cd16c..75fe516 100644
  	kernel_bootstrap_log("PE_lockdown_iokit");
  	PE_lockdown_iokit();
  #endif
-@@ -938,6 +953,7 @@ kernel_bootstrap_thread(void)
+@@ -978,6 +1008,7 @@ kernel_bootstrap_thread(void)
  	 * at the latest
  	 */
  	SWEET_STAGE("PE_lockdown_iokit returned");
