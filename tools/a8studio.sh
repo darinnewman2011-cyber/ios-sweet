@@ -1,5 +1,5 @@
 #!/bin/bash
-# a8studio - one menu for the Galaxy A8 iOS port: pick an iOS copy (IPSW), extract it, measure and translate its
+# a8studio (Project Beryllium) - one menu for the Galaxy A8 iOS port (Beryllium 10 = iPhone X builds, Beryllium 11 = iPhone 11 builds): pick an iOS copy (IPSW), extract it, measure and translate its
 # arm64e code (a8xlate), build an A8 root image, install it, build + flash a boot image, go back to iOS 16, and
 # pull logs. Run it in Terminal:  a8studio
 #
@@ -283,7 +283,7 @@ EOF
 }
 
 while true; do
-	say "a8studio  -  selected: ${NAME:-(none)}   on phone: $(cat "$STUDIO/.on-phone" 2>/dev/null || echo 'iOS 16')"
+	say "Project Beryllium (a8studio)  -  selected: ${NAME:-(none)}   on phone: $(cat "$STUDIO/.on-phone" 2>/dev/null || echo 'iOS 16')"
 	echo "  1) Pick an iOS copy            5) Install the root on the phone"
 	echo "  2) Extract its system images   6) Build + flash a boot image"
 	echo "  3) Measure (scan) translation  7) Back to iOS 16"
