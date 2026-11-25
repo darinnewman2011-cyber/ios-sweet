@@ -1,0 +1,33 @@
+name: gpu-userland-ios15
+
+# iOS 15 roots: the GPU userland with the theos iOS 16.5 SDK, deployment target iOS 15.0.
+# Xcode's iOS 26 SDK for the iOS 26 root.
+on:
+  workflow_dispatch:
+  push:
+    branches: [jackpotlte-gpu26]
+    paths: ['gpu/**', '.github/workflows/gpu15.yml']
+
+jobs:
+  build:
+    runs-on: macos-15-intel   # macos-26 (arm64) jobs were never picked up (capacity)
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          brew install bison
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: Build
+        run: IOSMIN=15.0 bash gpu/build.sh
+      - name: Checksums
+        if: always()
+        run: shasum -a 256 gpu/out/* || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-userland-ios15
+          path: |
+            gpu/out
+            gpu/build/meson-setup.log
