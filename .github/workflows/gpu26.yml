@@ -10,13 +10,14 @@ on:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-15-intel   # macos-26 (arm64) jobs were never picked up (capacity)
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Tools
         run: |
           brew install bison
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1); echo "using ${X:-default Xcode}"; [ -n "$X" ] && sudo xcode-select -s "$X"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
       - name: Build
