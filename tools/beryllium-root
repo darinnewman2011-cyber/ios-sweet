@@ -1,0 +1,57 @@
+#!/bin/bash
+# Project Beryllium: the only things that need root, behind one fixed interface (installed root-owned by
+# tools/setup-beryllium-sudo.sh into /usr/local/libexec/beryllium; sudoers allows exactly this file without a password).
+#
+#   beryllium-root build   OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img SIZE [--minimal] [--translate] [--tweaks]
+#   beryllium-root mount   IMG            -> mounts read-write at /Volumes/Beryllium-<name>
+#   beryllium-root put     IMG SRC DEST   -> copies SRC (a file under ~/iOS/rootpatch) to DEST inside the mounted IMG
+#   beryllium-root unmount IMG
+#
+# Every image must be under $HOME_DIR/iOS/studio and every input under $HOME_DIR/iOS; nothing else on the Mac is touched.
+set -euo pipefail
+HOME_DIR=/Users/darin
+LIB=/usr/local/libexec/beryllium
+STUDIO=$HOME_DIR/iOS/studio
+PATCHES=$HOME_DIR/iOS/rootpatch
+die() { echo "beryllium-root: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run with sudo"
+real() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+under() { case "$(real "$1")/" in "$2"/*) return 0 ;; *) return 1 ;; esac; }
+img_ok() { under "$1" "$STUDIO" || die "$1 is not under $STUDIO"; case "$1" in *.img) ;; *) die "$1 is not a .img" ;; esac; }
+mnt_of() { echo "/Volumes/Beryllium-$(basename "$(dirname "$(real "$1")")")-$(basename "$1" .img)"; }
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+build)
+	[ $# -ge 5 ] || die "build OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img SIZE [flags]"
+	for f in "$1" "$2" "$3"; do [ "$f" = - ] || under "$f" "$HOME_DIR/iOS" || die "$f is not under ~/iOS"; done
+	img_ok "$4"
+	case "$5" in *[!0-9]*) die "SIZE must be a number" ;; esac
+	for a in "${@:6}"; do case "$a" in --minimal|--translate|--tweaks) ;; *) die "unknown flag $a" ;; esac; done
+	exec "$LIB/tools/mkiosroot-mac.sh" "$@"
+	;;
+mount)
+	img_ok "$1"; M=$(mnt_of "$1"); mkdir -p "$M"
+	hdiutil attach -owners on -nobrowse -noverify -mountpoint "$M" "$(real "$1")" >/dev/null
+	echo "$M"
+	;;
+put)
+	[ $# = 3 ] || die "put IMG SRC DEST"
+	img_ok "$1"; M=$(mnt_of "$1")
+	mount | grep -q " on $M " || die "$1 is not mounted (beryllium-root mount first)"
+	under "$2" "$PATCHES" || die "$2 is not under $PATCHES"
+	[ -f "$2" ] || die "$2 is not a file"
+	D="$M/${3#/}"
+	parent=$(real "$(dirname "$D")")
+	case "$parent/" in "$M"/*) ;; *) die "$3 leaves the mounted image" ;; esac
+	cp -p "$2" "$D"; chown 0:0 "$D"
+	echo "put $3"
+	;;
+unmount)
+	img_ok "$1"; M=$(mnt_of "$1")
+	hdiutil detach "$M" >/dev/null || hdiutil detach -force "$M" >/dev/null
+	rmdir "$M" 2>/dev/null || true
+	;;
+*)
+	sed -n '2,12p' "$0"; exit 2 ;;
+esac
