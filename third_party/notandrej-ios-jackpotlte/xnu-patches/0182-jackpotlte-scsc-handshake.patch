@@ -1,0 +1,174 @@
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index 3af5dc2..cbdd94a 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -122,6 +122,16 @@ struct a5scsc_softc {
+ 	a5scsc_intr_fn intr_fn[A5SCSC_INTRBIT_NUM];
+ 	void          *intr_arg[A5SCSC_INTRBIT_NUM];
+ 
++	/* mxmgmt channel handlers (mxmgmt_transport.c:110-155). */
++	a5scsc_mxmgmt_fn mxmgmt_fn[A5SCSC_MMTRANS_NUM_CHANNELS];
++	void            *mxmgmt_arg[A5SCSC_MMTRANS_NUM_CHANNELS];
++
++	/* Maxwell management state.  mm_start_seen is written by the poll
++	 * thread and read by the bring-up thread, hence volatile. */
++	volatile bool mm_start_seen;
++	uint32_t      rf_hw_ver;        /* MM_START_IND arg (mxman.c:539-546) */
++	uint32_t      mm_unknown;       /* unhandled channel/message count      */
++
+ 	/* Transport streams, in the vendor's transports_init() order
+ 	 * (mxman.c:678-760). */
+ 	struct a5scsc_stream mxmgmt_in;
+@@ -673,6 +683,75 @@ a5scsc_mxmgmt_send(uint8_t channel, uint8_t msg, const void *payload,
+ 	    0 : EAGAIN;
+ }
+ 
++/* Registers a handler for one mxmgmt channel
++ * (mxmgmt_transport_register_channel_handler, mxmgmt_transport.c:280-291). */
++void
++a5scsc_mxmgmt_register(uint8_t channel, a5scsc_mxmgmt_fn fn, void *arg)
++{
++	if (channel >= A5SCSC_MMTRANS_NUM_CHANNELS) {
++		return;
++	}
++	a5scsc.mxmgmt_fn[channel] = fn;
++	a5scsc.mxmgmt_arg[channel] = arg;
++}
++
++/* Drains the inbound ring, delivering each packet to its channel handler and
++ * retiring it afterwards (mxmgmt_transport.c:133-155).  Runs in the poll
++ * thread, so handlers may sleep. */
++static void
++a5scsc_mxmgmt_poll(void)
++{
++	struct a5scsc_stream *s = &a5scsc.mxmgmt_in;
++	const uint8_t *packet;
++	uint32_t n = 0;
++
++	if (!s->ready) {
++		return;
++	}
++	packet = a5scsc_stream_peek(s, NULL);
++	while (packet != NULL && n < A5SCSC_MXMGMT_NUM_PACKETS) {
++		uint8_t channel = packet[0];
++
++		n++;
++		if (channel < A5SCSC_MMTRANS_NUM_CHANNELS &&
++		    a5scsc.mxmgmt_fn[channel] != NULL) {
++			a5scsc.mxmgmt_fn[channel](packet + 1,
++			    a5scsc.mxmgmt_arg[channel]);
++		} else {
++			a5scsc.mm_unknown++;
++		}
++		a5scsc_stream_peek_done(s, packet);
++		packet = a5scsc_stream_peek(s, NULL);
++	}
++}
++
++/* Maxwell-management messages (mxman.c:333-340): u8 ma_msg followed by u32
++ * arg, packed, so the arg starts at payload byte 1 and is unaligned. */
++static void
++a5scsc_mm_handler(const uint8_t *p, void *arg __unused)
++{
++	switch (p[0]) {
++	case A5SCSC_MM_START_IND:
++		/* mxman_message_handler(): the arg is the RF hardware version
++		 * (mxman.c:538-546). */
++		a5scsc.rf_hw_ver = (uint32_t)p[1] | ((uint32_t)p[2] << 8) |
++		    ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
++		a5scsc.mm_start_seen = true;
++		break;
++	case A5SCSC_MM_HALT_RSP:
++		break;
++	default:
++		a5scsc.mm_unknown++;
++		break;
++	}
++}
++
++static void
++a5scsc_mxmgmt_irq(int bit __unused, void *arg __unused)
++{
++	a5scsc_mxmgmt_poll();
++}
++
+ /* ---- mxconf (mxconf.h:106-139, mxman.c:721-760) ------------------------- */
+ 
+ /* One struct mxstreamconf is 24 bytes: struct mxcbufconf (5 x u32) followed by
+@@ -713,7 +792,7 @@ a5scsc_transports_init(void)
+ 
+ 	err = a5scsc_stream_init(&a5scsc.mxmgmt_in, A5SCSC_MIF_TARGET_R4,
+ 	    A5SCSC_STREAM_IN, A5SCSC_MXMGMT_NUM_PACKETS, A5SCSC_MXMGMT_PKT_SIZE,
+-	    false, NULL, NULL);
++	    false, a5scsc_mxmgmt_irq, NULL);
+ 	if (err != 0) {
+ 		return err;
+ 	}
+@@ -1012,6 +1091,7 @@ int
+ a5scsc_transport_up(void)
+ {
+ 	int err;
++	uint32_t waited;
+ 
+ 	if (a5scsc_transport_state == 2) {
+ 		return 1;
+@@ -1055,6 +1135,10 @@ a5scsc_transport_up(void)
+ 	    a5scsc.intr_fromhost_r4, a5scsc.intr_fromhost_m4);
+ 
+ 	a5scsc_mbox_init(a5scsc.fw_entry, a5scsc.mxconf_ref);
++	/* The vendor registers the Maxwell-management handler before releasing
++	 * reset, so the first message cannot be missed (mxman.c:1024-1026). */
++	a5scsc_mxmgmt_register(A5SCSC_MMTRANS_CHAN_MAXWELL, a5scsc_mm_handler,
++	    NULL);
+ 	a5scsc_poll_start();
+ 
+ 	err = a5scsc_pmu_reset_release();
+@@ -1065,12 +1149,28 @@ a5scsc_transport_up(void)
+ 		return 0;
+ 	}
+ 
++	/* The PMU state machine only says the domain is powered.  What proves
++	 * the R4 is executing is its first management message, MM_START_IND
++	 * (mxman.c:539-546, 1043-1060).  The poll thread delivers it. */
++	for (waited = 0; waited < A5SCSC_MXMAN_START_TIMEOUT_MS &&
++	    !a5scsc.mm_start_seen; waited += A5SCSC_POLL_INTERVAL_MS) {
++		a5scsc_sleep_ms(A5SCSC_POLL_INTERVAL_MS);
++	}
++	if (!a5scsc.mm_start_seen) {
++		/* No recovery path in this port: report once and leave the
++		 * transport marked up so nothing retries the reset sequence. */
++		printf("A5XELTE SCSC: stage 5/6 handshake: no MM_START_IND in %u ms (pmu up, mxmgmt pending 0x%04x)\n",
++		    (unsigned)A5SCSC_MXMAN_START_TIMEOUT_MS, a5scsc_irq_get());
++		a5scsc_transport_state = 2;
++		printf("A5XELTE SCSC: stage 6/6 up: WLBT cannot be confirmed\n");
++		return 1;
++	}
++
+ 	a5scsc_transport_state = 2;
+-	/* STUBBED until patch 0182: the R4's first mxmgmt message
+-	 * (MM_START_IND) is not waited for, so "up" below only means the PMU
+-	 * state machine accepted the reset. */
+-	printf("A5XELTE SCSC: stage 5/6 handshake: STUBBED\n");
+-	printf("A5XELTE SCSC: stage 6/6 up: WLBT running, no firmware handshake\n");
++	printf("A5XELTE SCSC: stage 5/6 handshake: MM_START_IND rf 0x%04x after %u ms\n",
++	    a5scsc.rf_hw_ver, waited);
++	printf("A5XELTE SCSC: stage 6/6 up: WLBT running, RF 0x%04x\n",
++	    a5scsc.rf_hw_ver);
+ 	return 1;
+ }
+ 
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index 3377fce..f5193f8 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -311,4 +311,10 @@ int  a5scsc_mxmgmt_send(uint8_t channel, uint8_t msg, const void *payload,
+     uint32_t len);
+ int  a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size);
+ 
++/* mxmgmt channel handlers: the callback gets the 7-byte payload of an 8-byte
++ * packet, without the channel byte (mxmgmt_transport_format.h:15-23).  The
++ * WiFi service and the BT endpoint each register their own channel. */
++typedef void (*a5scsc_mxmgmt_fn)(const uint8_t *payload, void *arg);
++void a5scsc_mxmgmt_register(uint8_t channel, a5scsc_mxmgmt_fn fn, void *arg);
++
+ #endif /* _A5XELTE_SCSC_H_ */

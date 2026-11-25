@@ -1,0 +1,73 @@
+--- a/src/panfrost/lib/meson.build
++++ b/src/panfrost/lib/meson.build
+@@ -23,7 +23,9 @@
+ 
+ libpanfrost_per_arch = []
+ 
+-foreach ver : ['4', '5', '6', '7', '9', '10']
++# Darwin: Bifrost v6 only (this port's Mali-G71), for the size of the
++# library the driver travels in.
++foreach ver : host_machine.system() == 'darwin' ? ['6'] : ['4', '5', '6', '7', '9', '10']
+   libpanfrost_per_arch += static_library(
+     'pan-arch-v' + ver,
+     [
+@@ -39,7 +41,7 @@
+   )
+ endforeach
+ 
+-foreach ver : ['7']
++foreach ver : host_machine.system() == 'darwin' ? ['6'] : ['7']
+   libpanfrost_per_arch += static_library(
+     'pan-arch-indirect-v' + ver,
+     'pan_indirect_dispatch.c',
+--- a/src/gallium/drivers/panfrost/meson.build
++++ b/src/gallium/drivers/panfrost/meson.build
+@@ -41,7 +41,8 @@
+   '-Wno-pointer-arith'
+ ]
+ 
+-panfrost_versions = ['4', '5', '6', '7', '9', '10']
++# Darwin: Bifrost v6 only (this port's Mali-G71).
++panfrost_versions = host_machine.system() == 'darwin' ? ['6'] : ['4', '5', '6', '7', '9', '10']
+ libpanfrost_versions = []
+ 
+ foreach ver : panfrost_versions
+--- a/src/panfrost/lib/pan_shader.c
++++ b/src/panfrost/lib/pan_shader.c
+@@ -85,7 +85,7 @@
+ /* This is only needed on Midgard. It's the same on both v4 and v5, so only
+  * compile once to avoid the GenXML dependency for calls.
+  */
+-#if PAN_ARCH == 5
++#if PAN_ARCH == 5 || (defined(__APPLE__) && PAN_ARCH == 6)   /* Darwin builds v6 alone */
+ uint8_t
+ pan_raw_format_mask_midgard(enum pipe_format *formats)
+ {
+--- a/src/gallium/drivers/panfrost/pan_screen.c
++++ b/src/gallium/drivers/panfrost/pan_screen.c
+@@ -978,6 +978,17 @@
+       return NULL;
+    }
+ 
++#ifdef __APPLE__
++   /* Darwin builds Bifrost v6 alone (this port's Mali-G71): the other
++    * architectures' init functions are not in the library, so they are not
++    * named here. */
++   if (dev->arch == 6)
++      panfrost_cmdstream_screen_init_v6(screen);
++   else {
++      panfrost_destroy_screen(&(screen->base));
++      return NULL;
++   }
++#else
+    if (dev->arch == 4)
+       panfrost_cmdstream_screen_init_v4(screen);
+    else if (dev->arch == 5)
+@@ -992,6 +1003,7 @@
+       panfrost_cmdstream_screen_init_v10(screen);
+    else
+       unreachable("Unhandled architecture major");
++#endif
+ 
+    return &screen->base;
+ }

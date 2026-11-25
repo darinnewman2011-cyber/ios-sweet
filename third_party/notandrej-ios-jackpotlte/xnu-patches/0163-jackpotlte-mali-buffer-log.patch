@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -310,6 +310,11 @@ JackpotlteMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	}
+ 	b->memory = memory;
+ 	request->offset = b->address;
++	/* Bring-up aid: a create-BO that lands here is the last thing Mesa did
++	 * before the GPU address space is walked, so its presence or absence in
++	 * the log says whether a later failure is inside this request. */
++	IOLog("JackpotlteMali: buffer %u: %llu bytes at %#llx\n",
++	    request->handle, size, b->address);
+ 	return kIOReturnSuccess;
+ }
+ 

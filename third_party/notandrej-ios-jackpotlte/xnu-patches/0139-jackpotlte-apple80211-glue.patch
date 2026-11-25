@@ -1,0 +1,315 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8eed139..051083d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/a5xelte_panel.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
++bsd/dev/a5xelte_wifi.c			standard
+ bsd/dev/jackpotlte_pmic.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/a5xelte_wifi.c b/bsd/dev/a5xelte_wifi.c
+new file mode 100644
+index 0000000..2deb7bd
+--- /dev/null
++++ b/bsd/dev/a5xelte_wifi.c
+@@ -0,0 +1,275 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) Apple80211 glue, step 2.
++ *
++ * wifid and, through it, Settings and the status bar, talk to a Wi-Fi driver
++ * over the two interface ioctls SIOCSA80211 / SIOCGA80211, whose argument is
++ * a struct apple80211req.  The request carries the interface name, a request
++ * type, a scalar and a caller buffer (IO80211.framework: Apple80211Get/Set).
++ * XNU hands an ioctl whose group is 'i' that no socket protocol claims to the
++ * interface (bsd/net/if.c:3555-3565 -> bsd/net/dlil.c:7596-7599), so a driver
++ * answers these by implementing if_ioctl.
++ *
++ * The board has no Wi-Fi interface of its own yet, so this file makes one
++ * (en0, IFT_ETHER, modeled on bsd/dev/sweet_usb.c:623-655) and answers the
++ * requests the SCSC/Maxwell transport can honestly answer today.  What it can
++ * answer is little: the transport in bsd/dev/a5xelte_scsc.c has no wlan
++ * service and no firmware handshake yet, so there is no scan, no join and no
++ * link state.  This file therefore answers only the scalar requests that do
++ * not need a radio (POWER, STATE) and refuses the rest with EOPNOTSUPP, and it
++ * logs every request so the next session can see which of them wifid needs.
++ *
++ * Everything here is marked implemented / stubbed / unknown in
++ * docs/drafts/jackpotlte-wifi/PORT-START.md.  The whole glue is off unless the
++ * boot argument "a8wifi" is 1, so a default boot gains no phantom interface.
++ *
++ * The layouts and the request/event numbers are Apple's, taken from the same
++ * reference as the rest of the port (/tmp/opencode/hakios.apple80211.c, which
++ * cites apple80211_ioctl.h / apple80211_var.h and the 16.5 IO80211.framework).
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/mbuf.h>
++#include <sys/kern_event.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++
++/* bsd/net/if.c:3555 dispatches any IOCGROUP == 'i' ioctl to the interface. */
++#define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req)  */
++#define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
++
++/* The argument of both ioctls.  Its first 16 bytes are req_if_name, which
++ * aliases struct ifreq.ifr_name, so ifioctl()'s ifunit_ref() lookup finds the
++ * interface before the ioctl is handed to it (bsd/net/if.c:3400). */
++struct apple80211req {
++	char     req_if_name[16];
++	int32_t  req_type;
++	int32_t  req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++
++/* Request types this skeleton answers, from apple80211_var.h (see the log
++ * helper for the full list). */
++#define APPLE80211_IOC_STATE    13
++#define APPLE80211_IOC_POWER    19
++
++/* Apple80211's events (APPLE80211_M_...), the same numbers hakios uses. */
++#define APPLE80211_M_POWER_CHANGED  1
++
++void a5xelte_wifi_probe(void);
++
++struct a5wifi_softc {
++	ifnet_t   ifp;
++	lck_mtx_t *lock;
++	bool      power;        /* last value wifid set; the radio is STUBBED */
++	bool      attached;
++};
++
++static struct a5wifi_softc a5wifi;
++static const char a5wifi_name[16] = "en0";
++
++/* ---- events ---------------------------------------------------------------
++ * A driver tells Darwin about the radio with kernel events of class 6
++ * (IEEE 802.11), subclass 1, whose first datum is the interface name in 16
++ * bytes (IO80211.framework reads them from a PF_SYSTEM socket and compares the
++ * name).  Only the power event is ever posted here.
++ */
++static void
++a5wifi_post_event(uint32_t code, const void *data, uint32_t length)
++{
++	struct kev_msg message = {
++		.vendor_code = KEV_VENDOR_APPLE,
++		.kev_class = KEV_IEEE80211_CLASS,
++		.kev_subclass = 1,
++		.event_code = code
++	};
++	char name[16];
++
++	memcpy(name, a5wifi_name, sizeof(name));
++	message.dv[0].data_length = sizeof(name);
++	message.dv[0].data_ptr = name;
++	if (length != 0) {
++		message.dv[1].data_length = length;
++		message.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	(void)kev_post_msg(&message);
++}
++
++/* ---- request handling -----------------------------------------------------
++ * There is no radio behind these yet: the transport patch (0138) brings the
++ * chip out of reset but does not run the mx140 wlan service, so the only
++ * truthful state is "power is off / not associated".  A request that would
++ * need the service is refused, not faked.
++ */
++static int
++a5wifi_get(struct apple80211req *req)
++{
++	switch (req->req_type) {
++	case APPLE80211_IOC_POWER:
++		req->req_val = a5wifi.power ? 1 : 0;
++		return 0;
++	case APPLE80211_IOC_STATE:
++		req->req_val = 0;       /* not associated: STUBBED */
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static int
++a5wifi_set(struct apple80211req *req)
++{
++	switch (req->req_type) {
++	case APPLE80211_IOC_POWER: {
++		bool on = req->req_val != 0;
++		bool changed;
++
++		lck_mtx_lock(a5wifi.lock);
++		changed = (on != a5wifi.power);
++		a5wifi.power = on;
++		lck_mtx_unlock(a5wifi.lock);
++		/* STUBBED: the WLBT reset/firmware path (0138) is not driven from
++		 * here; only the interface's idea of power changes. */
++		if (changed) {
++			a5wifi_post_event(APPLE80211_M_POWER_CHANGED, NULL, 0);
++		}
++		return 0;
++	}
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++a5wifi_if_output(ifnet_t ifp __unused, mbuf_t m)
++{
++	/* No radio yet; drop whatever would be transmitted. */
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++a5wifi_if_ioctl(ifnet_t ifp __unused, unsigned long cmd, void *data)
++{
++	static unsigned said;
++	struct apple80211req *req = (struct apple80211req *)data;
++	bool is_set = (cmd == SIOCSA80211);
++	int error;
++
++	switch (cmd) {
++	case SIOCSA80211:
++	case SIOCGA80211:
++		break;
++	default:
++		return EOPNOTSUPP;
++	}
++	if (req == NULL) {
++		return EINVAL;
++	}
++	error = is_set ? a5wifi_set(req) : a5wifi_get(req);
++	/* Say each request a bounded number of times: which of them wifid needs
++	 * is learned this way (never what a request carries). */
++	if (said < 400) {
++		said++;
++		printf("A5XELTE WIFI: %s type %d value %d len %u -> %d%s\n",
++		    is_set ? "set" : "get", req->req_type, req->req_val,
++		    req->req_len, error,
++		    error == EOPNOTSUPP ? " (not built)" : "");
++	}
++	return error;
++}
++
++static void
++a5wifi_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* Modeled on bsd/dev/sweet_usb.c:623-655, minus the PF_INET plumbing (there is
++ * no address to give an interface for a radio that cannot carry traffic yet). */
++static int
++a5wifi_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++
++	grp = lck_grp_alloc_init("a5xelte-wifi", LCK_GRP_ATTR_NULL);
++	a5wifi.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "a5xelte-wifi";
++	init.uniqueid_len = sizeof("a5xelte-wifi") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = a5wifi_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = a5wifi_if_ioctl;
++	init.detach = a5wifi_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &a5wifi.ifp) != 0) {
++		printf("A5XELTE WIFI: ifnet_allocate failed\n");
++		a5wifi.ifp = NULL;
++		return ENOMEM;
++	}
++	ifnet_set_addrlen(a5wifi.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(a5wifi.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(a5wifi.ifp, ETHERMTU);
++	ifnet_set_flags(a5wifi.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST,
++	    0xffff);
++	if (ifnet_attach(a5wifi.ifp, NULL) != 0) {
++		printf("A5XELTE WIFI: ifnet_attach failed\n");
++		a5wifi.ifp = NULL;
++		return ENXIO;
++	}
++	a5wifi.attached = true;
++	printf("A5XELTE WIFI: %s attached (radio STUBBED; no wlan service)\n",
++	    a5wifi_name);
++	return 0;
++}
++
++/* ---- public entry point --------------------------------------------------- */
++
++void
++a5xelte_wifi_probe(void)
++{
++	int enabled = 0;
++
++	/* The whole glue is opt-in: a default boot gets no phantom interface. */
++	(void)PE_parse_boot_argn("a8wifi", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("A5XELTE WIFI: glue off (a8wifi=0)\n");
++		return;
++	}
++	if (a5wifi_if_create() == 0) {
++		/* Announce the initial state so anything watching sees the iface. */
++		a5wifi_post_event(APPLE80211_M_POWER_CHANGED, NULL, 0);
++	}
++}
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++void
++a5xelte_wifi_probe(void)
++{
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 8438685..d4f573f 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -74,6 +74,7 @@ extern void a5xelte_panel_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void a5xelte_usb_probe(void);
+ extern void a5xelte_scsc_probe(void);
++extern void a5xelte_wifi_probe(void);
+ #if defined(JACKPOTLTE)
+ extern void jackpotlte_pmic_probe(void);
+ #endif
+@@ -791,6 +792,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	 * default; full bring-up only with the "a8wifi" boot argument
+ 	 * (bsd/dev/a5xelte_scsc.c). */
+ 	a5xelte_scsc_probe();
++	/* Galaxy A8 2018: Apple80211 glue (en0 + SIOCS/GA80211), off unless
++	 * "a8wifi" is 1 (bsd/dev/a5xelte_wifi.c). */
++	a5xelte_wifi_probe();
+ #endif
+ 	{
+ 	uint32_t emmcprobe = 0;

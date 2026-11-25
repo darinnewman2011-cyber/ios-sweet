@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -204,6 +204,13 @@
+ 	accelerator->release();
+ }
+ 
++/*
++ * Panel-present instrumentation (see present()).  File scope, and declared
++ * before AppleCLCD::start, which reads the boot arg and logs the mode.
++ */
++static uint32_t sweet_fb_presents_logged;
++static uint32_t sweet_fb_no_present;
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -268,6 +275,10 @@
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fMinGap = 26000000ULL / (hz == 0 ? 60 : hz);     /* 26 MHz timebase */
++	uint32_t nopresent = 0;
++	if (PE_parse_boot_argn("a5fb_nopresent", &nopresent, sizeof(nopresent))) {
++		sweet_fb_no_present = nopresent;
++	}
+ 	fPresentLock = IOLockAlloc();
+ 	if (fPresentLock == NULL) {
+ 		return false;
+@@ -281,6 +292,8 @@
+ 	sweet_accelerator_publish(provider);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: present copy %s (a5fb_nopresent)\n",
++	    sweet_fb_no_present ? "off: the console owns the panel" : "on");
+ 	return true;
+ }
+ 
+@@ -516,10 +529,43 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			/*
++			 * JT: prove what the panel is asked to show. This copy
++			 * writes over the kernel console in the panel memory,
++			 * so a frame with no lit pixels explains a screen that
++			 * goes black once the GUI presents. Sample on a coarse
++			 * grid: cheap and enough to tell black from content.
++			 * a5fb_nopresent=1 keeps the console on the panel
++			 * instead (the log still reports what was abandoned).
++			 */
++			if (sweet_fb_presents_logged < 32) {
++				const uint8_t *base = (const uint8_t *)src + s->offset;
++				uint32_t lit = 0, tot = 0, centre = 0;
++				for (int32_t yy = 0; yy < h; yy += 32) {
++					for (int32_t xx = 0; xx < w; xx += 32) {
++						uint32_t px = *(const volatile uint32_t *)(base +
++						    (uint64_t)(sy + yy) * s->bytesPerRow +
++						    (uint64_t)(sx + xx) * 4);
++						if ((px & 0x00ffffffu) != 0) {
++							lit++;
++						}
++						tot++;
++					}
++				}
++				centre = *(const volatile uint32_t *)(base +
++				    (uint64_t)(sy + h / 2) * s->bytesPerRow +
++				    (uint64_t)(sx + w / 2) * 4);
++				sweet_fb_presents_logged++;
++				IOLog("JTFB present %u: layer %u surface %u %ux%u dst %d,%d %dx%d centre %08x lit %u/%u\n",
++				    get32(rec, 0x50), layer, id, (uint32_t)s->width, (uint32_t)s->height,
++				    dx, dy, w, h, centre, lit, tot);
++			}
++			if (!sweet_fb_no_present) {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
+ 			}
+ 		}
+ 		s->release();

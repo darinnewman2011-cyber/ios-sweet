@@ -1,0 +1,188 @@
+diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
+--- a/bsd/dev/jackpotlte_pmic.c
++++ b/bsd/dev/jackpotlte_pmic.c
+@@ -40,6 +40,12 @@
+  *   i2c_1 @ 0x13840000 = "I2C_TSP",       irq 249 (lines 1020-1032);
+  * both "samsung,s3c2440-i2c".  The I2C0/I2C1 gates are HWACG
+  * (clk-exynos7885.c:152-153), so register access enables the clock.
++ *
++ * The SoC label on i2c_1 is stale: the jackpotlte board puts the s2mu004 MFD
++ * @0x3D on it (exynos7885-jackpotlte_common.dtsi:1100-1110) and the real
++ * touchscreen on i2c_4 @0x13870000 (same file:621-650), NFC on i2c_2.  These
++ * two buses are therefore not shared with the touch path, and a BUSY bit that
++ * outlives a transfer is a latched START or a held line, not contention.
+  */
+ #define JT_I2C_FUELGAUGE_PA	0x13830000u
+ #define JT_I2C_CHARGER_PA	0x13840000u
+@@ -58,6 +64,17 @@
+ #define JT_IICSTAT_NACK		0x01u	/* last byte NACK (IICSTAT[0]) */
+ 
+ /*
++ * Divider and line control the transfer runs with: ACKEN + interrupt enable,
++ * prescaler 3, SDA hold 7 with the noise filter on.  These are the values
++ * s3c24xx_i2c_clockrate() programs for a bus like this one
++ * (i2c-s3c2410.c:1105-1131); they are constants here rather than a read-back
++ * because a controller that had to be reset (jp_reset_bus) may hold nothing
++ * useful.
++ */
++#define JT_IICCON_INIT		0xe3u
++#define JT_IICLC_INIT		7u
++
++/*
+  * 8-bit slave addresses (7-bit << 1):
+  *   fuel gauge s2mu004 @ 7-bit 0x3B
+  *     (battery_data_jackpotlte_common.dtsi:48-50, reg = <0x3B>);
+@@ -182,17 +199,81 @@
+ 	jp_write(i2c, JT_IICCON, jp_read(i2c, JT_IICCON) & ~JT_IICCON_IRQPEND);
+ }
+ 
++/*
++ * The two buses are the only S3C2440 controllers this file owns, so a BUSY bit
++ * that outlives a transfer is not contention.  State is kept per bus: a wedged
++ * controller must not stop the other one from being read, and a bus that
++ * refused to come back is not retried for the rest of the boot.
++ */
++static bool jp_chg_logged;
++static bool jp_chg_dead;
++static bool jp_fg_logged;
++static bool jp_fg_dead;
++
++static const char *
++jp_bus_name(vm_offset_t i2c)
++{
++	return (i2c == jp_chg) ? "charger" : "gauge";
++}
++
++/*
++ * Wait for the controller to clear START/STOP.  The shape follows the vendor
++ * driver: a few polls before the first delay, because a healthy transfer's
++ * STOP is already through the bus (s3c24xx_i2c_wait_idle,
++ * i2c-s3c2410.c:810-856), then exponential backoff up to 1 ms within the
++ * 400 ms budget s3c24xx_i2c_set_master() allows before it declares "cannot get
++ * bus" (i2c-s3c2410.c:789-807).
++ */
++static bool
++jp_wait_free(vm_offset_t i2c)
++{
++	for (unsigned n = 0; n < 3; n++) {
++		if (!(jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_BUSY)) {
++			return true;
++		}
++	}
++	for (unsigned usec = 1, waited = 0; waited < 400000; usec *= 2) {
++		if (usec > 1000) {
++			usec = 1000;
++		}
++		delay(usec);
++		waited += usec;
++		if (!(jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_BUSY)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Put a controller that will not leave BUSY back where the vendor driver starts
++ * every transfer: a STOP for whatever START is latched (master mode with the
++ * START/STOP bit clear -- the write s3c24xx_i2c_message_start() makes before
++ * the address), then the full re-init s3c24xx_i2c_init() does after "cannot get
++ * bus" (i2c-s3c2410.c:1196-1230).
++ *
++ * This is needed because S-Boot can hand the MUIC bus over mid-transfer and
++ * nothing else in this kernel resets that controller.  The latched START then
++ * outlives the boot, and the old pre-message check gave up on it before ever
++ * issuing a STOP, so no later poll could recover the bus.
++ */
+ static void
++jp_reset_bus(vm_offset_t i2c)
++{
++	jp_write(i2c, JT_IICSTAT, 0xd0u);	/* master Tx, START/STOP clear */
++	(void)jp_wait_free(i2c);
++	jp_write(i2c, JT_IICCON, 0u);
++	jp_write(i2c, JT_IICSTAT, 0u);
++	jp_write(i2c, JT_IICCON, JT_IICCON_INIT);
++	jp_write(i2c, JT_IICLC, JT_IICLC_INIT);
++}
++
++static bool
+ jp_stop(vm_offset_t i2c)
+ {
+ 	jp_write(i2c, JT_IICSTAT, jp_read(i2c, JT_IICSTAT) & ~JT_IICSTAT_BUSY);
+ 	jp_clear_irq(i2c);
+-	for (unsigned n = 0; n < 5000; n++) {
+-		if (!(jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_BUSY)) {
+-			break;
+-		}
+-		delay(1);
+-	}
++	return jp_wait_free(i2c);
+ }
+ 
+ static bool
+@@ -200,23 +281,43 @@
+     unsigned count)
+ {
+ 	const uint32_t mode = receive ? 0x90u : 0xd0u;
++	const bool is_chg = (i2c == jp_chg);
++	bool *logged = is_chg ? &jp_chg_logged : &jp_fg_logged;
++	bool *dead = is_chg ? &jp_chg_dead : &jp_fg_dead;
+ 	bool ok = false;
++
+ 	if (!count || count > 32) {
+ 		return false;
+ 	}
+-	for (unsigned n = 0; n < 5000; n++) {
+-		if (!(jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_BUSY)) {
+-			break;
++	if (*dead) {
++		/* Already reported once: re-paying the wait for every register of
++		 * a bus that will not come back only delays the rest of the poll. */
++		return false;
++	}
++	if (!jp_wait_free(i2c)) {
++		if (!*logged) {
++			/* The raw registers separate "reachable but latched" from
++			 * "clock or pads not there" (a dead block reads all ones). */
++			printf("JACKPOTLTE PMIC: %s bus stuck busy stat=%#x "
++			    "con=%#x lc=%#x (resetting)\n", jp_bus_name(i2c),
++			    (unsigned)jp_read(i2c, JT_IICSTAT),
++			    (unsigned)jp_read(i2c, JT_IICCON),
++			    (unsigned)jp_read(i2c, JT_IICLC));
++			*logged = true;
+ 		}
+-		if (n == 4999) {
+-			printf("JACKPOTLTE PMIC: I2C busy before message\n");
++		jp_reset_bus(i2c);
++		if (!jp_wait_free(i2c)) {
++			printf("JACKPOTLTE PMIC: %s bus will not clear after "
++			    "reset stat=%#x, giving up on it\n",
++			    jp_bus_name(i2c),
++			    (unsigned)jp_read(i2c, JT_IICSTAT));
++			*dead = true;
+ 			return false;
+ 		}
+-		delay(1);
+ 	}
+ 	/* Conservative divider, as in the proven A5 routine. */
+-	jp_write(i2c, JT_IICCON, 0xe3u);
+-	jp_write(i2c, JT_IICLC, 7u);
++	jp_write(i2c, JT_IICCON, JT_IICCON_INIT);
++	jp_write(i2c, JT_IICLC, JT_IICLC_INIT);
+ 	jp_write(i2c, JT_IICSTAT, mode);
+ 	jp_write(i2c, JT_IICDS, (uint32_t)(addr8 | (receive ? 1u : 0u)));
+ 	delay(1);
+@@ -256,7 +357,12 @@
+ 	}
+ 	ok = true;
+ out:
+-	jp_stop(i2c);
++	if (!jp_stop(i2c) && !ok && !*dead) {
++		printf("JACKPOTLTE PMIC: %s bus will not stop after a failed "
++		    "message stat=%#x, giving up on it\n", jp_bus_name(i2c),
++		    (unsigned)jp_read(i2c, JT_IICSTAT));
++		*dead = true;
++	}
+ 	return ok;
+ }
+ 

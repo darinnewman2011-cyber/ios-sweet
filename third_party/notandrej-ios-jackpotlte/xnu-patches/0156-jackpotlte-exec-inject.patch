@@ -1,0 +1,108 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,80 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++/*
++ * Bring-up aid: boot-arg jtexecinject names a library to insert into named
++ * programs at exec, so that dyld loads it into them.  The reference does this
++ * from its own init through sysctl kern.exec_inject; this port has no init of
++ * its own (Apple's launchd is process 1), so the list comes from the boot-arg
++ * instead -- a LaunchDaemon setting a sysctl would race backboardd's exec,
++ * which launchd starts in parallel with it.
++ *
++ * Value: LIBRARY[,NAME...][;LIBRARY[,NAME...]].  A group starts with the
++ * library and continues with the programs' file names (basenames); a program
++ * named by more than one group gets every one of those libraries, joined with
++ * ':' in the one DYLD_INSERT_LIBRARIES.  Fields and groups are separated by
++ * ',' and ';' rather than spaces because a boot-arg's value ends at the first
++ * space (pexpert/gen/bootargs.c, argstrcpy2()).
++ *
++ * launchd refuses to pass DYLD_ variables from a job description, which is
++ * why the kernel adds this one.
++ */
++static TUNABLE_STR(exec_inject_conf, 512, "jtexecinject", "");
++
++static bool
++exec_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	const char *p = exec_inject_conf;
++	const char *name;
++	size_t namelen, used;
++	bool any = false;
++
++	if (*p == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
++	while (*p != 0) {
++		const char *library;
++		size_t liblen;
++		bool matched = false;
++
++		while (*p == ',' || *p == ';') {
++			p++;
++		}
++		if (*p == 0) {
++			break;
++		}
++		library = p;
++		while (*p != 0 && *p != ',' && *p != ';') {
++			p++;
++		}
++		liblen = (size_t)(p - library);
++		while (*p == ',') {
++			const char *word = ++p;
++
++			while (*p != 0 && *p != ',' && *p != ';') {
++				p++;
++			}
++			if (!matched && (size_t)(p - word) == namelen && namelen != 0 &&
++			    liblen != 0 && strncmp(word, name, namelen) == 0) {
++				matched = true;
++			}
++		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = 0;
++			any = true;
++		}
++	}
++	return any;
++}
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5815,24 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++	{
++		char inject_env[512];
++
++		/* one more variable for the programs that get our library inside them */
++		if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;

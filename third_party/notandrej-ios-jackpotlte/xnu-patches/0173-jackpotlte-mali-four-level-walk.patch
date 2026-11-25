@@ -1,0 +1,223 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -326,8 +326,14 @@
+ #define JT_PTE_ADDRESS		0x0000fffffffff000ull
+ #define JT_FIRST_JOB_GPU	0x00100000ull
+ 
+-static uint64_t *jt_pt_top;
+-static uint64_t jt_pt_top_phys;
++/* Four levels, because that is what the walk we program does.  AS_TRANSCFG
++ * says ADRMODE_AARCH64_4K, and Mali walks level 0 (the table TRANSTAB names,
++ * indexed by the top address bits) down to level 3 (the 4 KB page).  The
++ * reference's three-level table covered the 35 bits its allocator hands out,
++ * but the GPU still starts one level above it, finds an empty entry there and
++ * reports a translation fault on a page the driver believes it mapped. */
++static uint64_t *jt_pt_pgd;		/* level 0: what TRANSTAB names */
++static uint64_t jt_pt_pgd_phys;
+ 
+ /* A zeroed page the GPU's own walk can read: its caches are not the
+  * processor's, so the page is flushed to memory (redwood_mali.c:441-456). */
+@@ -367,18 +373,20 @@
+ }
+ 
+ /* One 4 KB page of physical memory at GPU address `gpu`: the reference's
+- * map_page (redwood_mali.c:474-492).  Three levels cover the 35 address bits
+- * JT_GPU_ADDRESS_END bounds the allocator to; the tables are made as needed,
+- * so buffers need not sit in the low gigabyte. */
++ * map_page (redwood_mali.c:474-492), one level longer than it had.  The
++ * allocator hands out addresses below JT_GPU_ADDRESS_END (35 bits), so only
++ * index 0 of the top two levels is ever used and the tables stay small. */
+ static bool
+ jt_map_page(uint64_t gpu, uint64_t phys)
+ {
+-	uint64_t *middle, *bottom, *entry;
++	uint64_t *level1, *middle, *bottom, *entry;
+ 
+-	if (jt_pt_top == NULL && (jt_pt_top = jt_pt_page(&jt_pt_top_phys)) == NULL) {
++	if (jt_pt_pgd == NULL &&
++	    (jt_pt_pgd = jt_pt_page(&jt_pt_pgd_phys)) == NULL) {
+ 		return false;
+ 	}
+-	if ((middle = jt_pt_below(&jt_pt_top[(gpu >> 30) & 31])) == NULL ||
++	if ((level1 = jt_pt_below(&jt_pt_pgd[(gpu >> 39) & 511])) == NULL ||
++	    (middle = jt_pt_below(&level1[(gpu >> 30) & 511])) == NULL ||
+ 	    (bottom = jt_pt_below(&middle[(gpu >> 21) & 511])) == NULL) {
+ 		return false;
+ 	}
+@@ -397,10 +405,15 @@
+ {
+ 	uint64_t *table, entry;
+ 
+-	if (jt_pt_top == NULL) {
++	if (jt_pt_pgd == NULL) {
+ 		return 0;
+ 	}
+-	entry = jt_pt_top[(gpu >> 30) & 31];
++	entry = jt_pt_pgd[(gpu >> 39) & 511];
++	if (!(entry & 1)) {
++		return 0;
++	}
++	table = (uint64_t *)phystokv(entry & JT_PTE_ADDRESS);
++	entry = table[(gpu >> 30) & 511];
+ 	if (!(entry & 1)) {
+ 		return 0;
+ 	}
+@@ -419,10 +432,14 @@
+ {
+ 	uint64_t *entry;
+ 
+-	if (jt_pt_top == NULL) {
++	if (jt_pt_pgd == NULL) {
+ 		return;
+ 	}
+-	entry = &jt_pt_top[(gpu >> 30) & 31];
++	entry = &jt_pt_pgd[(gpu >> 39) & 511];
++	if (!(*entry & 1)) {
++		return;
++	}
++	entry = &((uint64_t *)phystokv(*entry & JT_PTE_ADDRESS))[(gpu >> 30) & 511];
+ 	if (!(*entry & 1)) {
+ 		return;
+ 	}
+@@ -531,13 +548,13 @@
+ 	if (jt_run_write_job(mali, page, kvtophys(page), shaders,
+ 	    "job 1, identity mode")) {
+ 		if (jt_map_page(JT_FIRST_JOB_GPU, kvtophys(page))) {
+-			jt_as0_update(mali, jt_pt_top_phys, transcfg_4k);
++			jt_as0_update(mali, jt_pt_pgd_phys, transcfg_4k);
+ 			(void)jt_run_write_job(mali, page, JT_FIRST_JOB_GPU,
+ 			    shaders, "job 2, GPU page tables");
+ 			/* The page goes back to the kernel: take its entry
+ 			 * out too, or the tables would map freed memory. */
+ 			jt_unmap_page(JT_FIRST_JOB_GPU);
+-			jt_as0_update(mali, jt_pt_top_phys, transcfg_4k);
++			jt_as0_update(mali, jt_pt_pgd_phys, transcfg_4k);
+ 		} else {
+ 			printf("JACKPOTLTE MALI: no memory for page tables\n");
+ 		}
+@@ -721,7 +738,7 @@
+ void
+ jackpotlte_mali_unmap(uint64_t gpu, uint64_t size)
+ {
+-	if (jt_pt_top == NULL) {
++	if (jt_pt_pgd == NULL) {
+ 		return;
+ 	}
+ 	lck_mtx_lock(&jt_mali_lock);
+@@ -732,7 +749,7 @@
+ 
+ 	lck_mtx_lock(&jt_job_lock);	/* an entry taken out: the TLB may hold it */
+ 	lck_mtx_lock(&jt_mali_lock);
+-	jt_as0_update(jt_gpu, jt_pt_top_phys, jt_as0_transcfg);
++	jt_as0_update(jt_gpu, jt_pt_pgd_phys, jt_as0_transcfg);
+ 	lck_mtx_unlock(&jt_mali_lock);
+ 	lck_mtx_unlock(&jt_job_lock);
+ }
+@@ -744,7 +761,7 @@
+ {
+ 	lck_mtx_lock(&jt_job_lock);
+ 	lck_mtx_lock(&jt_mali_lock);
+-	jt_as0_update(jt_gpu, jt_pt_top_phys, jt_as0_transcfg);
++	jt_as0_update(jt_gpu, jt_pt_pgd_phys, jt_as0_transcfg);
+ 	lck_mtx_unlock(&jt_mali_lock);
+ 	lck_mtx_unlock(&jt_job_lock);
+ }
+@@ -788,7 +805,7 @@
+ 		    jt_rd(jt_gpu, JT_MALI_MMU_INT_RAWSTAT),
+ 		    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS));
+ 		/* Where the walk stopped, and whether the chain we just gave
+-		 * the slot is in the tables at all: a permission fault at an
++		 * the slot is in the tables at all: a translation fault at an
+ 		 * address nothing maps says the driver's buffer never made it
+ 		 * into address space 0, not that the GPU is broken. */
+ 		{
+@@ -797,12 +814,36 @@
+ 			    JT_MALI_AS_FAULTADDR_HI) << 32) |
+ 			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_FAULTADDR_LO);
+ 			uint64_t page = jt_pt_lookup(bad & ~(uint64_t)(PAGE_SIZE - 1));
+-			/* AS_FAULTSTATUS: bits 0-3 say what went wrong, bits
+-			 * 9:8 the access (0 atomic, 1 read, 2 write, 3
+-			 * execute), bits 23:16 the unit that faulted. */
++			/* AS_FAULTSTATUS: bits 7:0 are one exception code, not
++			 * a flag per bit; bits 9:8 the access (0 atomic,
++			 * 1 execute, 2 read, 3 write); bits 31:16 the source
++			 * id.  The codes are the vendor's own numbering as
++			 * panfrost names them (drivers/gpu/drm/panfrost/
++			 * panfrost_device.h, enum drm_panfrost_exception_type):
++			 * 0xc0-0xc4 translation fault level 0-4, 0xc7 identity,
++			 * 0xc8-0xcb permission level 0-3, 0xd0-0xd3 the walk's
++			 * own bus error, 0xd8-0xdb access flag, 0xe0-0xe7
++			 * address size, 0xe8-0xef memory attribute. */
+ 			static const char *const acc[] = {
+-				"atomic", "read", "write", "execute"
++				"atomic", "execute", "read", "write"
+ 			};
++			const char *what;
++
++			switch (fs & 0xf8u) {
++			case 0xc0: what = "translation fault"; break;
++			case 0xc8: what = "permission fault"; break;
++			case 0xd0: what = "transtab bus fault"; break;
++			case 0xd8: what = "access flag fault"; break;
++			default:
++				switch (fs & 0xf0u) {
++				case 0xe0: what = "address size fault"; break;
++				case 0xe8: what = "memory attribute fault"; break;
++				default: what = "fault"; break;
++				}
++			}
++			if ((fs & 0xffu) == 0xc7u) {
++				what = "translation fault, identity mode";
++			}
+ 
+ 			/* The faulting page against the same tables jt_map_page
+ 			 * fills.  An address the walk could not find means our
+@@ -810,15 +851,12 @@
+ 			 * that is there says the tables disagree with what the
+ 			 * GPU read (geometry or permission bits), which is a
+ 			 * different bug in a different place. */
+-			printf("JACKPOTLTE MALI: fault %#llx (%s%s%s%s, %s), "
+-			    "source %u, page %#llx %s, chain %#llx %s\n",
++			printf("JACKPOTLTE MALI: fault %#llx (%s %#x, %s), "
++			    "source %#x, page %#llx %s, chain %#llx %s\n",
+ 			    (unsigned long long)bad,
+-			    (fs & 1u) ? "translation " : "",
+-			    (fs & 2u) ? "permission " : "",
+-			    (fs & 4u) ? "transtab-bus " : "",
+-			    (fs & 8u) ? "access-flag " : "",
++			    what, fs & 0xffu,
+ 			    acc[(fs >> 8) & 3u],
+-			    (fs >> 16) & 0xffu,
++			    fs >> 16,
+ 			    (unsigned long long)page, page ? "mapped" : "NOT MAPPED",
+ 			    (unsigned long long)chain,
+ 			    jt_pt_lookup(chain) ? "mapped" : "NOT MAPPED");
+@@ -844,7 +882,7 @@
+ 		jt_wr(jt_gpu, JT_MALI_SHADER_PWRON, jt_shader_mask);
+ 		(void)jt_wait_reg(JT_MALI_SHADER_READY, jt_shader_mask,
+ 		    jt_shader_mask, 50);
+-		jt_as0_update(jt_gpu, jt_pt_top_phys, jt_as0_transcfg);
++		jt_as0_update(jt_gpu, jt_pt_pgd_phys, jt_as0_transcfg);
+ 		jt_wr(jt_gpu, JT_MALI_MMU_INT_CLEAR, 0xffffffffu);
+ 	}
+ 	jt_wr(jt_gpu, JT_MALI_JOB_INT_CLEAR,
+@@ -975,14 +1013,14 @@
+ 	jt_gpu_id = jt_rd(mali, JT_MALI_GPU_ID);
+ 	jt_shader_mask = jt_rd(mali, JT_MALI_SHADER_PRESENT);
+ 	jt_as0_transcfg = transcfg;
+-	if (jt_pt_top == NULL) {
+-		jt_pt_top = jt_pt_page(&jt_pt_top_phys);
++	if (jt_pt_pgd == NULL) {
++		jt_pt_pgd = jt_pt_page(&jt_pt_pgd_phys);
+ 	}
+-	if (jt_pt_top == NULL) {
++	if (jt_pt_pgd == NULL) {
+ 		printf("JACKPOTLTE MALI: no page for the top table, engine down\n");
+ 		return;
+ 	}
+-	jt_as0_update(mali, jt_pt_top_phys, transcfg);
++	jt_as0_update(mali, jt_pt_pgd_phys, transcfg);
+ 	jt_engine_up = true;
+ 	printf("JACKPOTLTE MALI: engine up, addresses from %#llx, "
+ 	    "transcfg=%#x shaders=%#x\n",

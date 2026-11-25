@@ -1,0 +1,604 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 649b3c4..1ec5dfd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
++bsd/dev/a5xelte_panel.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/jackpotlte_pmic.c		standard
+diff --git a/bsd/dev/a5xelte_panel.c b/bsd/dev/a5xelte_panel.c
+new file mode 100644
+index 0000000..7a3d6a1
+--- /dev/null
++++ b/bsd/dev/a5xelte_panel.c
+@@ -0,0 +1,566 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos 7885) panel / DSIM bring-up.
++ *
++ * The display already works before this driver runs: S-Boot initialises DSIM,
++ * the MIPI D-PHY and the s6e3fa7 panel, and the shim re-arms the DECON hardware
++ * trigger (0x1281 -> 0x14860070) so DECON keeps scanning the handover buffer at
++ * 0xec000000. This file therefore does NOT touch DECON and, by default, only
++ * reads and prints display-IP state. The active DSIM/PHY/panel bring-up is
++ * opt-in (boot-arg a5panel=1) and, exactly like the vendor driver, skips the
++ * whole link init when the DSIM PLL is already locked by the bootloader
++ * (Eureka-Kernel dpu_7885/dsim_drv.c:826-832, dsim_reg.c:1304-1316).
++ *
++ * Register maps and every constant below are taken from the Samsung 4.4 tree
++ * (Eureka-Kernel, "Release R24U sources"); the citations are file:line there.
++ * No PMIC/LDO/regulator is written: the panel rails (gpg2-7 ldo_3p0, gpg2-6
++ * vddr_en) are enabled by the bootloader and are only reported here.
++ *
++ *   DSIM     0x14870000  exynos7885.dtsi:1311-1313 (reg size 0x100)
++ *   D-PHY    0x11c80678  exynos7885.dtsi:1299-1309 (PMU isolation = 0x678)
++ *   pinctrl 0x139b0000   exynos7885.dtsi:631-633 (TOP; gpg1/gpg2)
++ *   panel   s6e3fa7      exynos7885-display-lcd.dtsi:173-193
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* ------------------------------------------------------------------ */
++/* Addresses                                                          */
++/* ------------------------------------------------------------------ */
++
++/* Pinctrl TOP, exynos7885.dtsi:631-633. */
++#define A5P_TOP_BASE		0x139b0000UL
++/* gpg1/gpg2 bank offsets: pinctrl-exynos.c:1742-1743; bank_type_6 reg
++ * offsets con/dat/pud 0x00/0x04/0x08: pinctrl-exynos.c:72-75. */
++#define A5P_GPG1		0x140U
++#define A5P_GPG2		0x160U
++/* decon_board pins, exynos7885-jackpotlte_common.dtsi:922-924:
++ *   gpio_ldo_3p0 = <&gpg2 7>, gpio_vddr_en = <&gpg2 6>,
++ *   gpio_lcd_rst = <&gpg1 7>.  FUNC_OUTPUT = 0x1: pinctrl-samsung.h:30. */
++#define A5P_FUNC_OUTPUT		0x1U
++#define A5P_LCD_RST_BIT		7U	/* gpg1-7  */
++#define A5P_LDO_3P0_BIT		7U	/* gpg2-7  */
++#define A5P_VDDR_EN_BIT		6U	/* gpg2-6  */
++
++/* DSIM, exynos7885.dtsi:1311-1313. */
++#define A5P_DSIM_BASE		0x14870000UL
++
++/* PMU syscon (exynos7885.dtsi:99 pmu_base = <0x11C80000>) with the D-PHY
++ * isolation bit at +0x678 (isolation = <0x678>, exynos7885.dtsi:1302;
++ * release path dsim_drv.c:746 / phy-exynos-mipi.c:70 EXYNOS_MIPI_PHY_ISO_BYPASS
++ * = BIT(0)). This is PHY isolation control, not a power rail. */
++#define A5P_PMU_BASE		0x11c80000UL
++#define A5P_PHY_ISO_OFF		0x678U
++#define A5P_PHY_ISO_BYPASS	0x1U
++
++/* DECON_F hardware trigger (board.h JT_DECON_BASE/TRIG_OFF;
++ * regs-decon.h HW_SW_TRIG_CONTROL). */
++#define A5P_DECON_BASE		0x14860000UL
++#define A5P_DECON_TRIG_OFF	0x0070U
++
++/* ------------------------------------------------------------------ */
++/* DSIM registers, dpu_7885/regs-dsim.h                               */
++/* ------------------------------------------------------------------ */
++#define DSIM_SWRST		0x04U
++#define  DSIM_DPHY_RST		0x00010000U	/* (1 << 16)   */
++#define  DSIM_SWRST_RESET	0x00000001U	/* (1 << 0)    */
++#define DSIM_LINK_STATUS2	0x10U
++#define DSIM_LINK_STATUS3	0x14U
++#define  DSIM_PLL_STABLE	0x00000001U
++#define DSIM_CLK_CTRL		0x20U
++#define  DSIM_NONCONT_CLK	0x02000000U	/* (1 << 25)   */
++#define  DSIM_TX_REQUEST_HSCLK	0x00100000U	/* (1 << 20)   */
++#define  DSIM_WORDCLK_EN	0x00020000U	/* (1 << 17)   */
++#define  DSIM_ESCCLK_EN		0x00010000U	/* (1 << 16)   */
++#define  DSIM_ESC_PRESCALER_MASK 0x000000ffU
++#define  DSIM_LANE_ESCCLK_MASK	0x00001f00U	/* (0x1f << 8) */
++#define DSIM_TIMEOUT		0x28U
++#define DSIM_ESCMODE		0x2cU
++#define  DSIM_STOP_STATE_CNT(v)	(((v) & 0x7ff) << 21)
++#define DSIM_UNDERRUN_CTRL	0x34U
++#define DSIM_THRESHOLD		0x38U
++#define DSIM_RESOL		0x3cU
++#define  DSIM_VRESOL(v)		(((v) & 0x1fff) << 16)
++#define  DSIM_HRESOL(v)		((v) & 0x1fff)
++#define DSIM_CONFIG		0x4cU
++#define  DSIM_CPRS_EN		0x00080000U	/* (1 << 19)   */
++#define  DSIM_VIDEO_MODE	0x00040000U	/* (1 << 18)   */
++#define  DSIM_EOTP_EN		0x00000080U	/* (1 << 7)    */
++#define  DSIM_NUM_LANE_MASK	0x00000060U	/* (0x3 << 5)  */
++#define  DSIM_LANES_EN_MASK	0x0000001fU
++#define DSIM_INTSRC		0x50U
++#define  DSIM_INTSRC_PLL_STABLE	0x80000000U	/* (1 << 31)   */
++#define DSIM_PKTHDR		0x58U
++#define  DSIM_PKTHDR_MASK	0x01ffffffU
++#define DSIM_PAYLOAD		0x5cU
++#define DSIM_SFR_CTRL		0x64U
++#define  DSIM_SHADOW_REG_READ_EN 0x2U
++#define  DSIM_SHADOW_EN		0x1U
++#define DSIM_FIFOCTRL		0x68U
++#define  DSIM_FIFO_EMPTY_PH_SFR	0x00000400U	/* (1 << 10)   */
++#define DSIM_CMD_CONFIG		0x80U
++#define  DSIM_PKT_GO_EN		0x00010000U	/* (1 << 16)   */
++#define DSIM_CMD_TE_CTRL0	0x84U
++#define DSIM_CMD_TE_CTRL1	0x88U
++#define DSIM_CSIS_LB		0x9cU
++#define  DSIM_1BYTEPPI_MODE	0x00000200U	/* (1 << 9)    */
++#define DSIM_PLLCTRL		0xa0U
++#define  DSIM_PLL_EN		0x00800000U	/* (1 << 23)   */
++#define  DSIM_PLL_PMS_MASK	0x0007ffffU
++#define DSIM_PLL_CTRL1		0xa4U
++#define DSIM_PLL_CTRL2		0xa8U
++#define DSIM_PLLTMR		0xacU
++#define DSIM_PHYCTRL_B1		0xb0U
++#define DSIM_PHYCTRL_B2		0xb4U
++#define DSIM_PHYCTRL_M1		0xc0U
++#define DSIM_PHYCTRL_M2		0xc4U
++#define DSIM_PHY_TIMING		0xd0U
++#define DSIM_PHY_TIMING1	0xd4U
++#define DSIM_PHY_TIMING2	0xd8U
++
++/* DSIM lane mask, dsim.h:95-99. */
++#define DSIM_LANE_MASK_4	0x1fU	/* clock + 4 data lanes */
++
++/* ------------------------------------------------------------------ */
++/* s6e3fa7 panel, exynos7885-display-lcd.dtsi:173-193                 */
++/* ------------------------------------------------------------------ */
++#define A5P_PANEL_HRESOL	1080U
++#define A5P_PANEL_VRESOL	2220U
++#define A5P_PANEL_LANES		4U
++/* timing,pms = <3 230 1> -> hs = m*26/(p*2^s) = 996 MHz (dsim_reg.c:1371);
++ * timing,dsi-escape-clk = 16; cmd_underrun_lp_ref = 2498. */
++#define A5P_PLL_P		3U
++#define A5P_PLL_M		230U
++#define A5P_PLL_S		1U
++#define A5P_ESC_CLK_REQ		16U
++#define A5P_CM_UNDERRUN		2498U
++/* DPHY timing, dsim_reg.c:95 (row bps = 1000): index = (1500 - hs)/10. */
++#define A5P_DPHY_CLK_PREPARE	8U
++#define A5P_DPHY_CLK_ZERO	43U
++#define A5P_DPHY_CLK_POST	13U
++#define A5P_DPHY_CLK_TRAIL	9U
++#define A5P_DPHY_HSA_PREPARE	9U
++#define A5P_DPHY_HS_ZERO	15U
++#define A5P_DPHY_HS_TRAIL	12U
++#define A5P_DPHY_LPX		7U
++#define A5P_DPHY_HS_EXIT	12U
++/* b_dphyctl[esc_clk - 7], dsim_reg.c:158-162; esc_div adjusted to 8 so the
++ * escape clock resolves to 15 MHz (dsim_reg.c:1388-1394) -> b_dphyctl[8]. */
++#define A5P_DPHY_B_CTRL		0x177U
++/* DSIM_PHY_CHARIC_VAL[0][M_PLL_CTRL1], dsim_reg.c:31-37 (dsim_0 uses row 0). */
++#define A5P_M_PLL_CTRL1		0x40000000U
++
++/* DSI data types, include/video/mipi_display.h:36-48. */
++#define DSI_DCS_SHORT_WRITE	0x05U
++#define DSI_DCS_SHORT_WRITE_1	0x15U
++#define DSI_DCS_LONG_WRITE	0x39U
++
++/* ------------------------------------------------------------------ */
++/* s6e3fa7 minimal init sequence, panels/s6e3fa7_jackpot_param.h      */
++/* ------------------------------------------------------------------ */
++static const unsigned char seq_sleep_out[] = { 0x11 };
++static const unsigned char seq_test_key_on[] = { 0xF0, 0x5A, 0x5A };
++static const unsigned char seq_partial_setting[] = {
++	0xC4, 0x5B, 0x41, 0x56, 0x0E, 0x00, 0x6F, 0x5A, 0x6F, 0x6F
++};
++static const unsigned char seq_pcd_set_det_low[] = { 0xCC, 0xFC };
++static const unsigned char seq_err_fg_setting[] = { 0xED, 0x4C, 0x44 };
++static const unsigned char seq_tsp_sync[] = {
++	0xB9, 0x00, 0x00, 0x14, 0x00, 0x18, 0x00, 0x00,
++	0x00, 0x00, 0x11, 0x01, 0x02, 0x40, 0x02, 0x40
++};
++static const unsigned char seq_ffc_setting[] = {
++	0xC5, 0x09, 0x10, 0xC8, 0x21, 0x55, 0x11, 0x3A, 0x3E
++};
++static const unsigned char seq_self_mask_sel[] = { 0x75, 0x10 };
++static const unsigned char seq_self_mask_image[] = {
++	0xC0, 0x24, 0x41, 0xE3, 0x41, 0xB6, 0x41, 0x8B,
++	0x41, 0x69, 0x41, 0x48, 0x41, 0x34, 0x41, 0x1F,
++	0x42, 0x10, 0x41, 0x04, 0x83, 0xDC, 0x41, 0x04,
++	0x42, 0x10, 0x41, 0x1F, 0x41, 0x34, 0x41, 0x48,
++	0x41, 0x69, 0x41, 0x8B, 0x41, 0xB6, 0x41, 0xE3,
++	0x41, 0x48, 0x41, 0x69, 0x41, 0x8B, 0x41, 0xB6,
++	0x41, 0xE3, 0xC0, 0x24, 0x00, 0x00, 0x00, 0x00
++};
++static const unsigned char seq_self_mask_on[] = {
++	0x7A, 0x01, 0x00, 0x00, 0x00, 0x3B, 0x08, 0x70,
++	0x08, 0xAB, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++static const unsigned char seq_test_key_off[] = { 0xF0, 0xA5, 0xA5 };
++/* Panel brightness (DCS 0x51, 1 param). Not a hardware address: a bring-up
++ * level so the panel is visible; the calibrated value is a follow-up. */
++static const unsigned char seq_brightness[] = { 0x51, 0x80 };
++static const unsigned char seq_te_on[] = { 0x35, 0x00, 0x00 };
++static const unsigned char seq_display_on[] = { 0x29 };
++
++/* ------------------------------------------------------------------ */
++/* MMIO helpers                                                       */
++/* ------------------------------------------------------------------ */
++static vm_offset_t a5p_dsim;
++static vm_offset_t a5p_top;
++static vm_offset_t a5p_pmu;
++static vm_offset_t a5p_decon;
++static uint32_t a5p_hs_clk;	/* resolved HS clock, MHz */
++static bool a5p_started;
++
++static uint32_t
++a5p_read(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++a5p_write(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++static void
++a5p_mask(vm_offset_t base, uint32_t off, uint32_t val, uint32_t mask)
++{
++	a5p_write(base, off, (a5p_read(base, off) & ~mask) | (val & mask));
++}
++
++/* Bounded poll so a missing/wedged block cannot hang the boot. */
++static bool
++a5p_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want,
++    unsigned int tries)
++{
++	while (tries--) {
++		if ((a5p_read(base, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/* ------------------------------------------------------------------ */
++/* GPIO / pinctrl                                                     */
++/* ------------------------------------------------------------------ */
++
++/* Drive a TOP pin as GPIO output (FUNC_OUTPUT = 0x1, 4-bit field). */
++static void
++a5p_gpio_output(uint32_t bank, uint32_t pin)
++{
++	uint32_t shift = (pin % 8) * 4;
++
++	/* bank_type_6 CON field is 4 bits wide per pin. */
++	a5p_mask(a5p_top, bank + 0x00, A5P_FUNC_OUTPUT << shift, 0xfu << shift);
++}
++
++static void
++a5p_gpio_set(uint32_t bank, uint32_t pin, int high)
++{
++	uint32_t bit = 1U << pin;
++
++	if (high) {
++		a5p_write(a5p_top, bank + 0x04, a5p_read(a5p_top, bank + 0x04) | bit);
++	} else {
++		a5p_write(a5p_top, bank + 0x04, a5p_read(a5p_top, bank + 0x04) & ~bit);
++	}
++}
++
++static int
++a5p_gpio_get(uint32_t bank, uint32_t pin)
++{
++	return (a5p_read(a5p_top, bank + 0x04) >> pin) & 1U;
++}
++
++/* ------------------------------------------------------------------ */
++/* DSI command transfer, dsim_drv.c:307-362 + dsim_reg.c:924-935      */
++/* ------------------------------------------------------------------ */
++static void
++a5p_dsi_write(const unsigned char *cmd, unsigned int len)
++{
++	uint32_t id, d0, d1, i, payload, cnt = 2000;
++
++	if (len == 1) {
++		id = DSI_DCS_SHORT_WRITE;
++		d0 = cmd[0];
++		d1 = 0;
++	} else if (len == 2) {
++		id = DSI_DCS_SHORT_WRITE_1;
++		d0 = cmd[0];
++		d1 = cmd[1];
++	} else {
++		id = DSI_DCS_LONG_WRITE;
++		d0 = len & 0xff;
++		d1 = (len >> 8) & 0xff;
++		for (i = 0; i < len; i += 4) {
++			payload = cmd[i];
++			if (i + 1 < len) payload |= (uint32_t)cmd[i + 1] << 8;
++			if (i + 2 < len) payload |= (uint32_t)cmd[i + 2] << 16;
++			if (i + 3 < len) payload |= (uint32_t)cmd[i + 3] << 24;
++			a5p_write(a5p_dsim, DSIM_PAYLOAD, payload);
++		}
++	}
++	/* Blocking command transfer: packet-go on, header, packet-go off. */
++	a5p_mask(a5p_dsim, DSIM_CMD_CONFIG, DSIM_PKT_GO_EN, DSIM_PKT_GO_EN);
++	a5p_mask(a5p_dsim, DSIM_PKTHDR,
++	    (d0 << 8) | (d1 << 16) | id, DSIM_PKTHDR_MASK);
++	a5p_mask(a5p_dsim, DSIM_CMD_CONFIG, 0, DSIM_PKT_GO_EN);
++	/* Wait for the packet header FIFO to drain (dsim_drv.c:140-147). */
++	while (cnt-- && !(a5p_read(a5p_dsim, DSIM_FIFOCTRL) & DSIM_FIFO_EMPTY_PH_SFR)) {
++		delay(10);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Panel power/reset                                                  */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Panel rails are the decon_board gpios gpg2-7 (ldo_3p0) and gpg2-6
++ * (vddr_en), enabled by the "dsim_set_panel_power_enable" list
++ * (exynos7885-jackpotlte_common.dtsi:927-934). S-Boot has already run that
++ * list — the panel is on before XNU starts — so this driver only reports the
++ * state. Enabling/reconfiguring a rail is the power (PMIC) agent's job.
++ */
++static void
++a5p_report_rails(void)
++{
++	printf("A5XELTE PANEL: rails: gpg2-%u (ldo_3p0) dat=%d "
++	    "gpg2-%u (vddr_en) dat=%d (S-Boot owned, not written)\n",
++	    A5P_LDO_3P0_BIT, a5p_gpio_get(A5P_GPG2, A5P_LDO_3P0_BIT),
++	    A5P_VDDR_EN_BIT, a5p_gpio_get(A5P_GPG2, A5P_VDDR_EN_BIT));
++}
++
++/*
++ * "dsim_reset_panel" list, exynos7885-jackpotlte_common.dtsi:942-950:
++ *   usleep 1000, lcd_rst high, usleep 5000, lcd_rst low, usleep 5000,
++ *   lcd_rst high, usleep 10000.
++ */
++static void
++a5p_reset_panel(void)
++{
++	a5p_gpio_output(A5P_GPG1, A5P_LCD_RST_BIT);
++	delay(1000);
++	a5p_gpio_set(A5P_GPG1, A5P_LCD_RST_BIT, 1);
++	delay(5000);
++	a5p_gpio_set(A5P_GPG1, A5P_LCD_RST_BIT, 0);
++	delay(5000);
++	a5p_gpio_set(A5P_GPG1, A5P_LCD_RST_BIT, 1);
++	delay(10000);
++}
++
++/* ------------------------------------------------------------------ */
++/* DSIM / D-PHY link init, dsim_drv.c:834-866 + dsim_reg.c            */
++/* ------------------------------------------------------------------ */
++static bool
++a5p_dsim_link_init(void)
++{
++	uint32_t hs_clk, byte_clk, esc_div, esc_clk, i;
++
++	/* Release D-PHY isolation (PMU + 0x678 bit 0), dsim_drv.c:746. */
++	a5p_mask(a5p_pmu, A5P_PHY_ISO_OFF, A5P_PHY_ISO_BYPASS, A5P_PHY_ISO_BYPASS);
++
++	/* D-PHY reset (active low then release), dsim_reg.c:192-196. */
++	a5p_mask(a5p_dsim, DSIM_SWRST, 0, DSIM_DPHY_RST);
++	a5p_mask(a5p_dsim, DSIM_SWRST, DSIM_DPHY_RST, DSIM_DPHY_RST);
++
++	/* DSIM software reset, dsim_reg.c:175-190. */
++	a5p_mask(a5p_dsim, DSIM_SWRST, DSIM_SWRST_RESET, DSIM_SWRST_RESET);
++	(void)a5p_poll(a5p_dsim, DSIM_SWRST, DSIM_SWRST_RESET, 0, 1000);
++
++	/* Clocks: hs = m*26/(p*2^s), byte = hs/8, esc = byte/esc_div
++	 * (dsim_reg.c:1341-1401). */
++	hs_clk = (A5P_PLL_M * 26U) / (A5P_PLL_P * (1U << A5P_PLL_S));
++	byte_clk = hs_clk / 8U;
++	esc_div = byte_clk / A5P_ESC_CLK_REQ;
++	if (esc_div == 0) {
++		esc_div = 1;
++	}
++	if ((byte_clk / esc_div) > A5P_ESC_CLK_REQ) {
++		esc_div++;
++	}
++	esc_clk = byte_clk / esc_div;
++	a5p_hs_clk = hs_clk;
++	printf("A5XELTE PANEL: hs=%u byte=%u esc=%u div=%u\n",
++	    hs_clk, byte_clk, esc_clk, esc_div);
++
++	a5p_mask(a5p_dsim, DSIM_CLK_CTRL, DSIM_ESCCLK_EN |
++	    (esc_div & DSIM_ESC_PRESCALER_MASK),
++	    DSIM_ESCCLK_EN | DSIM_ESC_PRESCALER_MASK);
++
++	/* D-PHY timing values, dsim_reg.c:303-324 + table row bps=1000. */
++	a5p_write(a5p_dsim, DSIM_PHY_TIMING,
++	    (A5P_DPHY_LPX << 8) | A5P_DPHY_HS_EXIT);
++	a5p_write(a5p_dsim, DSIM_PHY_TIMING1,
++	    (A5P_DPHY_CLK_PREPARE << 24) | (A5P_DPHY_CLK_ZERO << 16) |
++	    (A5P_DPHY_CLK_POST << 8) | A5P_DPHY_CLK_TRAIL);
++	a5p_write(a5p_dsim, DSIM_PHY_TIMING2,
++	    (A5P_DPHY_HSA_PREPARE << 16) | (A5P_DPHY_HS_ZERO << 8) |
++	    A5P_DPHY_HS_TRAIL);
++	a5p_write(a5p_dsim, DSIM_PHYCTRL_B1, A5P_DPHY_B_CTRL);
++	a5p_write(a5p_dsim, DSIM_PHYCTRL_B2, 0);
++	a5p_write(a5p_dsim, DSIM_PLL_CTRL1, A5P_M_PLL_CTRL1);
++	a5p_write(a5p_dsim, DSIM_PLL_CTRL2, 0);
++	a5p_write(a5p_dsim, DSIM_PHYCTRL_M1, 0);
++	a5p_write(a5p_dsim, DSIM_PHYCTRL_M2, 0);
++
++	/* PLL PMS + stable time + enable/poll, dsim_reg.c:251-261, 354-376. */
++	a5p_mask(a5p_dsim, DSIM_PLLCTRL,
++	    ((A5P_PLL_P & 0x3f) << 13) | ((A5P_PLL_M & 0x3ff) << 3) |
++	    (A5P_PLL_S & 0x7), DSIM_PLL_PMS_MASK);
++	a5p_write(a5p_dsim, DSIM_PLLTMR, 0x15f90);	/* dsim_reg.c:19 */
++	a5p_write(a5p_dsim, DSIM_INTSRC, DSIM_INTSRC_PLL_STABLE);
++	a5p_mask(a5p_dsim, DSIM_PLLCTRL, DSIM_PLL_EN, DSIM_PLL_EN);
++	if (!a5p_poll(a5p_dsim, DSIM_LINK_STATUS3, DSIM_PLL_STABLE,
++	    DSIM_PLL_STABLE, 1000)) {
++		printf("A5XELTE PANEL: D-PHY PLL did not lock\n");
++		return false;
++	}
++
++	/* Enable lanes (clock + 4 data), escape clock on lane, word clock. */
++	a5p_mask(a5p_dsim, DSIM_CONFIG, DSIM_LANE_MASK_4, DSIM_LANES_EN_MASK);
++	delay(400);					/* dsim_reg.c:1430 */
++	i = ((DSIM_LANE_MASK_4 >> 1) | (1U << 4)) << 8;	/* dsim_reg.c:391 */
++	a5p_mask(a5p_dsim, DSIM_CLK_CTRL, i, DSIM_LANE_ESCCLK_MASK);
++	a5p_mask(a5p_dsim, DSIM_CLK_CTRL, DSIM_WORDCLK_EN, DSIM_WORDCLK_EN);
++	return true;
++}
++
++/* dsim_reg.c:1198-1291 for DECON_MIPI_COMMAND_MODE (mode 2). */
++static void
++a5p_dsim_config(void)
++{
++	uint32_t ts;
++
++	/* Non-continuous clock lane: cmd mode, dsim_reg.c:1205-1208. */
++	a5p_mask(a5p_dsim, DSIM_CLK_CTRL, DSIM_NONCONT_CLK, DSIM_NONCONT_CLK);
++
++	/* Timeouts + stop-state count, dsim_reg.c:397-416. */
++	a5p_mask(a5p_dsim, DSIM_TIMEOUT, 0xffU << 16, 0xffffU << 16);
++	a5p_mask(a5p_dsim, DSIM_TIMEOUT, 0xffffU, 0xffffU);
++	a5p_mask(a5p_dsim, DSIM_ESCMODE, DSIM_STOP_STATE_CNT(0xA),
++	    0x7ffU << 21);
++
++	/* CM under-run reference, dsim_reg.c:994-1000, 1216-1218. */
++	a5p_mask(a5p_dsim, DSIM_UNDERRUN_CTRL, A5P_CM_UNDERRUN & 0xffffU, 0xffffU);
++	/* Threshold = xres (DSC off), dsim_reg.c:1219-1224. */
++	a5p_mask(a5p_dsim, DSIM_THRESHOLD, A5P_PANEL_HRESOL, 0xffffU);
++	/* Resolution, dsim_reg.c:1226-1227. */
++	a5p_mask(a5p_dsim, DSIM_RESOL, DSIM_VRESOL(A5P_PANEL_VRESOL) |
++	    DSIM_HRESOL(A5P_PANEL_HRESOL), 0x1fffU | (0x1fffU << 16));
++	/* Num of lanes = lanes - 1; RGB24; VC 0; command (not video) mode;
++	 * EOTP enabled; DSC off, dsim_reg.c:1237-1247. */
++	a5p_mask(a5p_dsim, DSIM_CONFIG, ((A5P_PANEL_LANES - 1U) << 5) |
++	    DSIM_EOTP_EN, DSIM_NUM_LANE_MASK | DSIM_EOTP_EN |
++	    DSIM_VIDEO_MODE | DSIM_CPRS_EN);
++	/* Command-mode TE/BTA timing, dsim_reg.c:735-747. */
++	ts = A5P_PANEL_HRESOL * 2U * 3U / 100U;		/* stable VFP */
++	a5p_mask(a5p_dsim, DSIM_CMD_TE_CTRL0, ts, 0xffffU);
++	ts = (a5p_hs_clk * 150U) / 8U;			/* protect-on */
++	a5p_mask(a5p_dsim, DSIM_CMD_TE_CTRL1, ts << 16, 0xffffU << 16);
++	ts = (a5p_hs_clk * 180U) / 8U;			/* TE timeout */
++	a5p_mask(a5p_dsim, DSIM_CMD_TE_CTRL1, ts, 0xffffU);
++	/* 1-byte PPI, shadow enable (dsim_reg.c:1283-1287). */
++	a5p_mask(a5p_dsim, DSIM_CSIS_LB, DSIM_1BYTEPPI_MODE, DSIM_1BYTEPPI_MODE);
++	a5p_mask(a5p_dsim, DSIM_SFR_CTRL, DSIM_SHADOW_REG_READ_EN |
++	    DSIM_SHADOW_EN, DSIM_SHADOW_REG_READ_EN | DSIM_SHADOW_EN);
++}
++
++/* ------------------------------------------------------------------ */
++/* Entry points                                                       */
++/* ------------------------------------------------------------------ */
++static void
++a5xelte_panel_probe(void)
++{
++	printf("A5XELTE PANEL: DSIM swrst=%#x clk=%#x cfg=%#x resol=%#x "
++	    "pll=%#x link3=%#x decong_trig=%#x\n",
++	    a5p_read(a5p_dsim, DSIM_SWRST), a5p_read(a5p_dsim, DSIM_CLK_CTRL),
++	    a5p_read(a5p_dsim, DSIM_CONFIG), a5p_read(a5p_dsim, DSIM_RESOL),
++	    a5p_read(a5p_dsim, DSIM_PLLCTRL),
++	    a5p_read(a5p_dsim, DSIM_LINK_STATUS3),
++	    a5p_read(a5p_decon, A5P_DECON_TRIG_OFF));
++	printf("A5XELTE PANEL: gpg1 con=%#x dat=%#x gpg2 con=%#x dat=%#x "
++	    "phy_iso=%#x pll_stable=%d\n",
++	    a5p_read(a5p_top, A5P_GPG1 + 0x00), a5p_read(a5p_top, A5P_GPG1 + 0x04),
++	    a5p_read(a5p_top, A5P_GPG2 + 0x00), a5p_read(a5p_top, A5P_GPG2 + 0x04),
++	    a5p_read(a5p_pmu, A5P_PHY_ISO_OFF),
++	    !!(a5p_read(a5p_dsim, DSIM_LINK_STATUS3) & DSIM_PLL_STABLE));
++}
++
++void
++a5xelte_panel_init(void)
++{
++	int probe = 1;
++	int active = 0;
++
++	if (a5p_started) {
++		return;
++	}
++	a5p_started = true;
++
++	a5p_top = ml_io_map(A5P_TOP_BASE, 0x1000);
++	a5p_dsim = ml_io_map(A5P_DSIM_BASE, 0x1000);
++	a5p_pmu = ml_io_map(A5P_PMU_BASE, 0x1000);
++	a5p_decon = ml_io_map(A5P_DECON_BASE, 0x1000);
++	if (!a5p_top || !a5p_dsim || !a5p_pmu || !a5p_decon) {
++		printf("A5XELTE PANEL: MMIO mapping failed\n");
++		return;
++	}
++
++	(void)PE_parse_boot_argn("a5panelprobe", &probe, sizeof(probe));
++	if (probe) {
++		a5xelte_panel_probe();
++	}
++
++	(void)PE_parse_boot_argn("a5panel", &active, sizeof(active));
++	if (!active) {
++		return;
++	}
++
++	a5p_report_rails();
++
++	/* S-Boot leaves DSIM running; re-initialising over a live scanout would
++	 * black the panel. Follow the vendor driver: if the D-PHY PLL is
++	 * already stable the link was brought up by the bootloader, so leave
++	 * the link, panel reset and command state untouched
++	 * (dsim_drv.c:826-832). */
++	if (a5p_read(a5p_dsim, DSIM_LINK_STATUS3) & DSIM_PLL_STABLE) {
++		printf("A5XELTE PANEL: DSIM PLL already up (bootloader); "
++		    "skipping link/panel init\n");
++		return;
++	}
++
++	if (!a5p_dsim_link_init()) {
++		printf("A5XELTE PANEL: link init failed; not continuing\n");
++		return;
++	}
++	a5p_dsim_config();
++	a5p_reset_panel();
++
++	/* HS clock on; then the panel init commands (dsim_drv.c:866-875). */
++	a5p_mask(a5p_dsim, DSIM_CLK_CTRL, DSIM_TX_REQUEST_HSCLK,
++	    DSIM_TX_REQUEST_HSCLK);
++
++	a5p_dsi_write(seq_sleep_out, sizeof(seq_sleep_out));
++	delay(20000);					/* msleep(20) */
++	a5p_dsi_write(seq_test_key_on, sizeof(seq_test_key_on));
++	a5p_dsi_write(seq_partial_setting, sizeof(seq_partial_setting));
++	a5p_dsi_write(seq_pcd_set_det_low, sizeof(seq_pcd_set_det_low));
++	a5p_dsi_write(seq_err_fg_setting, sizeof(seq_err_fg_setting));
++	a5p_dsi_write(seq_tsp_sync, sizeof(seq_tsp_sync));
++	a5p_dsi_write(seq_ffc_setting, sizeof(seq_ffc_setting));
++	a5p_dsi_write(seq_self_mask_sel, sizeof(seq_self_mask_sel));
++	a5p_dsi_write(seq_self_mask_image, sizeof(seq_self_mask_image));
++	a5p_dsi_write(seq_self_mask_on, sizeof(seq_self_mask_on));
++	a5p_dsi_write(seq_test_key_off, sizeof(seq_test_key_off));
++	a5p_dsi_write(seq_brightness, sizeof(seq_brightness));
++	a5p_dsi_write(seq_te_on, sizeof(seq_te_on));
++	delay(20000);
++	a5p_dsi_write(seq_display_on, sizeof(seq_display_on));
++
++	printf("A5XELTE PANEL: DSIM/PHY/panel bring-up done\n");
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index a344650..7b31ff2 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -70,6 +70,7 @@ extern boolean_t cpuid_vmm_present(void);
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
++extern void a5xelte_panel_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void a5xelte_usb_probe(void);
+ #if defined(JACKPOTLTE)
+@@ -778,6 +779,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++	a5xelte_panel_init();
+ #if defined(JACKPOTLTE)
+ 	jackpotlte_pmic_probe();
+ #endif

@@ -1,0 +1,573 @@
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -10,9 +10,14 @@
+  *     the smallest there is, a write of an immediate into memory -- first
+  *     with the MMU in identity mode, then through AArch64 4 KB page tables.
+  *     No rendering; success is the word written and the job-done bit set.
++ * M3: with jtmalimetal=1, keep the GPU up and run the engine a user client
++ *     drives: GPU addresses handed out, pages entered into and taken out of
++ *     address space 0, job chains queued and waited for.  This is the
++ *     reference's service half (redwood_mali.c:583-1146) on our registers;
++ *     iokit/Kernel/arm/JackpotlteMali.cpp speaks the panfrost ioctls to it.
+  *
+  * Sources: docs/jackpotlte-mali.md sec. 3 and the Samsung Eureka 4.4.302 tree
+- * (a path is cited per register group below); M2 from the HakiOS reference
++ * (a path is cited per register group below); M2/M3 from the HakiOS reference
+  * (redwood_mali.c, a Mali-G52 on MediaTek) whose MMU and job manager are the
+  * same ARM blocks a Bifrost G71 has.
+  */
+@@ -21,6 +26,8 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <mach/vm_param.h>
+ #include <mach/vm_statistics.h>
+@@ -29,10 +36,25 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t kvtophys(vm_offset_t va);
++extern vm_offset_t phystokv(uint64_t pa);
+ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ 
+ void jackpotlte_mali_probe(void);
+ 
++/* M3: the engine iokit/Kernel/arm/JackpotlteMali.cpp drives (prototypes here
++ * because the tree builds C with -Wmissing-prototypes). */
++bool jackpotlte_mali_ready(void);
++uint32_t jackpotlte_mali_shader_mask(void);
++bool jackpotlte_mali_parameter(uint32_t which, uint64_t *value);
++uint64_t jackpotlte_mali_address(uint64_t size);
++bool jackpotlte_mali_map(uint64_t gpu, uint64_t phys);
++void jackpotlte_mali_unmap(uint64_t gpu, uint64_t size);
++void jackpotlte_mali_mapped(void);
++uint32_t jackpotlte_mali_submit(uint64_t chain, bool fragment);
++uint64_t jackpotlte_mali_enqueue(uint64_t chain, bool fragment);
++bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
++void jackpotlte_mali_start(volatile uint32_t *mali);
++
+ /* ---- windows ---- */
+ #define JT_MALI_PA		0x11500000u
+ #define JT_MALI_WINDOW		0x5000u
+@@ -303,11 +325,7 @@
+ #define JT_FIRST_JOB_GPU	0x00100000ull
+ 
+ static uint64_t *jt_pt_top;
+-static uint64_t *jt_pt_mid;
+-static uint64_t *jt_pt_bot;
+ static uint64_t jt_pt_top_phys;
+-static uint64_t jt_pt_mid_phys;
+-static uint64_t jt_pt_bot_phys;
+ 
+ /* A zeroed page the GPU's own walk can read: its caches are not the
+  * processor's, so the page is flushed to memory (redwood_mali.c:441-456). */
+@@ -326,31 +344,71 @@
+ 	return (uint64_t *)page;
+ }
+ 
+-/* One 4 KB page of physical memory at GPU address `gpu`.  Three levels for
+- * the address bits a G71's MMU reports; single top/middle tables cover the
+- * low 1 GB, which is where the first jobs live (redwood_mali.c:412-479). */
++/* The table below `entry`, made and entered if there is none yet
++ * (redwood_mali.c:458-472). */
++static uint64_t *
++jt_pt_below(uint64_t *entry)
++{
++	uint64_t phys;
++	uint64_t *table;
++
++	if (*entry & 1) {
++		return (uint64_t *)phystokv(*entry & JT_PTE_ADDRESS);
++	}
++	table = jt_pt_page(&phys);
++	if (table == NULL) {
++		return NULL;
++	}
++	*entry = phys | JT_PTE_TABLE;
++	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++	return table;
++}
++
++/* One 4 KB page of physical memory at GPU address `gpu`: the reference's
++ * map_page (redwood_mali.c:474-492).  Three levels cover the 35 address bits
++ * JT_GPU_ADDRESS_END bounds the allocator to; the tables are made as needed,
++ * so buffers need not sit in the low gigabyte. */
+ static bool
+ jt_map_page(uint64_t gpu, uint64_t phys)
+ {
+-	if (jt_pt_top == NULL) {
+-		jt_pt_top = jt_pt_page(&jt_pt_top_phys);
+-		jt_pt_mid = jt_pt_page(&jt_pt_mid_phys);
+-		jt_pt_bot = jt_pt_page(&jt_pt_bot_phys);
+-		if (jt_pt_top == NULL || jt_pt_mid == NULL || jt_pt_bot == NULL) {
+-			return false;
+-		}
+-		jt_pt_top[(gpu >> 30) & 31] = jt_pt_mid_phys | JT_PTE_TABLE;
+-		jt_pt_mid[(gpu >> 21) & 511] = jt_pt_bot_phys | JT_PTE_TABLE;
+-		FlushPoC_DcacheRegion((vm_offset_t)jt_pt_top, sizeof(uint64_t));
+-		FlushPoC_DcacheRegion((vm_offset_t)jt_pt_mid, sizeof(uint64_t));
++	uint64_t *middle, *bottom, *entry;
++
++	if (jt_pt_top == NULL && (jt_pt_top = jt_pt_page(&jt_pt_top_phys)) == NULL) {
++		return false;
++	}
++	if ((middle = jt_pt_below(&jt_pt_top[(gpu >> 30) & 31])) == NULL ||
++	    (bottom = jt_pt_below(&middle[(gpu >> 21) & 511])) == NULL) {
++		return false;
+ 	}
+-	jt_pt_bot[(gpu >> 12) & 511] = (phys & JT_PTE_ADDRESS) | JT_PTE_AF |
++	entry = &bottom[(gpu >> 12) & 511];
++	*entry = (phys & JT_PTE_ADDRESS) | JT_PTE_AF |
+ 	    JT_PTE_SH_INNER | JT_PTE_AP_RW | JT_PTE_PAGE;
+-	FlushPoC_DcacheRegion((vm_offset_t)&jt_pt_bot[(gpu >> 12) & 511],
+-	    sizeof(uint64_t));
++	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
+ 	return true;
+ }
+ 
++/* Take one page out of the tables (redwood_mali.c:672-696's loop). */
++static void
++jt_unmap_page(uint64_t gpu)
++{
++	uint64_t *entry;
++
++	if (jt_pt_top == NULL) {
++		return;
++	}
++	entry = &jt_pt_top[(gpu >> 30) & 31];
++	if (!(*entry & 1)) {
++		return;
++	}
++	entry = &((uint64_t *)phystokv(*entry & JT_PTE_ADDRESS))[(gpu >> 21) & 511];
++	if (!(*entry & 1)) {
++		return;
++	}
++	entry = &((uint64_t *)phystokv(*entry & JT_PTE_ADDRESS))[(gpu >> 12) & 511];
++	*entry = 0;
++	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++}
++
+ static void
+ jt_as0_update(volatile uint32_t *mali, uint64_t transtab, uint32_t transcfg)
+ {
+@@ -450,6 +508,10 @@
+ 			jt_as0_update(mali, jt_pt_top_phys, transcfg_4k);
+ 			(void)jt_run_write_job(mali, page, JT_FIRST_JOB_GPU,
+ 			    shaders, "job 2, GPU page tables");
++			/* The page goes back to the kernel: take its entry
++			 * out too, or the tables would map freed memory. */
++			jt_unmap_page(JT_FIRST_JOB_GPU);
++			jt_as0_update(mali, jt_pt_top_phys, transcfg_4k);
+ 		} else {
+ 			printf("JACKPOTLTE MALI: no memory for page tables\n");
+ 		}
+@@ -460,6 +522,390 @@
+ 	    jt_rd(mali, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS));
+ }
+ 
++/* ---- M3: the engine a user client drives ----
++ *
++ * The reference's service half (redwood_mali.c:583-1146).  GPU addresses are
++ * handed out from a 32 GB range and never twice, pages are entered into
++ * address space 0, and a job chain is queued and run by a thread of its own,
++ * the submission returning at once with the job's number.  panfrost submits a
++ * pass's chains in order and waits for the number, so the queue runs one job
++ * at a time.
++ */
++#define JT_MALI_JS0			0x1800u	/* fragment chains */
++#define JT_MALI_MMU_INT_RAWSTAT		0x2000u
++#define JT_MALI_MMU_INT_CLEAR		0x2004u
++#define JT_GPU_ADDRESS_FIRST		0x01000000ull
++#define JT_GPU_ADDRESS_END		(1ull << 35)
++
++static LCK_GRP_DECLARE(jt_mali_lock_group, "jackpotlte-mali");
++/* Guards the address space and the tables; an UPDATE takes it.  job_lock is
++ * held for the length of a job, so no table changes under one. */
++static LCK_MTX_DECLARE(jt_mali_lock, &jt_mali_lock_group);
++static LCK_MTX_DECLARE(jt_job_lock, &jt_mali_lock_group);
++
++static volatile uint32_t *jt_gpu;
++static uint32_t jt_gpu_id;
++static uint32_t jt_shader_mask;
++static uint32_t jt_as0_transcfg;
++static bool jt_engine_up;
++static uint64_t jt_next_address = JT_GPU_ADDRESS_FIRST;
++
++/* Completion of a job, without spinning for its whole length: a moment of
++ * polling for the short jobs, then asleep 200 us at a time
++ * (redwood_mali.c:598-624). */
++static int jt_wait_event;
++static LCK_MTX_DECLARE(jt_wait_lock, &jt_mali_lock_group);
++
++static bool
++jt_wait_reg(uint32_t at, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	uint64_t deadline;
++
++	for (int i = 0; i < 20; i++) {
++		if ((jt_rd(jt_gpu, at) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint64_t nap;
++
++		if ((jt_rd(jt_gpu, at) & mask) == want) {
++			return true;
++		}
++		clock_interval_to_deadline(200, NSEC_PER_USEC, &nap);
++		lck_mtx_lock(&jt_wait_lock);
++		(void)lck_mtx_sleep_deadline(&jt_wait_lock, LCK_SLEEP_DEFAULT,
++		    (event_t)&jt_wait_event, THREAD_UNINT, nap);
++		lck_mtx_unlock(&jt_wait_lock);
++	}
++	return (jt_rd(jt_gpu, at) & mask) == want;
++}
++
++bool
++jackpotlte_mali_ready(void)
++{
++	return jt_engine_up;
++}
++
++uint32_t
++jackpotlte_mali_shader_mask(void)
++{
++	return jt_shader_mask;
++}
++
++/* Linux's DRM_PANFROST_PARAM_*, in its order, from the registers they come
++ * from (redwood_mali.c:763-830).  panfrost asks these once a device exists. */
++bool
++jackpotlte_mali_parameter(uint32_t which, uint64_t *value)
++{
++	static const uint16_t simple[] = {
++		[5] = 0xe00,	/* STACK_PRESENT (none on Bifrost: reads 0) */
++		[6] = 0x018, [7] = 0x01c, [8] = 0x004, [9] = 0x008,
++		[10] = 0x00c, [11] = 0x010, [12] = 0x014, [13] = 0x0ac,
++		[14] = 0x0a0, [15] = 0x0a4, [16] = 0x0a8, [17] = 0x300,
++		[18] = 0x0b0, [19] = 0x0b4, [20] = 0x0b8, [21] = 0x0bc,
++	};
++
++	if (!jt_engine_up) {
++		return false;
++	}
++	switch (which) {
++	case 0:
++		*value = jt_gpu_id >> 16;
++		return true;
++	case 1:
++		*value = jt_gpu_id & 0xffff;
++		return true;
++	case 2:
++	case 3:
++	case 4:
++		*value = jt_rd(jt_gpu, 0x100 + (which - 2) * 0x10) |
++		    ((uint64_t)jt_rd(jt_gpu, 0x104 + (which - 2) * 0x10) << 32);
++		return true;
++	case 38:	/* NR_CORE_GROUPS */
++		*value = 1;
++		return true;
++	case 39:	/* THREAD_TLS_ALLOC: never less than THREAD_MAX_THREADS, or a
++			 * spilling shader writes past the end of its stack
++			 * (redwood_mali.c:800-820). */
++		*value = jt_rd(jt_gpu, 0x310);
++		if (*value < jt_rd(jt_gpu, 0x0a0)) {
++			*value = jt_rd(jt_gpu, 0x0a0);
++		}
++		return true;
++	case 40:	/* AFBC_FEATURES: not on this GPU */
++		*value = 0;
++		return true;
++	default:
++		if (which >= 22 && which <= 37) {
++			*value = jt_rd(jt_gpu, 0x0c0 + (which - 22) * 4);
++			return true;
++		}
++		if (which < sizeof(simple) / sizeof(simple[0]) &&
++		    simple[which] != 0) {
++			*value = jt_rd(jt_gpu, simple[which]);
++			return true;
++		}
++		return false;
++	}
++}
++
++/* `size` bytes of GPU address, never given out twice (redwood_mali.c:835-855).
++ * 0: none left.  64 KB apart, so an overrun faults instead of hitting the
++ * next buffer. */
++uint64_t
++jackpotlte_mali_address(uint64_t size)
++{
++	uint64_t address;
++
++	lck_mtx_lock(&jt_mali_lock);
++	address = jt_next_address;
++	if (address + size > JT_GPU_ADDRESS_END) {
++		address = 0;
++	} else {
++		jt_next_address += (size + 0xffff) & ~0xffffull;
++	}
++	lck_mtx_unlock(&jt_mali_lock);
++	return address;
++}
++
++bool
++jackpotlte_mali_map(uint64_t gpu, uint64_t phys)
++{
++	bool done;
++
++	lck_mtx_lock(&jt_mali_lock);
++	done = jt_map_page(gpu, phys);
++	lck_mtx_unlock(&jt_mali_lock);
++	return done;
++}
++
++void
++jackpotlte_mali_unmap(uint64_t gpu, uint64_t size)
++{
++	if (jt_pt_top == NULL) {
++		return;
++	}
++	lck_mtx_lock(&jt_mali_lock);
++	for (uint64_t at = gpu; at < gpu + size; at += 4096) {
++		jt_unmap_page(at);
++	}
++	lck_mtx_unlock(&jt_mali_lock);
++
++	lck_mtx_lock(&jt_job_lock);	/* an entry taken out: the TLB may hold it */
++	lck_mtx_lock(&jt_mali_lock);
++	jt_as0_update(jt_gpu, jt_pt_top_phys, jt_as0_transcfg);
++	lck_mtx_unlock(&jt_mali_lock);
++	lck_mtx_unlock(&jt_job_lock);
++}
++
++/* After entries are added: the address space is set up from the top again,
++ * which drops everything the MMU remembered of it (redwood_mali.c:697-707). */
++void
++jackpotlte_mali_mapped(void)
++{
++	lck_mtx_lock(&jt_job_lock);
++	lck_mtx_lock(&jt_mali_lock);
++	jt_as0_update(jt_gpu, jt_pt_top_phys, jt_as0_transcfg);
++	lck_mtx_unlock(&jt_mali_lock);
++	lck_mtx_unlock(&jt_job_lock);
++}
++
++/* One job chain from GPU address `chain`, run to its end before this returns:
++ * fragment chains on slot 0, the rest on slot 1.  0 when it finished,
++ * otherwise the slot's status (or 0xff for no answer within a second), and
++ * the GPU is reset so the next job finds it working (redwood_mali.c:900-955).
++ */
++uint32_t
++jackpotlte_mali_submit(uint64_t chain, bool fragment)
++{
++	uint32_t slot = fragment ? 0 : 1;
++	uint32_t js = fragment ? JT_MALI_JS0 : JT_MALI_JS1;
++	uint32_t raw, status = 0;
++	bool finished;
++
++	lck_mtx_lock(&jt_job_lock);
++	lck_mtx_lock(&jt_mali_lock);
++	jt_wr(jt_gpu, JT_MALI_JOB_INT_CLEAR,
++	    (1u << slot) | (1u << (slot + 16)));
++	jt_wr(jt_gpu, js + JT_MALI_JS_HEAD_NEXT_LO, (uint32_t)chain);
++	jt_wr(jt_gpu, js + JT_MALI_JS_HEAD_NEXT_HI, (uint32_t)(chain >> 32));
++	jt_wr(jt_gpu, js + JT_MALI_JS_AFFINITY_NEXT_LO, jt_shader_mask);
++	jt_wr(jt_gpu, js + JT_MALI_JS_AFFINITY_NEXT_HI, 0);
++	jt_wr(jt_gpu, js + JT_MALI_JS_CONFIG_NEXT, JT_MALI_JS_CONFIG);
++	jt_wr(jt_gpu, js + JT_MALI_JS_COMMAND_NEXT, JT_MALI_JS_COMMAND_START);
++	lck_mtx_unlock(&jt_mali_lock);
++
++	finished = jt_wait_reg(JT_MALI_JOB_INT_RAWSTAT,
++	    (1u << slot) | (1u << (slot + 16)), 1u << slot, 1000);
++
++	lck_mtx_lock(&jt_mali_lock);
++	if (!finished) {
++		raw = jt_rd(jt_gpu, JT_MALI_JOB_INT_RAWSTAT);
++		status = (raw & (1u << (slot + 16))) ?
++		    jt_rd(jt_gpu, js + JT_MALI_JS_STATUS) : 0xff;
++		printf("JACKPOTLTE MALI: a job on slot %u did not finish: "
++		    "interrupts=%#x status=%#x mmu=%#x fault=%#x\n",
++		    slot, raw, jt_rd(jt_gpu, js + JT_MALI_JS_STATUS),
++		    jt_rd(jt_gpu, JT_MALI_MMU_INT_RAWSTAT),
++		    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS));
++		jt_wr(jt_gpu, JT_MALI_GPU_INT_CLEAR, 0xffffffffu);
++		jt_wr(jt_gpu, JT_MALI_GPU_CMD, 1u);
++		(void)jt_wait_reg(JT_MALI_GPU_INT_RAWSTAT,
++		    JT_MALI_IRQ_RESET_DONE, JT_MALI_IRQ_RESET_DONE, 100);
++		jt_wr(jt_gpu, JT_MALI_L2_PWRON, jt_rd(jt_gpu, JT_MALI_L2_PRESENT));
++		jt_wr(jt_gpu, JT_MALI_TILER_PWRON,
++		    jt_rd(jt_gpu, JT_MALI_TILER_PRESENT));
++		jt_wr(jt_gpu, JT_MALI_SHADER_PWRON, jt_shader_mask);
++		(void)jt_wait_reg(JT_MALI_SHADER_READY, jt_shader_mask,
++		    jt_shader_mask, 50);
++		jt_as0_update(jt_gpu, jt_pt_top_phys, jt_as0_transcfg);
++		jt_wr(jt_gpu, JT_MALI_MMU_INT_CLEAR, 0xffffffffu);
++	}
++	jt_wr(jt_gpu, JT_MALI_JOB_INT_CLEAR,
++	    (1u << slot) | (1u << (slot + 16)));
++	lck_mtx_unlock(&jt_mali_lock);
++	lck_mtx_unlock(&jt_job_lock);
++	return status;
++}
++
++/* The job queue, run by a thread of its own (redwood_mali.c:957-1080): a
++ * submission returns at once with the job's number, and whoever needs a job
++ * done waits for that number. */
++#define JT_MALI_QUEUE	64
++static struct {
++	uint64_t chain, seq, queued;
++	bool fragment;
++} jt_queue[JT_MALI_QUEUE];
++static unsigned jt_queue_head, jt_queue_count;
++static uint64_t jt_queued_seq, jt_done_seq;
++static bool jt_worker_started;
++static LCK_MTX_DECLARE(jt_queue_lock, &jt_mali_lock_group);
++
++static void
++jt_mali_worker(void *parameter, wait_result_t result)
++{
++	uint64_t chain, seq;
++	bool fragment;
++
++	(void)parameter;
++	(void)result;
++	for (;;) {
++		lck_mtx_lock(&jt_queue_lock);
++		while (jt_queue_count == 0) {
++			lck_mtx_sleep(&jt_queue_lock, LCK_SLEEP_DEFAULT,
++			    (event_t)&jt_queue_count, THREAD_UNINT);
++		}
++		chain = jt_queue[jt_queue_head].chain;
++		seq = jt_queue[jt_queue_head].seq;
++		fragment = jt_queue[jt_queue_head].fragment;
++		lck_mtx_unlock(&jt_queue_lock);
++
++		(void)jackpotlte_mali_submit(chain, fragment);
++
++		lck_mtx_lock(&jt_queue_lock);
++		jt_queue_head = (jt_queue_head + 1) % JT_MALI_QUEUE;
++		jt_queue_count--;
++		jt_done_seq = seq;
++		lck_mtx_unlock(&jt_queue_lock);
++		wakeup((caddr_t)&jt_done_seq);
++		wakeup((caddr_t)&jt_queue_head);
++	}
++}
++
++uint64_t
++jackpotlte_mali_enqueue(uint64_t chain, bool fragment)
++{
++	uint64_t seq;
++	unsigned at;
++
++	lck_mtx_lock(&jt_queue_lock);
++	if (!jt_worker_started) {
++		thread_t thread;
++
++		if (kernel_thread_start(jt_mali_worker, NULL, &thread) ==
++		    KERN_SUCCESS) {
++			thread_set_thread_name(thread, "jackpotlte-mali");
++			thread_deallocate(thread);
++			jt_worker_started = true;
++		}
++	}
++	if (!jt_worker_started) {
++		lck_mtx_unlock(&jt_queue_lock);
++		return 0;
++	}
++	while (jt_queue_count == JT_MALI_QUEUE) {
++		lck_mtx_sleep(&jt_queue_lock, LCK_SLEEP_DEFAULT,
++		    (event_t)&jt_queue_head, THREAD_UNINT);
++	}
++	seq = ++jt_queued_seq;
++	at = (jt_queue_head + jt_queue_count) % JT_MALI_QUEUE;
++	jt_queue[at].chain = chain;
++	jt_queue[at].seq = seq;
++	jt_queue[at].fragment = fragment;
++	jt_queue[at].queued = mach_absolute_time();
++	jt_queue_count++;
++	lck_mtx_unlock(&jt_queue_lock);
++	wakeup((caddr_t)&jt_queue_count);
++	return seq;
++}
++
++/* Wait until job `seq` is done: true when it is; with timeout 0 only a look. */
++bool
++jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns)
++{
++	uint64_t deadline;
++	bool done;
++
++	if (timeout_ns > 10ull * NSEC_PER_SEC) {
++		timeout_ns = 10ull * NSEC_PER_SEC;	/* an "infinite" one
++							 * (INT64_MAX) would wrap */
++	}
++	nanoseconds_to_absolutetime(timeout_ns, &deadline);
++	deadline += mach_absolute_time();
++	lck_mtx_lock(&jt_queue_lock);
++	while (jt_done_seq < seq && timeout_ns != 0 &&
++	    mach_absolute_time() < deadline) {
++		lck_mtx_sleep_deadline(&jt_queue_lock, LCK_SLEEP_DEFAULT,
++		    (event_t)&jt_done_seq, THREAD_UNINT, deadline);
++	}
++	done = jt_done_seq >= seq;
++	lck_mtx_unlock(&jt_queue_lock);
++	return done;
++}
++
++/* Leave the GPU up and hand it to the service: address space 0 on the tables,
++ * the allocator at its first address (called once bring-up succeeded). */
++void
++jackpotlte_mali_start(volatile uint32_t *mali)
++{
++	uint32_t mmu_features = jt_rd(mali, JT_MALI_GPU_MMU_FEATURES);
++	uint32_t addr_bits = (mmu_features >> 8) & 0xffu;
++	uint32_t addr_field = (addr_bits && addr_bits < 55u) ?
++	    (55u - addr_bits) : 20u;
++	uint32_t transcfg = JT_MALI_AS_TRANSCFG_AARCH64_4K |
++	    (addr_field << 6) | JT_MALI_AS_TRANSCFG_WALK_WB | (1u << 30);
++
++	jt_gpu = mali;
++	jt_gpu_id = jt_rd(mali, JT_MALI_GPU_ID);
++	jt_shader_mask = jt_rd(mali, JT_MALI_SHADER_PRESENT);
++	jt_as0_transcfg = transcfg;
++	if (jt_pt_top == NULL) {
++		jt_pt_top = jt_pt_page(&jt_pt_top_phys);
++	}
++	if (jt_pt_top == NULL) {
++		printf("JACKPOTLTE MALI: no page for the top table, engine down\n");
++		return;
++	}
++	jt_as0_update(mali, jt_pt_top_phys, transcfg);
++	jt_engine_up = true;
++	printf("JACKPOTLTE MALI: engine up, addresses from %#llx, "
++	    "transcfg=%#x shaders=%#x\n",
++	    (unsigned long long)JT_GPU_ADDRESS_FIRST, transcfg, jt_shader_mask);
++}
++
+ void
+ jackpotlte_mali_probe(void)
+ {
+@@ -527,10 +973,16 @@
+ 	    ((v & 0xffff) >> 12) & 0xf, ((v & 0xffff) >> 4) & 0xff);
+ 	if (jt_mali_up(mali)) {
+ 		int job = 0;
++		int metal = 0;
++
+ 		(void)PE_parse_boot_argn("jtmalijob", &job, sizeof(job));
+ 		if (job) {
+ 			jt_mali_jobs(mali);
+ 		}
++		(void)PE_parse_boot_argn("jtmalimetal", &metal, sizeof(metal));
++		if (metal) {
++			jackpotlte_mali_start(mali);
++		}
+ 	}
+ }
+ 

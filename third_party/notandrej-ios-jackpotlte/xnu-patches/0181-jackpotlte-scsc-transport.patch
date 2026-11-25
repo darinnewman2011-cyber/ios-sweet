@@ -1,0 +1,1258 @@
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index 57eb7cb..3af5dc2 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -1,7 +1,6 @@
+ /*
+  * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) Samsung SCSC / Maxwell
+- * (MX140) WiFi+BT transport, step 1: mailbox + MIF shared memory + interrupt
+- * bits + firmware download.
++ * (MX140) WiFi+BT transport.
+  *
+  * The chip this board actually has is Samsung's SCSC/Maxwell block (compatible
+  * "samsung,scsc_wifibt", exynos7885.dtsi:1797-1813).  The AP talks to it over a
+@@ -12,21 +11,31 @@
+  *
+  * What is real here (each offset cites its source in a5xelte_scsc.h):
+  *   - mailbox bank mapping and read/write (R4 and M4 banks);
+- *   - interrupt-bit operations: read/mask/unmask/clear the from-R4/M4 bank
+- *     and generate to-R4/M4 interrupts;
++ *   - interrupt-bit allocation and the bit operations (read/mask/unmask/clear
++ *     the from-R4/M4 bank, generate to-R4/M4 interrupts), including the
++ *     vendor's bit-0 panic reservation and its first-fit order;
+  *   - MIF shared-DRAM mapping and a block allocator over it;
++ *   - the seven transport streams (mxmgmt in/out, gdb R4 in/out, gdb M4 in/out,
++ *     mxlog in) with the vendor's ring geometry, and the 176-byte struct mxconf
++ *     that describes them to the R4;
+  *   - reading mx140.bin from the staged iOS root and parsing the "smxf"
+  *     firmware header (entry point / runtime length);
+  *   - the mailbox startup contract (entry point, config ref, magic, flags);
+  *   - the PMU reset-release sequence and its power-state handshake.
+  *
++ * Interrupts are POLLED, not taken from the GIC: XNU's arm64 IRQ entry gives
++ * every "other" interrupt to one per-CPU handler, which on this tree belongs to
++ * IOCPUInterruptController, so a BSD driver cannot own SPI 57 without an
++ * IOService and an IOInterruptController.  Instead a thread wakes every
++ * A5SCSC_POLL_INTERVAL_MS, reads INTMSR0 (pending AND unmasked) and runs the
++ * same per-bit handlers an ISR would run.  Handlers therefore execute in thread
++ * context, which is why they may sleep; that would have to change before a real
++ * GIC handler could share them.  See PORT-START.md, "Interrupt strategy".
++ *
+  * What is deliberately NOT real here (marked STUBBED in PORT-START.md):
+- *   - the mxconf transport streams (mxmgmt/gdb/mxlog) the vendor driver writes
+- *     into MIF RAM before releasing reset; a zeroed reservation with the correct
+- *     magic/version is placed instead, so the R4 can at least read it;
+- *   - the GIC interrupt is not registered: the mailbox ISR is not hooked (the
+- *     AP-side register plumbing to service it exists and is reported), and no
+- *     firmware handshake message is waited for;
++ *   - no driver hangs off the gdb streams; their rings exist because the
++ *     firmware expects a descriptor for every transport;
++ *   - mxlog is drained and discarded, not decoded;
+  *   - firmware CRC32 verification;
+  *   - the mx140 wlan service, the Apple80211 driver, and the 20 MHz USB PLL
+  *     handover (the jackpotlte DT leaves samsung,syscon-cmu_fsys commented out,
+@@ -36,7 +45,9 @@
+  * and the reserved MIF DRAM window.  The mailbox bank and the reset-release
+  * sequence run only when the "a8wifi" boot argument is 1, because reading a
+  * gated mailbox block or releasing WLBT reset changes the state of a live
+- * co-processor.  Nothing writes Android/S-Boot partitions.
++ * co-processor.  A boot argument that asks for bring-up but has no firmware
++ * image prints one line, leaves the port disabled and returns; it never panics.
++ * Nothing writes Android/S-Boot partitions.
+  *
+  * This file is compiled for the A5XELTE machine config and emits code only for
+  * JACKPOTLTE, matching the other A8 device files (e.g. bsd/dev/a5xelte_usb.c).
+@@ -48,19 +59,52 @@
+ #include <sys/errno.h>
+ #include <sys/uio.h>
+ #include <sys/vnode.h>
++#include <sys/attr.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ #include "a5xelte_scsc.h"
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-
++/* arm/machine_routines.h only declares these under PEXPERT_KERNEL_PRIVATE,
++ * which a BSD file does not define; 0138 declared ml_io_map by hand for the
++ * same reason.  0181 also needs ml_io_map_wcomb for the MIF window.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++
+ void a5xelte_scsc_probe(void);
+ 
+ /* ---- device state --------------------------------------------------------- */
+ 
++/* Direction of a transport stream, from the point of view of the AP:
++ * A5SCSC_STREAM_IN  = firmware writes, the AP reads (mifstream.h:29-32).
++ */
++#define A5SCSC_STREAM_IN        0
++#define A5SCSC_STREAM_OUT       1
++
++/* One simplex stream, the port's struct mif_stream + struct cpacketbuffer
++ * (mifstream.h:139-158, cpacket_buffer.h:124-137).  The two index words live
++ * in MIF DRAM because the R4 updates one of them too.
++ */
++struct a5scsc_stream {
++	uint32_t           buf_off;      /* packet buffer, offset in MIF DRAM   */
++	volatile uint32_t *read;         /* MIF-resident read index             */
++	volatile uint32_t *write;        /* MIF-resident write index            */
++	uint32_t           num_packets;
++	uint32_t           packet_size;
++	uint8_t            direction;    /* A5SCSC_STREAM_IN / _OUT             */
++	uint8_t            target;       /* peer: MIF target R4 or M4           */
++	uint8_t            read_bit;     /* vendor read_bit_idx                 */
++	uint8_t            write_bit;    /* vendor write_bit_idx                */
++	bool               ready;
++};
++
++/* Handler for one tohost bit: runs in the poll thread (mifintrbit.c:52-71). */
++typedef void (*a5scsc_intr_fn)(int bit, void *arg);
++
+ struct a5scsc_softc {
+ 	vm_offset_t mbox_r4;            /* R4 mailbox bank VA           */
+ 	vm_offset_t mbox_m4;            /* M4 mailbox bank VA           */
+@@ -74,12 +111,42 @@ struct a5scsc_softc {
+ 	uint32_t    fw_entry;           /* parsed firmware entry point  */
+ 	uint32_t    fw_runtime_len;     /* parsed firmware runtime size */
+ 	bool        fw_loaded;
++
++	uint32_t    mxconf_ref;         /* MIF offset of struct mxconf  */
++
++	/* Interrupt-bit allocation maps (mifintrbit.h:52-58).  Bit 0 of both
++	 * from-host maps is set at init and never cleared. */
++	uint16_t    intr_tohost;
++	uint16_t    intr_fromhost_r4;
++	uint16_t    intr_fromhost_m4;
++	a5scsc_intr_fn intr_fn[A5SCSC_INTRBIT_NUM];
++	void          *intr_arg[A5SCSC_INTRBIT_NUM];
++
++	/* Transport streams, in the vendor's transports_init() order
++	 * (mxman.c:678-760). */
++	struct a5scsc_stream mxmgmt_in;
++	struct a5scsc_stream mxmgmt_out;
++	struct a5scsc_stream gdb_r4_in;
++	struct a5scsc_stream gdb_r4_out;
++	struct a5scsc_stream gdb_m4_in;
++	struct a5scsc_stream gdb_m4_out;
++	struct a5scsc_stream mxlog_in;
++
++	bool        transports_ready;
++	bool        poll_running;
++	uint32_t    mxlog_dropped;      /* packets drained and thrown away */
+ };
+ 
+ static struct a5scsc_softc a5scsc;
+ 
+ /* ---- register access (32-bit, LE; little-endian AP identical to R4) ------- */
+ 
++static inline void
++a5scsc_mb(void)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++}
++
+ static inline uint32_t
+ a5scsc_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -102,6 +169,24 @@ a5scsc_mbox_rd(vm_offset_t bank, uint32_t off)
+ 	return a5scsc_rd(bank, off);
+ }
+ 
++/* MIF DRAM is normal non-cacheable memory, not device memory (the vendor maps
++ * it with pgprot_writecombine, platform_mif.c:614-637), so byte and unaligned
++ * accesses are safe and copies may use memcpy. */
++static inline uint32_t
++a5scsc_mif_rd32(uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(a5scsc.mif + off);
++	a5scsc_mb();
++	return value;
++}
++
++static inline void
++a5scsc_mif_wr32(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(a5scsc.mif + off) = value;
++	a5scsc_mb();
++}
++
+ /* RMW one field of a PMU register (the vendor driver uses regmap_update_bits;
+  * MIF:347, 367, 387). */
+ static void
+@@ -111,28 +196,182 @@ a5scsc_pmu_set(uint32_t off, uint32_t mask, uint32_t value)
+ 	a5scsc_wr(a5scsc.pmu, off, (v & ~mask) | (value & mask));
+ }
+ 
++/* ---- interrupt bits (platform_mif.c:766-908, mifintrbit.c) ----------------
++ * The AP sees two 16-bit masks per bank: bits [31:16] of INTMSR0 are interrupts
++ * from R4/M4 that are pending and not masked.  Bit 0 of each from-host map is
++ * reserved for forcing a firmware panic (mifintrbit.c:236-237); everything else
++ * is first-fit from bit 0 up.
++ */
++
++/* Pending, enabled and unmasked interrupts from R4/M4 (MIF:776-786). */
++static uint32_t
++a5scsc_irq_get(void)
++{
++	return a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMSR0) >> 16;
++}
++
++static void
++a5scsc_irq_bit_clear(int bit)
++{
++	if (bit < 0 || bit >= (int)A5SCSC_INTRBIT_NUM) {
++		return;
++	}
++	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTCR0, ((1u << bit) << 16));   /* MIF:831-842 */
++}
++
++static void
++a5scsc_irq_bit_mask(int bit)
++{
++	uint32_t v;
++
++	if (bit < 0 || bit >= (int)A5SCSC_INTRBIT_NUM) {
++		return;
++	}
++	v = a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0);
++	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTMR0, v | ((1u << bit) << 16)); /* MIF:844-860 */
++}
++
++static void
++a5scsc_irq_bit_unmask(int bit)
++{
++	uint32_t v;
++
++	if (bit < 0 || bit >= (int)A5SCSC_INTRBIT_NUM) {
++		return;
++	}
++	v = a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0);
++	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTMR0, v & ~((1u << bit) << 16)); /* MIF:862-878 */
++}
++
++/* Generate an interrupt TO R4 (target 0) or M4 (target 1); MIF:788-829.
++ * The from-M4 direction uses the R1 offsets in the M4 bank on 7885. */
++static void
++a5scsc_irq_bit_set(int bit, uint8_t target)
++{
++	if (bit < 0 || bit >= (int)A5SCSC_INTRBIT_NUM) {
++		return;
++	}
++	if (target == A5SCSC_MIF_TARGET_M4) {
++		a5scsc_wr(a5scsc.mbox_m4, A5SCSC_INTGR1, (1u << bit));
++	} else {
++		a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTGR1, (1u << bit));
++	}
++}
++
++/* One pass of the work mifiintrman_isr() does (mifintrbit.c:52-71): clear the
++ * bit first so a new arrival is not lost, then run the registered handler. */
++static void
++a5scsc_intr_dispatch(void)
++{
++	uint32_t pending = a5scsc_irq_get();
++
++	while (pending != 0) {
++		int bit = 0;
++
++		while (bit < (int)A5SCSC_INTRBIT_NUM &&
++		    (pending & (1u << bit)) == 0) {
++			bit++;
++		}
++		if (bit >= (int)A5SCSC_INTRBIT_NUM) {
++			break;
++		}
++		pending &= ~(1u << bit);
++		a5scsc_irq_bit_clear(bit);
++		if (a5scsc.intr_fn[bit] != NULL) {
++			a5scsc.intr_fn[bit](bit, a5scsc.intr_arg[bit]);
++		}
++	}
++}
++
++/* mifintrbit.c:105-121: mask, clear, register, unmask, then mark allocated. */
++static int
++a5scsc_intrbit_alloc_tohost(a5scsc_intr_fn fn, void *arg)
++{
++	int bit;
++
++	for (bit = 0; bit < (int)A5SCSC_INTRBIT_NUM; bit++) {
++		if ((a5scsc.intr_tohost & (1u << bit)) == 0) {
++			break;
++		}
++	}
++	if (bit >= (int)A5SCSC_INTRBIT_NUM) {
++		return -1;
++	}
++	a5scsc_irq_bit_mask(bit);
++	a5scsc_irq_bit_clear(bit);
++	a5scsc.intr_fn[bit] = fn;
++	a5scsc.intr_arg[bit] = arg;
++	a5scsc_irq_bit_unmask(bit);
++	a5scsc.intr_tohost |= (uint16_t)(1u << bit);
++	return bit;
++}
++
++/* mifintrbit.c:150-170.  "reserved" picks the panic bit instead of allocating,
++ * which is what the gdb output streams do (mifstream.c:62-70). */
++static int
++a5scsc_intrbit_alloc_fromhost(uint8_t target, bool reserved)
++{
++	uint16_t *map = (target == A5SCSC_MIF_TARGET_M4) ?
++	    &a5scsc.intr_fromhost_m4 : &a5scsc.intr_fromhost_r4;
++	int bit;
++
++	if (reserved) {
++		return (int)A5SCSC_INTRBIT_RESERVED_PANIC;
++	}
++	for (bit = 0; bit < (int)A5SCSC_INTRBIT_NUM; bit++) {
++		if ((*map & (1u << bit)) == 0) {
++			break;
++		}
++	}
++	if (bit >= (int)A5SCSC_INTRBIT_NUM) {
++		return -1;
++	}
++	*map |= (uint16_t)(1u << bit);
++	return bit;
++}
++
++static void
++a5scsc_intrbit_init(void)
++{
++	a5scsc.intr_tohost = 0;
++	a5scsc.intr_fromhost_r4 = (uint16_t)(1u << A5SCSC_INTRBIT_RESERVED_PANIC);
++	a5scsc.intr_fromhost_m4 = (uint16_t)(1u << A5SCSC_INTRBIT_RESERVED_PANIC);
++	bzero(a5scsc.intr_fn, sizeof(a5scsc.intr_fn));
++	bzero(a5scsc.intr_arg, sizeof(a5scsc.intr_arg));
++}
++
+ /* ---- MIF shared-DRAM block allocator --------------------------------------
+  * A trimmed port of miframman.c (block size 64 bytes, MIFRAMMAN_BLOCK_SIZE,
+  * miframman.h:23).  The vendor allocator keeps a bitmap; a bump allocator is
+- * enough for the single load in this first patch and cannot fragment, but it
+- * has no free(), so it is marked STUBBED in PORT-START.md.
++ * enough for the fixed set of allocations this port makes and cannot
++ * fragment, but it has no free(), so it is marked STUBBED in PORT-START.md.
+  */
+-static bool
++int
+ a5scsc_mifram_alloc(uint32_t nbytes, uint32_t align, uint32_t *out_off)
+ {
+ 	uint32_t off;
+ 
+ 	if (align == 0 || (align & (align - 1)) != 0) {
+-		return false;   /* align must be a power of two (miframman.c:147) */
++		return 0;       /* align must be a power of two (miframman.c:147) */
+ 	}
+ 	off = (a5scsc.mif_alloc_off + (align - 1)) & ~(align - 1);
+-	if (off < a5scsc.mif_alloc_off || off + nbytes > A5SCSC_MIF_DRAM_SIZE) {
+-		return false;
++	if (off < a5scsc.mif_alloc_off || off + nbytes > A5SCSC_MIF_DRAM_SIZE ||
++	    off + nbytes < off) {
++		return 0;
+ 	}
+ 	a5scsc.mif_alloc_off = off + nbytes;
+ 	a5scsc.mif_free = A5SCSC_MIF_DRAM_SIZE - a5scsc.mif_alloc_off;
+ 	*out_off = off;
+-	return true;
++	return 1;
++}
++
++void *
++a5scsc_mifram_ptr(uint32_t off)
++{
++	if (!a5scsc.mif_mapped || off >= A5SCSC_MIF_DRAM_SIZE) {
++		return NULL;
++	}
++	return (void *)(a5scsc.mif + off);
+ }
+ 
+ /* ---- firmware image header (fwhdr.c:16-92) -------------------------------- */
+@@ -144,10 +383,18 @@ a5scsc_le32(const uint8_t *p)
+ 	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+ }
+ 
++static uint16_t
++a5scsc_le16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
+ static bool
+ a5scsc_parse_fwhdr(const uint8_t *fw, uint32_t size,
+     uint32_t *entry_point, uint32_t *runtime_len, uint32_t *hdr_length)
+ {
++	uint32_t hdr;
++
+ 	if (size < A5SCSC_FWHDR_MIN_SIZE) {
+ 		return false;
+ 	}
+@@ -158,9 +405,27 @@ a5scsc_parse_fwhdr(const uint8_t *fw, uint32_t size,
+ 		 * (mxman.c:849-858), which we do not. */
+ 		return false;
+ 	}
++	hdr = a5scsc_le32(fw + A5SCSC_FWHDR_HDR_LENGTH_OFF);
++	if (hdr < A5SCSC_FWHDR_MIN_SIZE || hdr > size) {
++		return false;
++	}
++	/* fwhdr_is_valid() rejects a header whose advertised version is not the
++	 * one this driver was built for (fwhdr.c:44-45). */
++	if (a5scsc_le16(fw + A5SCSC_FWHDR_VERSION_MAJOR_OFF) !=
++	    A5SCSC_FWHDR_VERSION_MAJOR_EXPECT ||
++	    a5scsc_le16(fw + A5SCSC_FWHDR_VERSION_MINOR_OFF) !=
++	    A5SCSC_FWHDR_VERSION_MINOR_EXPECT) {
++		return false;
++	}
++	if (a5scsc_le16(fw + A5SCSC_FWHDR_FWAPI_MAJOR_OFF) !=
++	    A5SCSC_FWHDR_FWAPI_MAJOR_EXPECT ||
++	    a5scsc_le16(fw + A5SCSC_FWHDR_FWAPI_MINOR_OFF) !=
++	    A5SCSC_FWHDR_FWAPI_MINOR_EXPECT) {
++		return false;
++	}
+ 	*entry_point = a5scsc_le32(fw + A5SCSC_FWHDR_ENTRY_POINT_OFF);
+ 	*runtime_len = a5scsc_le32(fw + A5SCSC_FWHDR_FW_RUNTIME_LEN_OFF);
+-	*hdr_length  = a5scsc_le32(fw + A5SCSC_FWHDR_HDR_LENGTH_OFF);
++	*hdr_length  = hdr;
+ 	return true;
+ }
+ 
+@@ -168,7 +433,7 @@ a5scsc_parse_fwhdr(const uint8_t *fw, uint32_t size,
+  * Reads up to max bytes of path into dst.  Returns 0 on success.
+  * Same idiom as vfs_syscalls.c:517-525.
+  */
+-static int
++int
+ a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size)
+ {
+ 	vfs_context_t ctx = vfs_context_current();
+@@ -194,7 +459,8 @@ a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size)
+ 		return size == 0 ? ENOENT : EFBIG;
+ 	}
+ 	err = vn_rdwr(UIO_READ, vp, (caddr_t)dst, (int)size, 0,
+-	    UIO_SYSSPACE, IO_NOCACHE, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	    UIO_SYSSPACE, IO_NOCACHE, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
+ 	vnode_put(vp);
+ 	if (err != 0) {
+ 		return err;
+@@ -202,10 +468,14 @@ a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size)
+ 	if (resid != 0) {
+ 		return EIO;
+ 	}
+-	*out_size = size;
++	if (out_size != NULL) {
++		*out_size = size;
++	}
+ 	return 0;
+ }
+ 
++/* Silent on failure: the bring-up thread prints one line for "no firmware"
++ * after its retries, and nothing here may print per attempt. */
+ static int
+ a5scsc_load_firmware(void)
+ {
+@@ -214,126 +484,378 @@ a5scsc_load_firmware(void)
+ 	uint32_t hdr_length = 0;
+ 	int err;
+ 
++	if (!a5scsc.mif_mapped) {
++		return ENXIO;
++	}
+ 	err = a5scsc_read_file(A5SCSC_FW_PATH, dst, A5SCSC_MIF_DRAM_SIZE, &size);
+ 	if (err != 0) {
+ 		return err;
+ 	}
+ 	if (!a5scsc_parse_fwhdr(dst, (uint32_t)size, &a5scsc.fw_entry,
+ 	    &a5scsc.fw_runtime_len, &hdr_length)) {
+-		printf("A5XELTE SCSC: %s is not a smxf firmware image\n", A5SCSC_FW_PATH);
+ 		return EINVAL;
+ 	}
+-	if (a5scsc.fw_runtime_len == 0 || a5scsc.fw_runtime_len > A5SCSC_MIF_DRAM_SIZE) {
+-		printf("A5XELTE SCSC: bad fw runtime length 0x%x\n", a5scsc.fw_runtime_len);
++	if (a5scsc.fw_runtime_len == 0 ||
++	    a5scsc.fw_runtime_len > A5SCSC_MIF_DRAM_SIZE) {
+ 		return EINVAL;
+ 	}
+-	/* The MIF heap starts after the firmware (mxman.c:972-975). */
++	/* The MIF heap starts after the firmware (mxman.c:971-975). */
+ 	a5scsc.mif_alloc_off = a5scsc.fw_runtime_len;
+ 	a5scsc.mif_free = A5SCSC_MIF_DRAM_SIZE - a5scsc.fw_runtime_len;
+ 	a5scsc.fw_loaded = true;
+-	printf("A5XELTE SCSC: firmware %u bytes loaded, entry 0x%x runtime 0x%x\n",
+-	    (unsigned)size, a5scsc.fw_entry, a5scsc.fw_runtime_len);
++	printf("A5XELTE SCSC: stage 1/6 firmware: %u bytes, entry 0x%x runtime 0x%x hdr 0x%x\n",
++	    (unsigned)size, a5scsc.fw_entry, a5scsc.fw_runtime_len, hdr_length);
+ 	/* STUBBED: header/const/fw CRC32 checks (fwimage.c) are not run. */
+ 	return 0;
+ }
+ 
+-/* ---- mailbox startup (mxman.c:764-792) ------------------------------------ */
++/* ---- packet streams (cpacketbuffer.c + mifstream.c) ----------------------
++ * Ring semantics, quoted from cpacket_buffer.c:9-18: one slot is always left
++ * free, read == write means empty, and both indices stay in [0, num_packets).
++ */
+ 
+-static void
+-a5scsc_mbox_init(uint32_t entry_point, uint32_t mxconf_ref)
++static uint32_t
++a5scsc_stream_free(const struct a5scsc_stream *s)
+ {
+-	vm_offset_t b = a5scsc.mbox_r4;
++	uint32_t r = *s->read;
++	uint32_t w = *s->write;
++	uint32_t base = (w >= r) ? (r + s->num_packets - w) : (r - w);
+ 
+-	/* MBOX0 = firmware entry point; MBOX1 = R4-relative config address. */
+-	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_0), entry_point);
+-	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_1), mxconf_ref);
+-	/* MBOX2 = magic; MBOX3 = startup flags (0 == normal, mxman.c:116). */
+-	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_2), A5SCSC_MBOX_MAGIC);
+-	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_3), 0);
+-	printf("A5XELTE SCSC: mailbox0 entry 0x%x conf 0x%x magic 0x%08x\n",
+-	    entry_point, mxconf_ref, A5SCSC_MBOX_MAGIC);
++	return (base == 0) ? 0 : base - 1;
+ }
+ 
+-/* The vendor driver zeroes every mailbox and pre-masks both banks
+- * (platform_mif.c:658-684).  Mask value 1 == masked. */
++/* Writes one whole packet.  Unlike the vendor's write_gather() this does not
++ * split a message across packets; every caller here writes <= packet_size.
++ * (cpacketbuffer.c:75-98, mifstream.c:145-155.)
++ */
++static bool
++a5scsc_stream_write(struct a5scsc_stream *s, const void *buf, uint32_t len)
++{
++	uint32_t w;
++	uint8_t *dst;
++
++	if (!s->ready || buf == NULL || len == 0 || len > s->packet_size) {
++		return false;
++	}
++	if (a5scsc_stream_free(s) == 0) {
++		return false;
++	}
++	w = (*s->write) % s->num_packets;
++	dst = (uint8_t *)(a5scsc.mif + s->buf_off) + w * s->packet_size;
++	memcpy(dst, buf, len);
++	a5scsc_mb();
++	*s->write = (w + 1) % s->num_packets;
++	a5scsc_mb();
++	a5scsc_irq_bit_set(s->write_bit, s->target);
++	return true;
++}
++
++/* Returns a pointer to the next packet, or NULL when the ring is empty
++ * (cpacket_buffer.c:288-308). */
++static const void *
++a5scsc_stream_peek(struct a5scsc_stream *s, const void *current)
++{
++	uint32_t idx;
++
++	if (!s->ready) {
++		return NULL;
++	}
++	if (current == NULL) {
++		idx = (*s->read) % s->num_packets;
++	} else {
++		uintptr_t base = (uintptr_t)(a5scsc.mif + s->buf_off);
++		idx = (uint32_t)(((uintptr_t)current - base) / s->packet_size);
++		idx = (idx + 1) % s->num_packets;
++	}
++	a5scsc_mb();
++	if (idx == ((*s->write) % s->num_packets)) {
++		return NULL;
++	}
++	return (const void *)((uintptr_t)(a5scsc.mif + s->buf_off) +
++	    idx * s->packet_size);
++}
++
++/* Removes all packets up to and including `packet` and tells the peer the
++ * read finished (cpacket_buffer.c:311-321, mifstream.c:132-141). */
+ static void
+-a5scsc_mbox_bank_init(void)
++a5scsc_stream_peek_done(struct a5scsc_stream *s, const void *packet)
+ {
+-	vm_offset_t r4 = a5scsc.mbox_r4;
+-	vm_offset_t m4 = a5scsc.mbox_m4;
+-	uint32_t i;
++	uintptr_t base;
++	uint32_t idx;
+ 
+-	for (i = 0; i < A5SCSC_NUM_MBOX; i++) {
+-		a5scsc_wr(r4, A5SCSC_ISSR(i), 0);
+-		a5scsc_wr(m4, A5SCSC_ISSR(i), 0);
++	if (!s->ready || packet == NULL) {
++		return;
+ 	}
+-	/* INTMR0 covers interrupts FROM R4/M4 in bits [31:16]: mask all. */
+-	a5scsc_wr(r4, A5SCSC_INTMR0, 0xffff0000u);
+-	a5scsc_wr(r4, A5SCSC_INTMR1, 0x0000ffffu);       /* to-R4 bank */
+-	a5scsc_wr(m4, A5SCSC_INTMR1, 0x0000ffffu);       /* to-M4 bank (MIF:672) */
+-	/* Clear every pending interrupt. */
+-	a5scsc_wr(r4, A5SCSC_INTCR0, 0xffff0000u);
+-	a5scsc_wr(r4, A5SCSC_INTCR1, 0x0000ffffu);
+-	a5scsc_wr(m4, A5SCSC_INTCR1, 0x0000ffffu);
+-	/* STUBBED: the mxconf transport streams are not serialised here. */
++	base = (uintptr_t)(a5scsc.mif + s->buf_off);
++	idx = (uint32_t)(((uintptr_t)packet - base) / s->packet_size);
++	*s->read = (idx + 1) % s->num_packets;
++	a5scsc_mb();
++	a5scsc_irq_bit_set(s->read_bit, s->target);
+ }
+ 
+-/* ---- interrupt bits (platform_mif.c:766-908) ------------------------------
+- * These are the operations a real ISR and a real service driver will call.
+- * They are implemented and used by the read-only report below; the GIC handler
+- * that would call them is not registered in this patch.
++/* mifstream.c:25-88 + cpacketbuffer.c:170-205.  Allocation order is the
++ * vendor's and decides the interrupt-bit numbers: tohost first, then fromhost.
+  */
++static int
++a5scsc_stream_init(struct a5scsc_stream *s, uint8_t target, uint8_t direction,
++    uint32_t num_packets, uint32_t packet_size, bool reserved_bit,
++    a5scsc_intr_fn fn, void *arg)
++{
++	uint32_t buf, read_idx, write_idx;
++	uint32_t bytes;
++	int tohost, fromhost;
+ 
+-/* Pending, enabled and unmasked interrupts from R4/M4 (MIF:776-786). */
+-static uint32_t
+-a5scsc_irq_get(void)
++	bzero(s, sizeof(*s));
++	if (num_packets < 2 || packet_size == 0 || packet_size > 64) {
++		return EINVAL;
++	}
++	bytes = num_packets * packet_size;
++	if (!a5scsc_mifram_alloc(bytes, 4, &buf) ||
++	    !a5scsc_mifram_alloc(4, 4, &read_idx) ||
++	    !a5scsc_mifram_alloc(4, 4, &write_idx)) {
++		return ENOMEM;
++	}
++	/* cpacketbuffer_init() zeroes both indices.  IN buffers are then filled
++	 * with 0xff, which is what mif_stream_init() does (mifstream.c:79-81);
++	 * OUT buffers keep the zeros. */
++	a5scsc_mif_wr32(read_idx, 0);
++	a5scsc_mif_wr32(write_idx, 0);
++	if (direction == A5SCSC_STREAM_IN) {
++		memset((void *)(a5scsc.mif + buf), 0xff, bytes);
++	} else {
++		memset((void *)(a5scsc.mif + buf), 0x00, bytes);
++	}
++
++	tohost = a5scsc_intrbit_alloc_tohost(fn, arg);
++	fromhost = a5scsc_intrbit_alloc_fromhost(target, reserved_bit);
++	if (tohost < 0 || fromhost < 0) {
++		return ENOSPC;
++	}
++
++	s->buf_off = buf;
++	s->read = (volatile uint32_t *)(a5scsc.mif + read_idx);
++	s->write = (volatile uint32_t *)(a5scsc.mif + write_idx);
++	s->num_packets = num_packets;
++	s->packet_size = packet_size;
++	s->direction = direction;
++	s->target = target;
++	/* mifstream.c:83-93. */
++	if (direction == A5SCSC_STREAM_IN) {
++		s->read_bit = (uint8_t)fromhost;
++		s->write_bit = (uint8_t)tohost;
++	} else {
++		s->read_bit = (uint8_t)tohost;
++		s->write_bit = (uint8_t)fromhost;
++	}
++	s->ready = true;
++	a5scsc_mb();
++	return 0;
++}
++
++/* mxmgmt wire format: one 8-byte packet of {u8 channel, u8 msg, u8 payload[7]}
++ * (mxmgmt_transport_format.h:18-23).  Sends one Maxwell message. */
++int
++a5scsc_mxmgmt_send(uint8_t channel, uint8_t msg, const void *payload,
++    uint32_t len)
+ {
+-	return a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMSR0) >> 16;
++	uint8_t packet[A5SCSC_MXMGMT_PKT_SIZE];
++
++	if (len > A5SCSC_MXMGR_PAYLOAD_SIZE) {
++		return EINVAL;
++	}
++	bzero(packet, sizeof(packet));
++	packet[0] = channel;
++	packet[1] = msg;
++	if (len != 0) {
++		memcpy(packet + 2, payload, len);
++	}
++	return a5scsc_stream_write(&a5scsc.mxmgmt_out, packet, sizeof(packet)) ?
++	    0 : EAGAIN;
+ }
+ 
++/* ---- mxconf (mxconf.h:106-139, mxman.c:721-760) ------------------------- */
++
++/* One struct mxstreamconf is 24 bytes: struct mxcbufconf (5 x u32) followed by
++ * read_bit_idx and write_bit_idx (mxconf.h:52-67). */
+ static void
+-a5scsc_irq_bit_clear(int bit)
++a5scsc_mxconf_describe(uint8_t *p, const struct a5scsc_stream *s)
+ {
+-	if (bit < 0 || bit >= 16) {
++	uintptr_t base = (uintptr_t)a5scsc.mif;
++
++	bzero(p, A5SCSC_MXCONF_STREAM_STRIDE);
++	if (s == NULL || !s->ready) {
+ 		return;
+ 	}
+-	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTCR0, ((1u << bit) << 16));   /* MIF:831-842 */
++	*(volatile uint32_t *)(void *)(p + A5SCSC_MXCBUF_LOC_OFF)   = s->buf_off;
++	*(volatile uint32_t *)(void *)(p + A5SCSC_MXCBUF_NUM_OFF)   = s->num_packets;
++	*(volatile uint32_t *)(void *)(p + A5SCSC_MXCBUF_SIZE_OFF)  = s->packet_size;
++	*(volatile uint32_t *)(void *)(p + A5SCSC_MXCBUF_READ_OFF)  =
++	    (uint32_t)((uintptr_t)s->read - base);
++	*(volatile uint32_t *)(void *)(p + A5SCSC_MXCBUF_WRITE_OFF) =
++	    (uint32_t)((uintptr_t)s->write - base);
++	/* mif_stream_config_serialise() copies the stream's own read/write bit
++	 * indices (mifstream.c:18-23). */
++	p[A5SCSC_MXSTREAM_READ_BIT_OFF] = s->read_bit;
++	p[A5SCSC_MXSTREAM_WRITE_BIT_OFF] = s->write_bit;
+ }
+ 
++/* transports_init() (mxman.c:678-760) in the vendor's order.  The gdb output
++ * streams take the reserved panic bit instead of an allocated one.
++ * STUBBED: no gdb client is attached, and mxlog is only drained.
++ */
+ static void
+-a5scsc_irq_bit_mask(int bit)
++a5scsc_mxlog_drain(int bit, void *arg);
++
++static int
++a5scsc_transports_init(void)
+ {
+-	uint32_t v;
+-	if (bit < 0 || bit >= 16) {
+-		return;
++	int err;
++
++	err = a5scsc_stream_init(&a5scsc.mxmgmt_in, A5SCSC_MIF_TARGET_R4,
++	    A5SCSC_STREAM_IN, A5SCSC_MXMGMT_NUM_PACKETS, A5SCSC_MXMGMT_PKT_SIZE,
++	    false, NULL, NULL);
++	if (err != 0) {
++		return err;
+ 	}
+-	v = a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0);
+-	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTMR0, v | ((1u << bit) << 16)); /* MIF:844-860 */
++	err = a5scsc_stream_init(&a5scsc.mxmgmt_out, A5SCSC_MIF_TARGET_R4,
++	    A5SCSC_STREAM_OUT, A5SCSC_MXMGMT_NUM_PACKETS, A5SCSC_MXMGMT_PKT_SIZE,
++	    false, NULL, NULL);
++	if (err != 0) {
++		return err;
++	}
++	err = a5scsc_stream_init(&a5scsc.gdb_r4_in, A5SCSC_MIF_TARGET_R4,
++	    A5SCSC_STREAM_IN, A5SCSC_GDB_NUM_PACKETS, A5SCSC_GDB_PKT_SIZE,
++	    false, NULL, NULL);
++	if (err != 0) {
++		return err;
++	}
++	err = a5scsc_stream_init(&a5scsc.gdb_r4_out, A5SCSC_MIF_TARGET_R4,
++	    A5SCSC_STREAM_OUT, A5SCSC_GDB_NUM_PACKETS, A5SCSC_GDB_PKT_SIZE,
++	    true, NULL, NULL);
++	if (err != 0) {
++		return err;
++	}
++	err = a5scsc_stream_init(&a5scsc.gdb_m4_in, A5SCSC_MIF_TARGET_M4,
++	    A5SCSC_STREAM_IN, A5SCSC_GDB_NUM_PACKETS, A5SCSC_GDB_PKT_SIZE,
++	    false, NULL, NULL);
++	if (err != 0) {
++		return err;
++	}
++	err = a5scsc_stream_init(&a5scsc.gdb_m4_out, A5SCSC_MIF_TARGET_M4,
++	    A5SCSC_STREAM_OUT, A5SCSC_GDB_NUM_PACKETS, A5SCSC_GDB_PKT_SIZE,
++	    true, NULL, NULL);
++	if (err != 0) {
++		return err;
++	}
++	err = a5scsc_stream_init(&a5scsc.mxlog_in, A5SCSC_MIF_TARGET_R4,
++	    A5SCSC_STREAM_IN, A5SCSC_MXLOG_NUM_PACKETS, A5SCSC_MXLOG_PKT_SIZE,
++	    false, a5scsc_mxlog_drain, NULL);
++	if (err != 0) {
++		return err;
++	}
++	a5scsc.transports_ready = true;
++	return 0;
+ }
+ 
+-static void
+-a5scsc_irq_bit_unmask(int bit)
++/* Builds the struct mxconf the R4 reads through MBOX1 (mxman.c:738-760). */
++static int
++a5scsc_mxconf_build(void)
+ {
+-	uint32_t v;
+-	if (bit < 0 || bit >= 16) {
+-		return;
++	uint32_t ref = 0;
++	uint8_t *m;
++
++	if (!a5scsc_mifram_alloc(A5SCSC_MXCONF_SIZE, 4, &ref)) {
++		return ENOMEM;
+ 	}
+-	v = a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0);
+-	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTMR0, v & ~((1u << bit) << 16)); /* MIF:862-878 */
++	m = (uint8_t *)(a5scsc.mif + ref);
++	bzero(m, A5SCSC_MXCONF_SIZE);
++	*(volatile uint32_t *)(void *)(m + 0) = A5SCSC_MXCONF_MAGIC;     /* mxconf.h:120 */
++	*(volatile uint16_t *)(void *)(m + 4) = A5SCSC_MXCONF_VERSION_MAJOR;
++	*(volatile uint16_t *)(void *)(m + 6) = A5SCSC_MXCONF_VERSION_MINOR;
++
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_MX_TRANS + A5SCSC_MXSTREAM_TO_AP,
++	    &a5scsc.mxmgmt_in);
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_MX_TRANS + A5SCSC_MXSTREAM_FROM_AP,
++	    &a5scsc.mxmgmt_out);
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_GDB_R4 + A5SCSC_MXSTREAM_TO_AP,
++	    &a5scsc.gdb_r4_in);
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_GDB_R4 + A5SCSC_MXSTREAM_FROM_AP,
++	    &a5scsc.gdb_r4_out);
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_GDB_M4 + A5SCSC_MXSTREAM_TO_AP,
++	    &a5scsc.gdb_m4_in);
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_GDB_M4 + A5SCSC_MXSTREAM_FROM_AP,
++	    &a5scsc.gdb_m4_out);
++	a5scsc_mxconf_describe(m + A5SCSC_MXCONF_MXLOG, &a5scsc.mxlog_in);
++	a5scsc_mb();
++
++	a5scsc.mxconf_ref = ref;
++	return 0;
+ }
+ 
+-/* Generate an interrupt TO R4 (target 0) or M4 (target 1); MIF:788-829. */
++/* ---- mxlog drain ----------------------------------------------------------
++ * mxlog is a one-way stream of 4-byte records the firmware writes for its own
++ * logging.  Nothing consumes it in this port, but leaving it full would make
++ * the firmware's writes fail, so the poll thread empties it and counts what it
++ * threw away.  STUBBED: no decoding of the records.
++ */
+ static void
+-a5scsc_irq_bit_set(int bit, int target)
++a5scsc_mxlog_drain(int bit __unused, void *arg __unused)
+ {
+-	if (bit < 0 || bit >= 16) {
++	struct a5scsc_stream *s = &a5scsc.mxlog_in;
++	const void *packet;
++	uint32_t drained = 0;
++
++	if (!s->ready) {
+ 		return;
+ 	}
+-	if (target == 0) {
+-		a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTGR1, (1u << bit));
+-	} else {
+-		a5scsc_wr(a5scsc.mbox_m4, A5SCSC_INTGR1, (1u << bit));
++	packet = a5scsc_stream_peek(s, NULL);
++	while (packet != NULL && drained < 512) {
++		drained++;
++		a5scsc_stream_peek_done(s, packet);
++		packet = a5scsc_stream_peek(s, packet);
+ 	}
++	a5scsc.mxlog_dropped += drained;
++}
++
++/* ---- mailbox startup (mxman.c:764-792) ------------------------------------ */
++
++static void
++a5scsc_mbox_init(uint32_t entry_point, uint32_t mxconf_ref)
++{
++	vm_offset_t b = a5scsc.mbox_r4;
++
++	/* MBOX0 = firmware entry point; MBOX1 = R4-relative config address. */
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_0), entry_point);
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_1), mxconf_ref);
++	/* MBOX2 = magic; MBOX3 = startup flags (0 == normal, mxman.c:116). */
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_2), A5SCSC_MBOX_MAGIC);
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_3), 0);
++	printf("A5XELTE SCSC: stage 3/6 mailbox: mbox0 entry 0x%x mbox1 conf 0x%x mbox2 magic 0x%08x\n",
++	    entry_point, mxconf_ref, A5SCSC_MBOX_MAGIC);
++}
++
++/* The vendor driver zeroes every mailbox and pre-masks both banks
++ * (platform_mif.c:655-684).  Mask value 1 == masked.
++ */
++static void
++a5scsc_mbox_bank_init(void)
++{
++	vm_offset_t r4 = a5scsc.mbox_r4;
++	vm_offset_t m4 = a5scsc.mbox_m4;
++	uint32_t i;
++
++	for (i = 0; i < A5SCSC_NUM_MBOX; i++) {
++		a5scsc_wr(r4, A5SCSC_ISSR(i), 0);
++		a5scsc_wr(m4, A5SCSC_ISSR(i), 0);
++	}
++	/* INTMR0 covers interrupts FROM R4/M4 in bits [31:16]: mask all. */
++	a5scsc_wr(r4, A5SCSC_INTMR0, 0xffff0000u);
++	a5scsc_wr(r4, A5SCSC_INTMR1, 0x0000ffffu);       /* to-R4 bank */
++	a5scsc_wr(m4, A5SCSC_INTMR1, 0x0000ffffu);       /* to-M4 bank (MIF:669-672) */
++	/* Clear every pending interrupt. */
++	a5scsc_wr(r4, A5SCSC_INTCR0, 0xffff0000u);
++	a5scsc_wr(r4, A5SCSC_INTCR1, 0x0000ffffu);
++	a5scsc_wr(m4, A5SCSC_INTCR1, 0x0000ffffu);
+ }
+ 
+ /* ---- PMU reset release / hold ---------------------------------------------
+@@ -344,17 +866,26 @@ a5scsc_irq_bit_set(int bit, int target)
+ static void
+ a5scsc_pmu_mem_windows(void)
+ {
+-	/* BASE in CONFIG1 and SIZE in CONFIG0, both in 4 KiB units (MIF:560-579). */
++	/* BASE in CONFIG1 and SIZE in CONFIG0, both in 4 KiB units (MIF:560-579).
++	 * The vendor masks with 0xFFFFFC000, i.e. it keeps bits 12..39 of the
++	 * address; the narrower mask here is equivalent for the 32-bit PA of
++	 * this window. */
+ 	a5scsc_wr(a5scsc.pmu, A5SCSC_WIFI2AP_MEM_CONFIG1,
+-	    (A5SCSC_MIF_DRAM_PA & 0xffffc000u) >> 12);
++	    (A5SCSC_MIF_DRAM_PA & 0xfffff000u) >> 12);
+ 	a5scsc_wr(a5scsc.pmu, A5SCSC_WIFI2AP_MEM_CONFIG0,
+ 	    A5SCSC_MIF_DRAM_SIZE >> 12);
++	/* BT-ABOX window: see A5SCSC_BTABOX_* in the header.  Zero on this board
++	 * in the vendor driver too, because the DT node has no reg. */
++	a5scsc_wr(a5scsc.pmu, A5SCSC_WIFI2AP_MEM_CONFIG3,
++	    (A5SCSC_BTABOX_PA & 0xfffff000u) >> 12);
++	a5scsc_wr(a5scsc.pmu, A5SCSC_WIFI2AP_MEM_CONFIG2,
++	    A5SCSC_BTABOX_SIZE >> 12);
+ }
+ 
+ static int
+ a5scsc_pmu_reset_release(void)
+ {
+-	uint32_t v, state;
++	uint32_t v, state = 0;
+ 	int n;
+ 
+ 	/* Take the WIFI domain out of low-power first (MIF:449-512). */
+@@ -380,14 +911,169 @@ a5scsc_pmu_reset_release(void)
+ 		v = a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS);
+ 		state = (v & A5SCSC_CENTRAL_SEQ_STATES) >> 16;
+ 		if (state == A5SCSC_CENTRAL_SEQ_UP) {
++			printf("A5XELTE SCSC: stage 4/6 reset: released, PMU seq state 0x%x\n",
++			    state);
+ 			return 0;
+ 		}
+ 		delay(1000);    /* 1 ms between polls; 500 ms budget (MIF:438) */
+ 	}
+-	printf("A5XELTE SCSC: PMU WLBT state timeout, STATUS 0x%08x\n", v);
++	printf("A5XELTE SCSC: reset release timed out, PMU seq state 0x%x\n", state);
+ 	return ETIMEDOUT;
+ }
+ 
++/* ---- poll thread ----------------------------------------------------------
++ * One thread for the whole port: it takes the place of the mailbox ISR, and
++ * every stream handler runs here.  Started once, before the reset is released,
++ * so no early firmware interrupt is missed.  It never exits; there is no unload
++ * path in this port.
++ */
++static void
++a5scsc_sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&a5scsc.poll_running, THREAD_UNINT, ms,
++	    1000 * NSEC_PER_USEC);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++a5scsc_poll_thread(void *param __unused, wait_result_t wr __unused)
++{
++	while (a5scsc.poll_running) {
++		a5scsc_intr_dispatch();
++		a5scsc_mxlog_drain(0, NULL);
++		a5scsc_sleep_ms(A5SCSC_POLL_INTERVAL_MS);
++	}
++}
++
++static void
++a5scsc_poll_start(void)
++{
++	thread_t thread = THREAD_NULL;
++
++	if (a5scsc.poll_running) {
++		return;
++	}
++	a5scsc.poll_running = true;
++	a5scsc_mb();
++	if (kernel_thread_start((thread_continue_t)a5scsc_poll_thread, NULL,
++	    &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		a5scsc.poll_running = false;
++		printf("A5XELTE SCSC: poll thread failed to start; no interrupt service\n");
++	}
++}
++
++/* The poll thread only reads INTMSR0/INTCR0.  It is stopped when the reset
++ * sequence fails, because there is then no firmware to deliver anything and
++ * nothing will start it again: the transport stays down and every caller sees
++ * a dead port without another reset attempt behind its back. */
++static void
++a5scsc_poll_stop(void)
++{
++	if (!a5scsc.poll_running) {
++		return;
++	}
++	a5scsc.poll_running = false;
++	a5scsc_mb();
++	thread_wakeup((event_t)&a5scsc.poll_running);
++}
++
++/* ---- shared transport bring-up (a8wifi and a8bt) --------------------------
++ * The PMU/mailbox/MIF startup contract belongs to the shared R4, not to one
++ * service.  The vendor does the same in mxman_start() before any service is
++ * opened (mxman.c:976-991); scsc_mx_service_open() then only calls
++ * mxman_open(), which is a no-op once the core is up (scsc_service.c:582-583).
++ * Both the "a8wifi" thread and the "a8bt" thread come through here, so this
++ * runs at most once.
++ *
++ * a5scsc_transport_state is not atomic.  Boot-time init is single-threaded and
++ * the two boot args are intended as alternatives; if both are set, the second
++ * caller backs off (returns 0) and its own retry loop tries again later.
++ */
++static int a5scsc_transport_state;      /* 0 down, 1 starting, 2 up */
++
++static int
++a5scsc_mbox_map(void)
++{
++	if (a5scsc.mbox_mapped) {
++		return 0;
++	}
++	a5scsc.mbox_r4 = ml_io_map(A5SCSC_MBOX_R4_PA, A5SCSC_MBOX_SIZE);
++	a5scsc.mbox_m4 = ml_io_map(A5SCSC_MBOX_M4_PA, A5SCSC_MBOX_SIZE);
++	if (a5scsc.mbox_r4 == 0 || a5scsc.mbox_m4 == 0) {
++		return ENOMEM;
++	}
++	a5scsc.mbox_mapped = true;
++	return 0;
++}
++
++int
++a5scsc_transport_up(void)
++{
++	int err;
++
++	if (a5scsc_transport_state == 2) {
++		return 1;
++	}
++	if (!a5scsc.pmu_mapped || !a5scsc.mif_mapped) {
++		return 0;
++	}
++	if (a5scsc_transport_state == 1) {
++		return 0;
++	}
++	a5scsc_transport_state = 1;
++
++	if (a5scsc_mbox_map() != 0) {
++		a5scsc_transport_state = 0;
++		return 0;
++	}
++
++	if (!a5scsc.fw_loaded) {
++		err = a5scsc_load_firmware();
++		if (err != 0) {
++			a5scsc_transport_state = 0;
++			return 0;
++		}
++	}
++
++	a5scsc_mbox_bank_init();
++
++	a5scsc_intrbit_init();
++	if (a5scsc_transports_init() != 0) {
++		printf("A5XELTE SCSC: transports_init failed\n");
++		a5scsc_transport_state = 0;
++		return 0;
++	}
++	if (a5scsc_mxconf_build() != 0) {
++		printf("A5XELTE SCSC: mxconf allocation failed\n");
++		a5scsc_transport_state = 0;
++		return 0;
++	}
++	printf("A5XELTE SCSC: stage 2/6 mxconf: at 0x%x, bits tohost 0x%04x r4 0x%04x m4 0x%04x\n",
++	    a5scsc.mxconf_ref, a5scsc.intr_tohost,
++	    a5scsc.intr_fromhost_r4, a5scsc.intr_fromhost_m4);
++
++	a5scsc_mbox_init(a5scsc.fw_entry, a5scsc.mxconf_ref);
++	a5scsc_poll_start();
++
++	err = a5scsc_pmu_reset_release();
++	if (err != 0) {
++		printf("A5XELTE SCSC: reset release failed (%d)\n", err);
++		a5scsc_poll_stop();
++		a5scsc_transport_state = 0;
++		return 0;
++	}
++
++	a5scsc_transport_state = 2;
++	/* STUBBED until patch 0182: the R4's first mxmgmt message
++	 * (MM_START_IND) is not waited for, so "up" below only means the PMU
++	 * state machine accepted the reset. */
++	printf("A5XELTE SCSC: stage 5/6 handshake: STUBBED\n");
++	printf("A5XELTE SCSC: stage 6/6 up: WLBT running, no firmware handshake\n");
++	return 1;
++}
++
+ /* ---- read-only identity report -------------------------------------------- */
+ 
+ static void
+@@ -419,46 +1105,30 @@ a5scsc_print_identity(void)
+ static void
+ a5scsc_bringup_thread(void *param __unused, wait_result_t wr __unused)
+ {
+-	uint32_t mxconf_ref;
+-	int attempt, err = 0;
++	int attempt;
+ 
+-	/* The staged iOS root may not be mounted yet; retry for a while. */
+-	for (attempt = 0; attempt < 60; attempt++) {
+-		err = a5scsc_load_firmware();
+-		if (err == 0) {
++	/* The staged iOS root may not be mounted yet; retry for a while.  A
++	 * missing image is not an error worth more than one line: the port stays
++	 * disabled and nothing else was touched. */
++	for (attempt = 0; attempt < 60 && !a5scsc.fw_loaded; attempt++) {
++		if (a5scsc_load_firmware() == 0) {
+ 			break;
+ 		}
+-		delay(500000);  /* 500 ms */
+-	}
+-	if (err != 0) {
+-		printf("A5XELTE SCSC: firmware not loaded (%d); restart later\n", err);
+-		return;
++		a5scsc_sleep_ms(500);
+ 	}
+-
+-	a5scsc_mbox_bank_init();
+-
+-	/* Reserve the mxconf block and give it the magic/version the R4 checks
+-	 * (mxman.c:721-733).  Transport streams: STUBBED. */
+-	if (!a5scsc_mifram_alloc(A5SCSC_MXCONF_RESERVE, 64, &mxconf_ref)) {
+-		printf("A5XELTE SCSC: mxconf allocation failed\n");
++	if (!a5scsc.fw_loaded) {
++		printf("A5XELTE SCSC: firmware absent or invalid at %s; SCSC port disabled\n",
++		    A5SCSC_FW_PATH);
+ 		return;
+ 	}
+-	{
+-		uint8_t *mxconf = (uint8_t *)a5scsc.mif + mxconf_ref;
+-		bzero(mxconf, A5SCSC_MXCONF_RESERVE);
+-		*(volatile uint32_t *)(mxconf + 0) = A5SCSC_MXCONF_MAGIC;
+-		*(volatile uint16_t *)(mxconf + 4) = A5SCSC_MXCONF_VERSION_MAJOR;
+-		*(volatile uint16_t *)(mxconf + 6) = A5SCSC_MXCONF_VERSION_MINOR;
+-	}
+-
+-	a5scsc_mbox_init(a5scsc.fw_entry, mxconf_ref);
+ 
+-	err = a5scsc_pmu_reset_release();
+-	if (err != 0) {
+-		printf("A5XELTE SCSC: reset release failed (%d)\n", err);
+-		return;
++	for (attempt = 0; attempt < 60; attempt++) {
++		if (a5scsc_transport_up()) {
++			return;
++		}
++		a5scsc_sleep_ms(500);
+ 	}
+-	printf("A5XELTE SCSC: WLBT released from reset; firmware handshake STUBBED\n");
++	printf("A5XELTE SCSC: transport bring-up did not complete\n");
+ }
+ 
+ /* ---- public entry points -------------------------------------------------- */
+@@ -467,13 +1137,16 @@ void
+ a5xelte_scsc_probe(void)
+ {
+ 	int enabled = 0;
++	thread_t thread = THREAD_NULL;
+ 
+ 	/* Default: read-only report only.  a8wifi=1 additionally maps the
+ 	 * mailbox bank and starts the firmware bring-up thread. */
+ 	(void)PE_parse_boot_argn("a8wifi", &enabled, sizeof(enabled));
+ 
+ 	a5scsc.pmu = ml_io_map(A5SCSC_PMU_PA, A5SCSC_PMU_SIZE);
+-	a5scsc.mif = ml_io_map(A5SCSC_MIF_DRAM_PA, A5SCSC_MIF_DRAM_SIZE);
++	/* The MIF window is shared DRAM, mapped write-combined like the vendor's
++	 * pgprot_writecombine() mapping, so packets can be memcpy'd into it. */
++	a5scsc.mif = ml_io_map_wcomb(A5SCSC_MIF_DRAM_PA, A5SCSC_MIF_DRAM_SIZE);
+ 	if (a5scsc.pmu == 0 || a5scsc.mif == 0) {
+ 		printf("A5XELTE SCSC: PMU/MIF map failed (pmu %d mif %d); skipping\n",
+ 		    a5scsc.pmu != 0, a5scsc.mif != 0);
+@@ -489,23 +1162,18 @@ a5xelte_scsc_probe(void)
+ 		return;
+ 	}
+ 
+-	a5scsc.mbox_r4 = ml_io_map(A5SCSC_MBOX_R4_PA, A5SCSC_MBOX_SIZE);
+-	a5scsc.mbox_m4 = ml_io_map(A5SCSC_MBOX_M4_PA, A5SCSC_MBOX_SIZE);
+-	if (a5scsc.mbox_r4 == 0 || a5scsc.mbox_m4 == 0) {
++	if (a5scsc_mbox_map() != 0) {
+ 		printf("A5XELTE SCSC: mailbox map failed\n");
+ 		return;
+ 	}
+-	a5scsc.mbox_mapped = true;
+ 
+ 	a5scsc_print_identity();
+ 
+-	{
+-		thread_t thread = THREAD_NULL;
+-		if (kernel_thread_start((thread_continue_t)a5scsc_bringup_thread, NULL, &thread) == KERN_SUCCESS) {
+-			thread_deallocate(thread);
+-		} else {
+-			printf("A5XELTE SCSC: bring-up thread failed to start\n");
+-		}
++	if (kernel_thread_start((thread_continue_t)a5scsc_bringup_thread, NULL,
++	    &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A5XELTE SCSC: bring-up thread failed to start\n");
+ 	}
+ }
+ 
+@@ -516,4 +1184,4 @@ a5xelte_scsc_probe(void)
+ {
+ }
+ 
+-#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+\ No newline at end of file
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index f21009f..3377fce 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -292,14 +292,23 @@
+  * look instant and long enough not to matter for a booted system. */
+ #define A5SCSC_POLL_INTERVAL_MS         10u
+ 
+-/* Temporary: the 0138 .c reserves this many zeroed bytes instead of writing a
+- * real struct mxconf.  Patch 0181 replaces that with the descriptors above and
+- * deletes this define. */
+-#define A5SCSC_MXCONF_RESERVE   0x200u
+-
+ /* Where the firmware + configuration are expected at runtime.  The vendor
+  * driver reads mx140.bin and the *.hcf config from a base directory
+  * (mx140_file.c:38, 96-98); on iOS the staged iOS root supplies them. */
+ #define A5SCSC_FW_PATH          "/private/var/wifi/mx140.bin"
+ 
++/* ---- transport API --------------------------------------------------------
++ * The transport below the services.  a5scsc_transport_up() is idempotent and
++ * owns firmware load, mailbox setup, stream allocation, mxconf and reset
++ * release; it returns 1 when the R4 has been started, 0 while another caller
++ * owns the bring-up or setup has not finished.  The WiFi glue (0139) and the
++ * BT endpoint (0183) both call it before they use a stream.
++ */
++int  a5scsc_transport_up(void);                                 /* 0/1        */
++int  a5scsc_mifram_alloc(uint32_t nbytes, uint32_t align, uint32_t *out_off);
++void *a5scsc_mifram_ptr(uint32_t off);
++int  a5scsc_mxmgmt_send(uint8_t channel, uint8_t msg, const void *payload,
++    uint32_t len);
++int  a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size);
++
+ #endif /* _A5XELTE_SCSC_H_ */

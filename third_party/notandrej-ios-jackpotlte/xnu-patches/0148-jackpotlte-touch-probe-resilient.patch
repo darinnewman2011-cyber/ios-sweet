@@ -1,0 +1,82 @@
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1506,25 +1506,19 @@
+ 	uint8_t buf[8 * 4];
+ 	unsigned errors = 0;
+ 	unsigned idle = 0;
+-	unsigned ticks = 0, last_moves = 0, last_retries = 0, last_lost = 0;
++	unsigned ticks = 0;
+ 	int last_irq = -1;
+ 	(void)arg;
+ 	(void)result;
+ 	printf("A8 TOUCH: contact worker started (debug log on)\n");
+ 	for (;;) {
+-		/* Every ~16 s with activity: movement events and I2C recoveries,
+-		 * so a swipe that drops events is visible without the raw log. */
++		/* Every ~16 s, always: movement events and I2C recoveries, and a
++		 * heartbeat proving the worker runs even with no touch at all
++		 * (the counters are otherwise only visible during activity). */
+ 		if (++ticks == 2000) {
+ 			ticks = 0;
+-			if (jt_ts_moves != last_moves ||
+-			    jt_ts_retries != last_retries ||
+-			    jt_ts_lost != last_lost) {
+-				printf("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u\n",
+-				    jt_ts_moves, jt_ts_retries, jt_ts_lost);
+-				last_moves = jt_ts_moves;
+-				last_retries = jt_ts_retries;
+-				last_lost = jt_ts_lost;
+-			}
++			printf("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u\n",
++			    jt_ts_moves, jt_ts_retries, jt_ts_lost);
+ 		}
+ 		/* IRQ gpa0-0 (DTS line 635) is level low while events queue. */
+ 		int irq = !!(a5touch_read(jt_ts_pinctrl0,
+@@ -1629,7 +1623,7 @@
+ 		} else {
+ 			printf("A8 TOUCH: status read failed after power\n");
+ 		}
+-		have_id = jtts_read_reg(JTTS_READ_ID, id, sizeof(id));
++		have_id = jtts_read_retry(JTTS_READ_ID, id, sizeof(id));
+ 		if (have_id) {
+ 			printf("A8 TOUCH: id after power %02x%02x%02x\n",
+ 			    id[0], id[1], id[2]);
+@@ -1748,6 +1742,7 @@
+ 	uint8_t boot = 0;
+ 	uint8_t integrity = 0;
+ 	int enabled = 1;
++	bool have_id;
+ 
+ 	(void)PE_parse_boot_argn("a8touch", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+@@ -1768,11 +1763,28 @@
+ 	    a5touch_read(jt_ts_bus, JTTS_IICLC));
+ 	jtts_bus_init();
+ 	jtts_pad_levels("before read");
+-	if (!jtts_read_reg(JTTS_READ_ID, id, sizeof(id))) {
++	/* The IC is flaky at boot: the same read that answers on one boot
++	 * NACKs on the next (seen on the phone as "status read failed after
++	 * power").  This probe's first read used to be a single attempt and a
++	 * failure returned before the contact path started, which left the
++	 * digitizer with no worker and no log at all.  Retry it, recover the
++	 * bus once, and on failure start the contact path anyway so the
++	 * worker, the periodic counters and the enable sequence all run. */
++	have_id = jtts_read_retry(JTTS_READ_ID, id, sizeof(id));
++	if (!have_id) {
+ 		jtts_pad_levels("read failed");
+-		printf("A8 TOUCH: product id read failed stat=%#x con=%#x\n",
++		printf("A8 TOUCH: product id read failed stat=%#x con=%#x, "
++		    "recovering\n",
+ 		    a5touch_read(jt_ts_bus, JTTS_IICSTAT),
+ 		    a5touch_read(jt_ts_bus, JTTS_IICCON));
++		jtts_bus_recover();
++		delay(2);
++		have_id = jtts_read_retry(JTTS_READ_ID, id, sizeof(id));
++	}
++	if (!have_id) {
++		printf("A8 TOUCH: no product id; starting the contact path "
++		    "anyway\n");
++		jackpotlte_touch_contacts(boot);
+ 		return;
+ 	}
+ 	printf("A8 TOUCH: sec_ts product id %02x%02x%02x\n", id[0], id[1], id[2]);

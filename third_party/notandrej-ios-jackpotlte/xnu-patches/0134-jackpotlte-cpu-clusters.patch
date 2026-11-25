@@ -1,0 +1,26 @@
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 1cf0ea0..db794c9 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -113,7 +113,21 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
++/*
++ * Galaxy A8 2018 (jackpotlte, Exynos 7885) has three hardware clusters:
++ * 4x A53 MPIDR 0x100-0x103 (Aff1=1), 2x A53 0x200-0x201 (Aff1=2) and
++ * 2x A73 0x0-0x1 (Aff1=0). The A5XELTE topology path (patch 0115) maps
++ * clusters by MPIDR_CLUSTER_ID, so bringing up all eight CPUs needs
++ * MAX_CPU_CLUSTERS >= 3; with 2 the third cluster trips
++ * assert(cpu->cluster_id < MAX_CPU_CLUSTERS) in ml_parse_cpu_topology().
++ * The A5 donor (two A53 clusters) keeps 2. MAX_CPU_CLUSTER_PHY_ID then
++ * defaults to MAX_CPU_CLUSTERS - 1 = 2, the highest Aff1 here.
++ */
++#if defined(JACKPOTLTE)
++#define MAX_CPU_CLUSTERS               3
++#else
+ #define MAX_CPU_CLUSTERS               2
++#endif
+ 
+ #define CORE_NCTRS                     8
+ #endif  /* ARM64_BOARD_CONFIG_A5XELTE */

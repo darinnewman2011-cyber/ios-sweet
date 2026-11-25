@@ -1,0 +1,422 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -946,21 +946,20 @@ dreamlte_touch_start(void)
+ 
+ #if defined(JACKPOTLTE)
+ /*
+- * The A8's fuel gauge is not driven yet. SweetBattery references this for
+- * every A5XELTE build, so return "no sample"; it then publishes the static
+- * installed-battery fallback.
++ * SweetBattery's A5XELTE branch (iokit/Kernel/arm/SweetBattery.cpp) calls this
++ * name every 30 s on both S8 and A8 builds, so the A8 keeps the interface and
++ * forwards to its own s2mu004 reader: the polled S3C2440 charger/fuel-gauge
++ * transfer in bsd/dev/jackpotlte_pmic.c.  That function is opt-in with
++ * a8battery=1 and returns -1 (no sample, static fallback) otherwise.
+  */
++int jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full);
+ int
+ dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full)
+ {
+-	(void)percent;
+-	(void)mv;
+-	(void)ma;
+-	(void)external;
+-	(void)charging;
+-	(void)full;
+-	return -1;
++	return jackpotlte_battery_read(percent, mv, ma, external, charging,
++	    full);
+ }
+ #endif /* JACKPOTLTE */
+ 
+diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
+--- a/bsd/dev/jackpotlte_pmic.c
++++ b/bsd/dev/jackpotlte_pmic.c
+@@ -13,11 +13,21 @@
+  * (exynos7885-jackpotlte_common.dtsi:196-198, acpm_mfd.c:20,
+  * s2mpu08_core.c:76); its regulator map is named at the end of
+  * jackpotlte_pmic_probe() for a later stage.
++ *
++ * This file is also the data source for the one IOPMPowerSource the A5XELTE
++ * build has: SweetBattery (iokit/Kernel/arm/SweetBattery.cpp), whose A5XELTE
++ * branch calls dreamlte_battery_read() every 30 s.  On the A8 that name is a
++ * forwarder to jackpotlte_battery_read() (bsd/dev/a5xelte_touch.c).  The
++ * periodic path is opt-in with a8battery=1: without it the reader reports "no
++ * sample" and SweetBattery keeps publishing its 100 %/AC fallback, so a boot
++ * without the boot-arg prints and draws exactly what it did before.  Nothing
++ * here writes a charger or fuel-gauge register.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -78,8 +88,41 @@ void jackpotlte_pmic_probe(void);
+ #define JT_CHG_STATUS3		0x0du	/* BAT_STATUS[2:1] (charger.h:132-134) */
+ #define JT_CHG_CTRL0		0x10u	/* EN_CHG[7] (charger.h:147)           */
+ #define JT_CHG_CTRL6		0x16u	/* CV float voltage (charger.c:399-403) */
++#define JT_CHG_CTRL11		0x1bu	/* FIRST_TOPOFF_CURRENT (charger.h:216-219) */
+ #define JT_CHG_REV_ID		0x82u
+ 
++/*
++ * Charger status fields (drivers/battery_v2/include/charger/s2mu004_charger.h):
++ *   STATUS0 CHGIN_STATUS[7:5]   input source, 0 = no input (83-85);
++ *   STATUS1 SELF_DISCHG bit 7, CHG_FAULT[6:3], TOP_OFF bit 1, DONE bit 0
++ *           (91-113);
++ *   STATUS3 BAT_STATUS[2:1], DET_BAT bit 0 (129-134).
++ */
++#define JT_CHGIN(st0)		((unsigned)((st0) >> 5) & 0x7u)
++#define JT_CHG_FAULT(st1)	((unsigned)((st1) >> 3) & 0xfu)
++#define JT_ST1_SELF_DISCHG	0x80u
++#define JT_ST1_TOP_OFF		0x02u
++#define JT_ST1_DONE		0x01u
++#define JT_ST3_DET_BAT		0x01u
++
++/*
++ * CHGIN_STATUS values the vendor driver decodes: 3 and 5 mean "input present,
++ * charging" (s2mu004_charger.c:721-757), 2 is the VBUS over-voltage reported
++ * by its CHGIN interrupt (s2mu004_charger.c:1416-1425), and 0 is "no charger
++ * input" (drivers/muic/s2mu004-muic-afc.c:1305,1337).  The other values are
++ * not named anywhere in the vendor tree, so they are logged raw and treated as
++ * "input present, not charging".
++ */
++#define JT_CHGIN_NONE		0u
++#define JT_CHGIN_OVP		2u
++#define JT_CHGIN_CHARGING(v)	((v) == 3u || (v) == 5u)
++
++/* CHG_FAULT_STATUS values that mean charging has stopped (charger.h:98-103). */
++#define JT_FAULT_WD_SUSPEND	3u
++#define JT_FAULT_WD_RST		4u
++#define JT_FAULT_TSD		5u
++#define JT_FAULT_TFB		6u
++
+ static uint32_t
+ jp_read(vm_offset_t base, uint32_t offset)
+ {
+@@ -96,6 +139,30 @@ jp_write(vm_offset_t base, uint32_t offset, uint32_t value)
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
++/*
++ * Both buses are mapped once and then used by two callers: jackpotlte_pmic_probe()
++ * on the bsd_init thread at root-mount time, and the SweetBattery timer on its
++ * workloop.  Every transfer on either bus is under jp_lock, so a poll can never
++ * interleave with the probe's register sequence (or with itself after a
++ * second caller appears).
++ */
++static vm_offset_t jp_fg;
++static vm_offset_t jp_chg;
++static LCK_GRP_DECLARE(jp_grp, "jackpotlte_pmic");
++static LCK_MTX_DECLARE(jp_lock, &jp_grp);
++
++static bool
++jp_map(void)
++{
++	if (!jp_fg) {
++		jp_fg = ml_io_map(JT_I2C_FUELGAUGE_PA, JT_I2C_WINDOW);
++	}
++	if (!jp_chg) {
++		jp_chg = ml_io_map(JT_I2C_CHARGER_PA, JT_I2C_WINDOW);
++	}
++	return jp_fg && jp_chg;
++}
++
+ /* Polled S3C2440 transfer, ported from bsd/dev/a5xelte_touch.c:224-318. */
+ static bool
+ jp_wait_irq(vm_offset_t i2c)
+@@ -311,33 +378,271 @@ jp_fuelgauge(vm_offset_t fg)
+ 	}
+ }
+ 
++/*
++ * One decoded battery sample.  `charging`, `full` and `external` are the three
++ * properties SpringBoard/backboardd need in order to draw the charging state;
++ * `percent`/`mv`/`ma` are the fuel gauge values IOPMPowerSource carries
++ * alongside them.
++ */
++struct jp_sample {
++	uint8_t st0, st1, st3, ctrl0, ctrl11;
++	unsigned chgin, fault;
++	unsigned topoff;
++	unsigned percent;
++	unsigned mv;
++	int ma;
++	bool external;
++	bool charging;
++	bool full;
++};
++
++/*
++ * Decode matches the vendor's own get_charging_status()
++ * (drivers/battery_v2/s2mu004_charger.c:721-757) rather than a guessed
++ * battery-state enumeration:
++ *   - SELF_DISCHG means the charger is not charging;
++ *   - TOP_OFF/DONE mean the taper is over, and "full" is then decided by
++ *     comparing the measured current against the configured top-off current
++ *     (CTRL11[3:0] * 25 + 100 mA, s2mu004_charger.c:586-600), exactly as the
++ *     vendor does;
++ *   - otherwise CHGIN_STATUS 3 or 5 is "charging" and everything else is
++ *     "not charging" while still reporting external power if the input field
++ *     is non-zero.
++ * BAT_STATUS[2:1] is left undecoded: the vendor driver never interprets it for
++ * this part (it only uses DET_BAT bit 0 for battery presence), so it is logged
++ * raw instead of being turned into a state we cannot justify.
++ */
++static bool
++jp_sample_read(struct jp_sample *s)
++{
++	uint8_t st0 = 0, st1 = 0, st3 = 0, c0 = 0, c11 = 0, b[2];
++	unsigned raw, mv, rsoc_centi, topoff, chgin, fault;
++	int ma;
++
++	if (!jp_map()) {
++		return false;
++	}
++	if (!jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_STATUS0, &st0, 1) ||
++	    !jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_STATUS1, &st1, 1) ||
++	    !jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_STATUS3, &st3, 1) ||
++	    !jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL0, &c0, 1) ||
++	    !jp_read_reg(jp_chg, JT_CHG_ADDR, JT_CHG_CTRL11, &c11, 1)) {
++		return false;
++	}
++	if (!jp_read_reg(jp_fg, JT_FG_ADDR, JT_FG_RVBAT, b, 2)) {
++		return false;
++	}
++	raw = (unsigned)b[0] | ((unsigned)b[1] << 8);
++	mv = (raw * 1000u) >> 13;
++	if (!jp_read_reg(jp_fg, JT_FG_ADDR, JT_FG_RCUR_CC, b, 2)) {
++		return false;
++	}
++	raw = (unsigned)b[0] | ((unsigned)b[1] << 8);
++	if (raw & 0x8000u) {
++		ma = (int)((((~raw) & 0xffffu) + 1u) * 1000u >> 12);
++	} else {
++		ma = -(int)((raw & 0x7fffu) * 1000u >> 12);
++	}
++	if (!jp_read_reg(jp_fg, JT_FG_ADDR, JT_FG_RSOC, b, 2)) {
++		return false;
++	}
++	raw = (unsigned)b[0] | ((unsigned)b[1] << 8);
++	if (raw & 0x8000u) {
++		/* A negative RSOC cannot be published as a capacity. */
++		return false;
++	}
++	rsoc_centi = ((raw & 0x7fffu) * 10000u) / (1u << 14);
++
++	/* Reject a floating/absent battery or a gauge that has not sampled yet
++	 * instead of publishing 0 % (the donor does the same 2800..4600 mV
++	 * sanity check, SweetBattery.cpp:261-265). */
++	if (mv < 2800u || mv > 4600u || rsoc_centi > 10000u) {
++		return false;
++	}
++
++	chgin = JT_CHGIN(st0);
++	fault = JT_CHG_FAULT(st1);
++	topoff = (unsigned)(c11 & 0x0fu) * 25u + 100u;
++
++	s->st0 = st0;
++	s->st1 = st1;
++	s->st3 = st3;
++	s->ctrl0 = c0;
++	s->ctrl11 = c11;
++	s->chgin = chgin;
++	s->fault = fault;
++	s->topoff = topoff;
++	s->mv = mv;
++	s->ma = ma;
++	s->percent = rsoc_centi / 100u;
++	s->external = chgin != JT_CHGIN_NONE;
++	s->full = false;
++	s->charging = false;
++	if (!(st1 & JT_ST1_SELF_DISCHG)) {
++		if (st1 & (JT_ST1_DONE | JT_ST1_TOP_OFF)) {
++			/* The vendor compares CURRENT_AVG; the fuel gauge only has
++			 * instantaneous RCUR_CC, so one sample stands in for it. */
++			if (s->external && ma < (int)topoff) {
++				s->full = true;
++			} else {
++				s->charging = s->external;
++			}
++		} else if (s->external && JT_CHGIN_CHARGING(chgin)) {
++			s->charging = true;
++		}
++	}
++	if (fault == JT_FAULT_WD_SUSPEND || fault == JT_FAULT_WD_RST ||
++	    fault == JT_FAULT_TSD || fault == JT_FAULT_TFB) {
++		/* Watchdog stop / thermal foldback: the charger is not charging
++		 * whatever CHGIN says; keep full so a finished charge stays full. */
++		s->charging = false;
++	}
++	return true;
++}
++
++/* Last good sample, kept across a NACK so one bus error does not flap the
++ * indicator back to the static fallback. */
++static bool jp_have;
++static struct jp_sample jp_last;
++/* Boot-arg parsed once: -1 unknown, 0 off (default), 1 on. */
++static int jp_enabled = -1;
++static bool jp_error_logged;
++
++static const char *
++jp_chgin_name(unsigned chgin)
++{
++	switch (chgin) {
++	case JT_CHGIN_NONE:
++		return "none";
++	case 1:
++		return "input1";
++	case JT_CHGIN_OVP:
++		return "ovp";
++	case 3:
++		return "input3";
++	case 4:
++		return "input4";
++	case 5:
++		return "input5";
++	case 6:
++		return "input6";
++	default:
++		return "input7";
++	}
++}
++
++static void
++jp_log_sample(const struct jp_sample *s)
++{
++	printf("JACKPOTLTE BATTERY: chgin=%u(%s) st0=%#04x st1=%#04x "
++	    "st3=%#04x bat=%u en_chg=%u topoff=%umA vbat=%umV rsoc=%u%% "
++	    "cur=%dmA ext=%d chg=%d full=%d fault=%u\n",
++	    s->chgin, jp_chgin_name(s->chgin), (unsigned)s->st0,
++	    (unsigned)s->st1, (unsigned)s->st3,
++	    ((unsigned)s->st3 & JT_ST3_DET_BAT) ? 1u : 0u,
++	    ((unsigned)s->ctrl0 >> 7) & 1u, s->topoff, s->mv, s->percent,
++	    s->ma, (int)s->external, (int)s->charging, (int)s->full, s->fault);
++}
++
++/*
++ * SweetBattery's data source on A5XELTE (see the top of this file).
++ * 0 = a sample was returned in the output arguments (percent, mv, ma,
++ * external, charging, full); -1 = no sample: the boot-arg is absent or no read
++ * has ever succeeded, and SweetBattery publishes its static fallback.
++ *
++ * Runs from the SweetBattery workloop timer every 30 s, i.e. thread context,
++ * never from an interrupt.  A NACK or timeout keeps the previous sample and is
++ * logged once; the polled transfer bounds each byte to milliseconds, so a dead
++ * bus costs the poll a bounded delay instead of a hang.  Nothing is written to
++ * the charger or the gauge.
++ */
++int
++jackpotlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    int *external, int *charging, int *full)
++{
++	struct jp_sample s, out;
++	bool ok, have;
++
++	lck_mtx_lock(&jp_lock);
++	if (jp_enabled < 0) {
++		int value = 0;
++		(void)PE_parse_boot_argn("a8battery", &value, sizeof(value));
++		jp_enabled = (value == 1) ? 1 : 0;
++		if (!jp_enabled) {
++			printf("JACKPOTLTE BATTERY: off "
++			    "(a8battery=1 reads the s2mu004 charger/fuel gauge)\n");
++		}
++	}
++	if (!jp_enabled) {
++		lck_mtx_unlock(&jp_lock);
++		return -1;
++	}
++
++	ok = jp_sample_read(&s);
++	if (ok) {
++		bool changed = !jp_have ||
++		    s.external != jp_last.external ||
++		    s.charging != jp_last.charging ||
++		    s.full != jp_last.full ||
++		    s.chgin != jp_last.chgin ||
++		    s.fault != jp_last.fault ||
++		    s.percent / 5u != jp_last.percent / 5u;
++		jp_last = s;
++		jp_have = true;
++		if (jp_error_logged) {
++			printf("JACKPOTLTE BATTERY: read recovered\n");
++			jp_error_logged = false;
++		}
++		if (changed) {
++			jp_log_sample(&jp_last);
++		}
++	} else if (!jp_error_logged) {
++		/* One line per error episode: the sample path itself already
++		 * printed the register that NACKed/timed out. */
++		printf("JACKPOTLTE BATTERY: read failed, %s\n",
++		    jp_have ? "keeping the last sample" : "no sample yet");
++		jp_error_logged = true;
++	}
++	have = jp_have;
++	out = jp_last;
++	lck_mtx_unlock(&jp_lock);
++
++	if (!have) {
++		return -1;
++	}
++	*percent = out.percent;
++	*mv = out.mv;
++	*ma = out.ma;
++	*external = out.external ? 1 : 0;
++	*charging = out.charging ? 1 : 0;
++	*full = jp_last.full ? 1 : 0;
++	return 0;
++}
++
+ void
+ jackpotlte_pmic_probe(void)
+ {
+-	vm_offset_t fg;
+-	vm_offset_t chg;
+-
+-	printf("JACKPOTLTE PMIC: probe "
+-	    "(fuel gauge/charger state)\n");
++	printf("JACKPOTLTE PMIC: probe (fuel gauge/charger state)\n");
+ 
++	lck_mtx_lock(&jp_lock);
+ 	/* I2C_FUELGAUGE (i2c_0, 0x13830000): s2mu004 fuel gauge @0x3B. */
+-	fg = ml_io_map(JT_I2C_FUELGAUGE_PA, JT_I2C_WINDOW);
+-	if (!fg) {
++	(void)jp_map();
++	if (!jp_fg) {
+ 		printf("JACKPOTLTE PMIC: fuel-gauge bus mapping failed\n");
+ 	} else {
+-		jp_fuelgauge(fg);
++		jp_fuelgauge(jp_fg);
+ 	}
+ 
+ 	/*
+ 	 * I2C_CHARGER (i2c_1, 0x13840000): s2mu004 MFD/charger @0x3D
+ 	 * (exynos7885-jackpotlte_common.dtsi:1102-1105).  Only reads.
+ 	 */
+-	chg = ml_io_map(JT_I2C_CHARGER_PA, JT_I2C_WINDOW);
+-	if (!chg) {
++	if (!jp_chg) {
+ 		printf("JACKPOTLTE PMIC: charger bus mapping failed\n");
+ 	} else {
+-		jp_charger(chg);
++		jp_charger(jp_chg);
+ 	}
++	lck_mtx_unlock(&jp_lock);
+ 
+ 	/*
+ 	 * Main PMIC rails: not read.  The s2mpu08 is ACPM-gated
+@@ -353,4 +658,4 @@ jackpotlte_pmic_probe(void)
+ 	    "ACPM-gated via the mailbox, not the I2C bus "
+ 	    "(exynos7885-jackpotlte_common.dtsi:196-198)\n");
+ }
+-#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+\ No newline at end of file

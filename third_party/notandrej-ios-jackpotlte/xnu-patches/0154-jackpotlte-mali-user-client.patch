@@ -1,0 +1,656 @@
+--- /dev/null
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -0,0 +1,627 @@
++/*
++ * JackpotlteMali: the Galaxy A8's Mali-G71 (Bifrost, arch 6) for programs to
++ * draw with.
++ *
++ * bsd/dev/jackpotlte_mali.c brings the GPU up (jtmaliprobe=1 jtmalipwr=1
++ * jtmalimetal=1) and, once address space 0 and its page tables are live,
++ * starts this service.  A program that opens it speaks the interface of
++ * Linux's panfrost DRM driver, the one Mesa's panfrost knows: every request
++ * is a call of the user client with the request's number as the selector and
++ * its structure passed in and back.  What Linux does with mmap() on the device
++ * is the client memory of the type that is the buffer's handle.
++ *
++ * The reference is hakios-xnu's RedwoodMali (a Mali-G52); the shape is kept
++ * and the surface type is ours: a buffer made here is kernel-user-shared
++ * memory, and a buffer made from a surface is the pixels of a SweetSurface
++ * (iokit/Kernel/arm/SweetSurface.h), which is what our display stack already
++ * reads.
++ *
++ * What there is: parameters, buffers (made, entered into the GPU's address
++ * space, told their address, mapped, given back), and job chains.  A job chain
++ * is queued and run by bsd/dev/jackpotlte_mali.c's worker; the call returns
++ * with its number and a wait answers when it is done.  Not here yet: a
++ * separate address space per client, interrupts, Metal.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <mach/vm_param.h>
++#include <kern/clock.h>
++#include <sys/systm.h>
++
++#include "SweetSurface.h"
++
++/*
++ * iokit/bsddev/IOKitBSDInit.cpp calls this once the probe has run.
++ * -Wmissing-prototypes (the tree builds with -Weverything -Werror) wants it
++ * declared above either branch's definition, so it is declared out here where
++ * both the board's and the empty one can see it.
++ */
++extern "C" void jackpotlte_mali_service_start(void);
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++extern "C" {
++/* bsd/dev/jackpotlte_mali.c */
++bool jackpotlte_mali_ready(void);
++uint32_t jackpotlte_mali_shader_mask(void);
++bool jackpotlte_mali_parameter(uint32_t which, uint64_t * value);
++uint64_t jackpotlte_mali_address(uint64_t size);
++bool jackpotlte_mali_map(uint64_t gpu, uint64_t phys);
++void jackpotlte_mali_mapped(void);
++void jackpotlte_mali_unmap(uint64_t gpu, uint64_t size);
++uint32_t jackpotlte_mali_submit(uint64_t chain, bool fragment);
++uint64_t jackpotlte_mali_enqueue(uint64_t chain, bool fragment);
++bool jackpotlte_mali_wait(uint64_t seq, uint64_t timeout_ns);
++}
++
++/* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and
++ * structures.  The two 0x7c/0x7d ones are the reference's own (waiting for a
++ * job by its number), since a Darwin client has no sync objects. */
++enum {
++	kDrmGemClose            = 0x09,
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBO         = 0x41,
++	kPanfrostCreateBO       = 0x42,
++	kPanfrostMmapBO         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBOOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kJackpotlteWait         = 0x7d,         /* ours: wait for a job by its number */
++	kJackpotlteSurface      = 0x7e,         /* ours: a surface's memory as a buffer */
++};
++
++struct jackpotlte_surface {
++	uint32_t surface;                       /* the SweetSurface's ID */
++	uint32_t handle;                        /* kSurfaceDescribe: no buffer is wanted; else, back: the buffer */
++	uint64_t size;                          /* how big it is */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++#define kSurfaceDescribe        0xffffffffu
++
++/* kJackpotlteWait: job `seq` done within timeout_ns, or kIOReturnTimeout */
++struct jackpotlte_wait {
++	uint64_t seq;
++	int64_t timeout_ns;
++};
++
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++struct drm_panfrost_submit {
++	uint64_t jc;
++	uint64_t in_syncs;
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++};
++#define PANFROST_JD_REQ_FS      (1u << 0)
++
++struct drm_panfrost_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++
++struct drm_panfrost_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++
++struct drm_panfrost_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++
++struct drm_panfrost_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++
++struct drm_panfrost_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++
++struct drm_panfrost_madvise {
++	uint32_t handle, madv, retained;
++};
++
++#define MALI_BUFFERS            4096
++#define MALI_BUFFER_MAX         (256ull << 20)
++
++struct mali_buffer {
++	IOMemoryDescriptor * memory;            /* made here, or the pixels of a surface */
++	SweetSurface *       surface;
++	uint64_t             address, size;
++	uint64_t             last_seq;          /* the last job given it */
++};
++
++static IOLock * gMaliLock;
++
++/* Activity counters, for a fault report to show; nothing reads them yet. */
++static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class JackpotlteMali : public IOService
++{
++	OSDeclareDefaultStructors(JackpotlteMali);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(JackpotlteMali, IOService);
++
++bool
++JackpotlteMali::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "JackpotlteMaliUserClient");
++	setName("JackpotlteMali");
++	registerService();
++	return true;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class JackpotlteMaliUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(JackpotlteMaliUserClient);
++
++	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextBuffer;
++	uint32_t                fSubmits, fFailed, fRequests;
++
++	struct mali_buffer * buffer(uint32_t handle);
++	void freeBuffer(struct mali_buffer * b);
++	IOReturn createBO(struct drm_panfrost_create_bo * request);
++	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle);
++	IOReturn surfaceBuffer(struct jackpotlte_surface * request);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(JackpotlteMaliUserClient, IOUserClient);
++
++bool
++JackpotlteMaliUserClient::start(IOService * provider)
++{
++	if (!jackpotlte_mali_ready() || !IOUserClient::start(provider)) {
++		IOLog("JackpotlteMali: a client could not be started\n");
++		return false;
++	}
++	IOLog("JackpotlteMali: a client opened the GPU\n");
++	OSIncrementAtomic((SInt32 *) &gMaliClients);
++	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++	return fBuffers != NULL;
++}
++
++struct mali_buffer *
++JackpotlteMaliUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/* With the lock held. */
++void
++JackpotlteMaliUserClient::freeBuffer(struct mali_buffer * b)
++{
++	if (b->last_seq != 0) {
++		(void)jackpotlte_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
++	}
++	jackpotlte_mali_unmap(b->address, b->size);
++	b->memory->release();
++	if (b->surface != NULL) {
++		b->surface->release();
++	}
++	bzero(b, sizeof(*b));
++}
++
++/*
++ * A handle and GPU addresses for `size` bytes of `memory` from byte `from` on,
++ * every page entered into the GPU's tables.  With the lock held; NULL: no
++ * handle, no addresses, or a page that would not go in.  The caller sets
++ * `memory` (and `surface`) of what comes back.
++ */
++struct mali_buffer *
++JackpotlteMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle)
++{
++	struct mali_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLog("JackpotlteMali: no handles left\n");
++		return NULL;
++	}
++	b->address = jackpotlte_mali_address(size);
++	/* every 4 KB of it: the GPU's pages, a quarter of the kernel's 16 KB ones */
++	for (uint64_t offset = 0; offset < size && mapped && b->address != 0; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && jackpotlte_mali_map(b->address + offset, phys);
++	}
++	if (b->address == 0 || !mapped) {
++		if (b->address != 0) {
++			jackpotlte_mali_unmap(b->address, size);
++		}
++		bzero(b, sizeof(*b));
++		IOLog("JackpotlteMali: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	jackpotlte_mali_mapped();
++	OSIncrementAtomic((SInt32 *) &gMaliBuffers);
++	b->size = size;
++	return b;
++}
++
++/* With the lock held. */
++IOReturn
++JackpotlteMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
++{
++	uint64_t size = round_page_64(request->size);
++	IOBufferMemoryDescriptor * memory;
++	struct mali_buffer * b;
++
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("JackpotlteMali: no memory for a buffer of %llu bytes\n", size);
++		return kIOReturnNoMemory;
++	}
++	b = newBuffer(memory, 0, size, &request->handle);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	b->memory = memory;
++	request->offset = b->address;
++	return kIOReturnSuccess;
++}
++
++/*
++ * The pixels of a SweetSurface as a buffer.  Our surfaces have no state page at
++ * the front of their memory (unlike the reference's MiniIOSurface), so the
++ * mapping starts at byte 0 and `offset` says where in it the pixels are.  The
++ * surface is held for as long as the buffer is there; a surface that is a
++ * buffer of this client's already is that buffer again.  Asked only to
++ * describe, no buffer is made.
++ */
++IOReturn
++JackpotlteMaliUserClient::surfaceBuffer(struct jackpotlte_surface * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++	IOMemoryDescriptor * memory = NULL;
++	struct mali_buffer * b = NULL;
++	uint64_t size;
++
++	if (s == NULL || s->memory == NULL) {
++		OSSafeReleaseNULL(s);
++		return kIOReturnNotFound;
++	}
++	/* Unlike the reference's IOSurface, ours has no shared state page at the
++	 * front: the pixels start at `offset` in the memory.  The buffer is made
++	 * from that offset on, so its address is the first pixel's. */
++	if ((uint64_t)s->offset >= s->allocSize) {
++		s->release();
++		return kIOReturnBadArgument;
++	}
++	size = round_page_64((uint64_t)s->allocSize - s->offset);
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	memory = s->offset == 0 ? s->memory :
++	    IOSubMemoryDescriptor::withSubRange(s->memory, s->offset, size, kIODirectionInOut);
++	if (memory == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	memory->retain();                       /* ours, or a second reference for the buffer */
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kSurfaceDescribe) {
++		request->handle = 0;
++		memory->release();
++		s->release();
++		return kIOReturnSuccess;
++	}
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		memory->release();
++		s->release();
++		return kIOReturnSuccess;
++	}
++	b = newBuffer(memory, 0, size, &request->handle);
++	if (b == NULL) {
++		memory->release();
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	b->memory = memory;                     /* newBuffer does not set it */
++	b->surface = s;                         /* the reference from sweet_surface_copy */
++	return kIOReturnSuccess;
++}
++
++IOReturn
++JackpotlteMaliUserClient::clientClose(void)
++{
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL) {
++			freeBuffer(&fBuffers[i]);
++		}
++	}
++	IOLockUnlock(gMaliLock);
++	if (fSubmits != 0) {
++		IOLog("JackpotlteMali: a client goes after %u job chains, %u of them unfinished\n", fSubmits, fFailed);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++JackpotlteMaliUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++JackpotlteMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gMaliLock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gMaliLock);
++	return ret;
++}
++
++IOReturn
++JackpotlteMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    __unused IOExternalMethodDispatch * dispatch, __unused OSObject * target,
++    __unused void * reference)
++{
++	union {
++		struct drm_gem_close close;
++		struct drm_panfrost_submit submit;
++		struct drm_panfrost_wait_bo wait;
++		struct drm_panfrost_create_bo create;
++		struct drm_panfrost_mmap_bo mmap;
++		struct drm_panfrost_get_param param;
++		struct drm_panfrost_get_bo_offset offset;
++		struct drm_panfrost_madvise madvise;
++		struct jackpotlte_surface surface;
++		struct jackpotlte_wait waitseq;
++	} r;
++	size_t size = args->structureInputSize;
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!jackpotlte_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	/* the two waits, without holding everybody else up */
++	if (selector == kJackpotlteWait || selector == kPanfrostWaitBO) {
++		uint64_t seq = r.waitseq.seq;
++		int64_t timeout = r.waitseq.timeout_ns;
++
++		if (selector == kPanfrostWaitBO) {
++			IOLockLock(gMaliLock);
++			b = buffer(r.wait.handle);
++			seq = b != NULL ? b->last_seq : 0;
++			IOLockUnlock(gMaliLock);
++			timeout = r.wait.timeout_ns;
++			if (b == NULL) {
++				return kIOReturnNotFound;
++			}
++		}
++		ret = seq == 0 || jackpotlte_mali_wait(seq, timeout > 0 ? (uint64_t) timeout : 0) ?
++		    kIOReturnSuccess : kIOReturnTimeout;
++		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++			memcpy(args->structureOutput, &r, size);
++			args->structureOutputSize = (uint32_t) size;
++		}
++		return ret;
++	}
++	IOLockLock(gMaliLock);
++	if (fRequests++ < 32) {
++		IOLog("JackpotlteMali: request %#x, %zu bytes\n", selector, size);
++	}
++	switch (selector) {
++	case kPanfrostGetParam:
++		if (!jackpotlte_mali_parameter(r.param.param, &r.param.value)) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case kPanfrostCreateBO:
++		ret = createBO(&r.create);
++		break;
++	case kPanfrostMmapBO:                   /* the offset is the handle: the program maps client memory of that type */
++		ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.mmap.offset = (uint64_t) r.mmap.handle << 12;
++		break;
++	case kPanfrostGetBOOffset:
++		b = buffer(r.offset.handle);
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.offset.offset = b != NULL ? b->address : 0;
++		break;
++	case kPanfrostSubmit: {
++		/* queued, not run here: the job's number goes back in `jc`, and every buffer it names
++		 * remembers it (kPanfrostWaitBO, and no buffer is freed under a job that uses it) */
++		uint64_t seq = 0;
++
++		fSubmits++;
++		gMaliSubmits++;
++		if (r.submit.jc != 0) {
++			seq = jackpotlte_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
++			if (seq == 0) {
++				gMaliFailed++;
++			}
++		}
++		for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
++			uint32_t handles[64];
++			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++			if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++				break;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				b = buffer(handles[k]);
++				if (b != NULL) {
++					b->last_seq = seq;
++				}
++			}
++		}
++		r.submit.jc = seq;
++		break;
++	}
++	case kJackpotlteSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
++	case kPanfrostWaitBO:                   /* every job has finished before its submission returned */
++		ret = buffer(r.wait.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		break;
++	case kPanfrostMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kDrmGemClose:
++		b = buffer(r.close.handle);
++		if (b != NULL) {
++			freeBuffer(b);
++		} else {
++			ret = kIOReturnNotFound;
++		}
++		break;
++	default:
++		IOLog("JackpotlteMali: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gMaliLock);
++
++	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++		memcpy(args->structureOutput, &r, size);
++		args->structureOutputSize = (uint32_t) size;
++	}
++	return ret;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++/*
++ * Add the service once the GPU is up.  The probe runs from IOKitBSDInit, so
++ * this is called from there and waits a moment for the platform to settle
++ * before it creates an IOService on it (as the reference's RedwoodMaliStart
++ * does from its bring-up thread).
++ */
++static void
++jackpotlte_mali_service_thread(void * parameter, wait_result_t result)
++{
++	IOService * provider;
++	JackpotlteMali * gpu;
++
++	(void)parameter;
++	(void)result;
++	delay(1000 * 1000);
++	if (!jackpotlte_mali_ready()) {
++		IOLog("JackpotlteMali: the GPU did not come up; no service\n");
++		return;
++	}
++	gMaliLock = IOLockAlloc();
++	provider = IOService::getPlatform();
++	gpu = OSTypeAlloc(JackpotlteMali);
++	if (gMaliLock == NULL || gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("JackpotlteMali: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("JackpotlteMali: the service did not start\n");
++	} else {
++		IOLog("JackpotlteMali: the GPU is there for programs to draw with\n");
++	}
++	gpu->release();
++}
++
++extern "C" void
++jackpotlte_mali_service_start(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(jackpotlte_mali_service_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++extern "C" void
++jackpotlte_mali_service_start(void)
++{
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/JackpotlteMali.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -75,2 +75,3 @@
+ extern void jackpotlte_mali_probe(void);
++extern void jackpotlte_mali_service_start(void);
+ extern void a5xelte_usb_probe(void);
+@@ -786,6 +786,9 @@
+ 	a5xelte_panel_init();
+ /* Galaxy A8 2018: Mali GPU bring-up (M0/M1), gated by jtmaliprobe/jtmalipwr. */
+ 	jackpotlte_mali_probe();
++	/* Galaxy A8 2018: the Mali service programs draw through, once
++	 * jtmalimetal brought the engine up (iokit/Kernel/arm/JackpotlteMali.cpp). */
++	jackpotlte_mali_service_start();
+ #if defined(JACKPOTLTE)
+ 	jackpotlte_pmic_probe();
+ #endif

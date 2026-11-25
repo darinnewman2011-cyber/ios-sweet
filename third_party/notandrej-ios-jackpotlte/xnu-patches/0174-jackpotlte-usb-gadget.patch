@@ -1,0 +1,707 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -1,31 +1,50 @@
+ /*
+- * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) USB bring-up, step 1:
+- * read-only DWC3 + PHY state probe.
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) USB:
++ * state probe plus a polled DWC3 gadget that enumerates as an iPhone.
+  *
+  * The USB device controller is a Synopsys DWC3 (USB 2.0 only; the board caps
+  * it at high speed) at 0x13600000, behind Samsung's "samsung,exynos-dwusb"
+  * glue, with the Samsung combo USB DRD PHY at 0x135D0000. Both live in the
+  * FSYS power/clock domain: the FSYS power switch is a PMU register and the
+  * FSYS block's clocks are Q-channel gates in the FSYS CMU. S-Boot drives
+- * this controller for Odin/download mode and hands it over in an unknown
+- * state; this probe only reports what it finds.
++ * this controller for Odin/download mode, so `fastboot boot` hands it over
++ * powered, clocked, in device mode and halted.
+  *
+- * It writes no register, and it reads the DWC3 / PHY register blocks only
+- * when the PMU says the FSYS domain is powered and the USB30DRD Q-channel
+- * says the block clock is enabled (a read of a gated block would hang).
++ * The probe reports that state and writes nothing.  The gadget then keeps the
++ * scheme the donor's SWEET port proved (xnu/patches/0072-0081): restart only
++ * the device controller, give it an event buffer in kernel DMA memory, arm
++ * endpoint 0, poll GEVNTCOUNT from a kernel thread, and answer control
++ * transfers from a small state machine modelled on Linux dwc3 ep0.c.  It
++ * writes the PHY's VBUS force bits (this board has no VBUS pad) and the DWC3
++ * device registers, and nothing else: no PMU or CMU writes yet, because
++ * those need the vendor's handshake sequences and the expected state here is
++ * "already on".
+  *
+- * Every address and bit below cites Samsung's own 4.4 tree (Eureka-Kernel)
+- * or the mainline jackpotlte device tree; see the comments. Nothing here is
+- * guessed. This file is compiled for the A5XELTE machine config; the A8
+- * values are selected under JACKPOTLTE and no code is emitted otherwise.
++ * The identity in the descriptors is Apple's (VID 0x05ac, the iPhone PID)
++ * with an iPhone product string and the vendor-specific interface an iPhone
++ * exposes; see the descriptor table.  Boot arg a8usbgadget=0 disables it.
++ *
++ * Every address and bit below cites Samsung's own tree (Eureka-Kernel) or
++ * the jackpotlte device tree; see the comments. This file is compiled for the
++ * A5XELTE machine config; the A8 values are selected under JACKPOTLTE and no
++ * code is emitted otherwise.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void a5xelte_usb_probe(void);
++static void a8_usb_gadget_start(vm_offset_t dwc, vm_offset_t phy);
+ 
+ #if defined(JACKPOTLTE)
+ 
+@@ -80,6 +99,7 @@ void a5xelte_usb_probe(void);
+ #define A8_GSTS        0xc118u
+ #define A8_GSNPSID     0xc120u
+ #define A8_GHWPARAMS0  0xc140u
++#define A8_GHWPARAMS3  0xc148u
+ #define A8_GEVNTADRLO  0xc400u
+ #define A8_GEVNTADRHI  0xc404u
+ #define A8_GEVNTSIZ    0xc408u
+@@ -114,6 +134,13 @@ a8_usb_rd(vm_offset_t base, uint32_t off)
+ 	return value;
+ }
+ 
++static void
++a8_usb_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ void
+ a5xelte_usb_probe(void)
+ {
+@@ -154,10 +181,22 @@ a5xelte_usb_probe(void)
+ 	    qch_hsdrd, qch_usb20, qch_usb30_0, qch_usb30_1);
+ 	printf("A5XELTE USB: CMU gate USB30DRD 0x%08x\n", cmu_gate);
+ 
+-	/* Both the FSYS power switch and the USB30DRD clock must be on before
+-	 * the DWC3 block may be touched (a read of a gated block would hang). */
++	/*
++	 * Both the FSYS power switch and the USB30DRD clock must be on before
++	 * the DWC3 block may be touched: a read of a gated block hangs the
++	 * bus.  S-Boot runs this controller in device mode for its own
++	 * download mode (Odin/fastboot) and `fastboot boot` does not go
++	 * through a power-down, so the expected state here is on/on.  These
++	 * registers are only reported, not written: the vendor's power-up is
++	 * a PMU handshake (mask/value plus an ack bit) and its clock gates are
++	 * CMU fields this file does not implement, so a wrong write here would
++	 * hang the SoC for no gain.  If the next console shows them off, that
++	 * is the observation to implement against.
++	 */
+ 	if (!powered || !clocked) {
+-		printf("A5XELTE USB: controller unpowered or unclocked; DWC3 not read\n");
++		printf("A5XELTE USB: controller unpowered or unclocked "
++		    "(power %s, clock %s); DWC3 not read\n",
++		    powered ? "on" : "off", clocked ? "on" : "off");
+ 		return;
+ 	}
+ 
+@@ -169,6 +208,8 @@ a5xelte_usb_probe(void)
+ 	printf("A5XELTE USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    a8_usb_rd(dwc, A8_GSNPSID), a8_usb_rd(dwc, A8_GCTL), a8_usb_rd(dwc, A8_GSTS),
+ 	    a8_usb_rd(dwc, A8_GHWPARAMS0));
++	printf("A5XELTE USB: DWC3 GHWPARAMS3 0x%08x (endpoint and fifo report)\n",
++	    a8_usb_rd(dwc, A8_GHWPARAMS3));
+ 	printf("A5XELTE USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+ 	    a8_usb_rd(dwc, A8_DCFG), a8_usb_rd(dwc, A8_DCTL), a8_usb_rd(dwc, A8_DEVTEN),
+ 	    a8_usb_rd(dwc, A8_DSTS), a8_usb_rd(dwc, A8_DALEPENA));
+@@ -191,6 +232,585 @@ a5xelte_usb_probe(void)
+ 	printf("A5XELTE USB: PHY PHYTEST 0x%08x PHYADP 0x%08x PHYRESUME 0x%08x LINKPORT 0x%08x\n",
+ 	    a8_usb_rd(phy, A8_PHY_PHYTEST), a8_usb_rd(phy, A8_PHY_PHYADP),
+ 	    a8_usb_rd(phy, A8_PHY_PHYRESUME), a8_usb_rd(phy, A8_PHY_LINKPORT));
++
++	a8_usb_gadget_start(dwc, phy);
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * Device mode: the gadget
++ * ---------------------------------------------------------------------------
++ *
++ * The donor's SWEET port (0072-0081) proved this scheme on another SoC: the
++ * bootloader leaves DWC3 powered, clocked, in device mode and halted, and the
++ * kernel restarts only the device controller -- soft reset, an event buffer in
++ * kernel DMA memory, endpoint 0, a kernel thread polling GEVNTCOUNT, and a
++ * control-transfer state machine that follows Linux dwc3 ep0.c.  The register
++ * layout is Synopsys'; what is Samsung's is the wrapper, the PHY and the
++ * power/clock domain, cited from the Eureka tree.
++ */
++
++/* ---- DWC3 registers the gadget drives (Synopsys databook block layout) ---- */
++#define A8_DEPCMDPAR2(n)   (0xc800u + 0x10u * (n))
++#define A8_DEPCMDPAR1(n)   (0xc804u + 0x10u * (n))
++#define A8_DEPCMDPAR0(n)   (0xc808u + 0x10u * (n))
++#define A8_DEPCMD(n)       (0xc80cu + 0x10u * (n))
++
++#define A8_DCTL_RUN_STOP   (1u << 31)
++#define A8_DCTL_CSFTRST    (1u << 30)
++#define A8_DSTS_DEVCTRLHLT (1u << 22)
++#define A8_GUSB2PHYCFG_SUSPHY     (1u << 6)
++#define A8_GUSB2PHYCFG_PHYSOFTRST (1u << 31)
++
++#define A8_DEPCMD_SETEPCONFIG       1u
++#define A8_DEPCMD_SETTRANSFRESOURCE 2u
++#define A8_DEPCMD_SETSTALL          4u
++#define A8_DEPCMD_STARTTRANSFER     6u
++#define A8_DEPCMD_DEPSTARTCFG       9u
++#define A8_DEPCMD_CMDACT            (1u << 10)
++
++#define A8_TRB_HWO      (1u << 0)
++#define A8_TRB_LST      (1u << 1)
++#define A8_TRB_ISP_IMI  (1u << 10)
++#define A8_TRB_IOC      (1u << 11)
++#define A8_TRBCTL_SETUP    (2u << 4)
++#define A8_TRBCTL_STATUS2  (3u << 4)
++#define A8_TRBCTL_STATUS3  (4u << 4)
++#define A8_TRBCTL_DATA     (5u << 4)
++#define A8_TRBCTL_NORMAL   (1u << 4)
++
++/* ---- the gadget's DMA area (contiguous, 4 KiB) ---- */
++#define A8G_EVT        0x0000u
++#define A8G_EVT_SIZE   0x1000u
++#define A8G_TRB_OUT    0x1000u
++#define A8G_TRB_IN     0x1010u
++#define A8G_TRB_RX     0x1020u
++#define A8G_SETUP_BUF  0x1040u
++#define A8G_DATA_BUF   0x1100u
++#define A8G_RX         0x2000u
++#define A8G_RX_MAX     0x800u
++#define A8G_DMA_SIZE   0x4000u
++
++/* Physical endpoints: 2n = OUT, 2n+1 = IN (DWC3 numbering). */
++#define A8G_EP_RX      2u
++#define A8G_EP_TX      3u
++
++/* ---- Samsung combo PHY v3.0.0 (phy-exynos-usb3p1-reg.h) ----
++ * The board sets is_not_vbus_pad = <1> (exynos7885.dtsi, dwc3 node), so the
++ * vendor driver *forces* BVALID/VBUSVALID and selects the external VBUS valid
++ * input on the PHY's HSP block instead of reading a VBUS pad
++ * (phy-exynos-usb3p1.c:315-330).  Those are the bits that let a device connect
++ * at all on this board. */
++#define A8_PHY_LINK_CTRL   0x04u
++#define A8_PHY_LINK_PORT   0x08u
++#define A8_PHY_UTMI        0x50u
++#define A8_PHY_HSP         0x54u
++
++#define A8_UTMI_FORCE_VBUSVALID (1u << 5)
++#define A8_UTMI_FORCE_BVALID    (1u << 4)
++#define A8_UTMI_DP_PULLDOWN     (1u << 3)
++#define A8_UTMI_DM_PULLDOWN     (1u << 2)
++#define A8_UTMI_FORCE_SUSPEND   (1u << 1)
++#define A8_UTMI_FORCE_SLEEP     (1u << 0)
++
++#define A8_HSP_VBUSVLDEXTSEL    (1u << 13)
++#define A8_HSP_VBUSVLDEXT       (1u << 12)
++
++static struct {
++	vm_offset_t dwc;
++	vm_offset_t dma;
++	uint64_t    dma_pa;
++	uint32_t    evt_pos;
++	uint32_t    events;
++	int         sleep_chan;
++	enum { A8G_SETUP, A8G_DATA, A8G_WAIT_STATUS2, A8G_WAIT_STATUS3,
++	    A8G_STATUS } state;
++	bool        data_in;
++	bool        configured;
++} a8g;
++
++static inline void
++a8_dwc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a8g.dwc + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++a8g_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(a8g.dma_pa + off), len, TRUE);
++}
++
++static void
++a8g_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a8g.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++a8g_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	a8_dwc_wr(A8_DEPCMDPAR0(ep), p0);
++	a8_dwc_wr(A8_DEPCMDPAR1(ep), p1);
++	a8_dwc_wr(A8_DEPCMDPAR2(ep), p2);
++	a8_dwc_wr(A8_DEPCMD(ep), cmd | A8_DEPCMD_CMDACT);
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = a8_usb_rd(a8g.dwc, A8_DEPCMD(ep));
++
++		if (!(v & A8_DEPCMD_CMDACT)) {
++			uint32_t status = (v >> 12) & 0xf;
++			if (status) {
++				printf("A5XELTE USB: ep%u cmd 0x%x status %u\n",
++				    ep, cmd & 0xf, status);
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	printf("A5XELTE USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	return -1;
++}
++
++static void
++a8g_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len,
++    uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(a8g.dma + trb);
++	uint64_t bpa = a8g.dma_pa + buf;
++	uint64_t tpa = a8g.dma_pa + trb;
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = ctl | A8_TRB_HWO | A8_TRB_LST | A8_TRB_ISP_IMI | A8_TRB_IOC;
++	a8g_sync(trb, 16);
++	if (len) {
++		a8g_sync(buf, len);
++	}
++	a8g_epcmd(ep, A8_DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32),
++	    (uint32_t)tpa, 0);
++}
++
++/* ep0: 0 = OUT, 1 = IN. */
++static void
++a8g_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	a8g_start_trb(ep, ep ? A8G_TRB_IN : A8G_TRB_OUT, buf, len, ctl);
++}
++
++static void
++a8g_start_setup(void)
++{
++	a8g.state = A8G_SETUP;
++	a8g_start(0, A8G_SETUP_BUF, 8, A8_TRBCTL_SETUP);
++}
++
++static void
++a8g_stall(void)
++{
++	a8g_epcmd(0, A8_DEPCMD_SETSTALL, 0, 0, 0);
++	a8g_start_setup();
++}
++
++/*
++ * The identity: Apple's vendor ID and the iPhone 8/8 Plus/X product ID, with
++ * the strings a host shows.  lsusb prints the vendor's name from its own table
++ * and this product string, so it reads "Apple, Inc. iPhone".  Interface 0 is
++ * the vendor-specific one an iPhone exposes in normal mode (0xff/0xfe/0x02)
++ * with a bulk pair -- the interface libusb and usbmuxd look for.
++ */
++static const uint8_t a8g_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0xac, 0x05,             /* idVendor  = 0x05ac (Apple) */
++	0xa8, 0x12,             /* idProduct = 0x12a8 (iPhone 8/8 Plus/X) */
++	0x00, 0x01,             /* bcdDevice = 1.00 */
++	1, 2, 3,                /* manufacturer, product, serial strings */
++	1,
++};
++static const uint8_t a8g_cfg_desc[32] = {
++	9, 2, 32, 0, 1, 1, 0, 0x80, 250,       /* config: 1 interface, 500 mA */
++	9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,    /* iface 0: vendor, 2 bulk eps */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,       /* ep 0x01 bulk OUT, 512 */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,       /* ep 0x81 bulk IN, 512 */
++};
++/* High-speed device qualifier: a high-speed-capable device answers it. */
++static const uint8_t a8g_qual_desc[10] = {
++	10, 6, 0x00, 0x02, 0x00, 0x00, 0x00, 64, 1, 0,
++};
++static const char *const a8g_strings[] = {
++	NULL, "Apple Inc.", "iPhone", "D22AP0000001",
++};
++
++static uint32_t
++a8g_string(unsigned idx, uint8_t *out)
++{
++	uint32_t n = 2;
++
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
++		return 4;
++	}
++	if (idx >= sizeof(a8g_strings) / sizeof(a8g_strings[0])) {
++		return 0;
++	}
++	for (const char *s = a8g_strings[idx]; *s && n < 126; s++) {
++		out[n++] = (uint8_t)*s;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++static void
++a8g_rx_arm(void)
++{
++	a8g_start_trb(A8G_EP_RX, A8G_TRB_RX, A8G_RX, A8G_RX_MAX, A8_TRBCTL_NORMAL);
++}
++
++/*
++ * SET_CONFIGURATION(1): the vendor interface's bulk pair.  Nothing is expected
++ * on them yet, so OUT data is read and dropped; what matters here is that the
++ * endpoints exist, which is what lets the host finish configuring and the
++ * device stay enumerated.
++ */
++static void
++a8g_configure(void)
++{
++	if (a8g.configured) {
++		return;
++	}
++	if (a8g_epcmd(0, A8_DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    a8g_epcmd(A8G_EP_RX, A8_DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3),
++	    (1u << 8) | ((uint32_t)A8G_EP_RX << 25), 0) ||
++	    a8g_epcmd(A8G_EP_RX, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    a8g_epcmd(A8G_EP_TX, A8_DEPCMD_SETEPCONFIG,
++	    (2u << 1) | (512u << 3) | (1u << 17),
++	    (1u << 8) | ((uint32_t)A8G_EP_TX << 25), 0) ||
++	    a8g_epcmd(A8G_EP_TX, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("A5XELTE USB: data endpoints setup failed\n");
++		return;
++	}
++	a8_dwc_wr(A8_DALEPENA, a8_usb_rd(a8g.dwc, A8_DALEPENA) |
++	    (1u << A8G_EP_RX) | (1u << A8G_EP_TX));
++	a8g.configured = true;
++	a8g_rx_arm();
++	printf("A5XELTE USB: configured, bulk 0x01/0x81 armed\n");
++}
++
++static void
++a8g_setup(void)
++{
++	const uint8_t *st = (const uint8_t *)(a8g.dma + A8G_SETUP_BUF);
++	uint8_t *data = (uint8_t *)(a8g.dma + A8G_DATA_BUF);
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint32_t n = 0;
++	bool ok = true;
++
++	printf("A5XELTE USB: setup %02x %02x %04x %04x len %u\n",
++	    type, req, value, index, length);
++	a8g.data_in = (type & 0x80) != 0;
++	if ((type & 0x60) != 0) {               /* class/vendor: nothing yet */
++		ok = false;
++	} else if (req == 6) {                  /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1:
++			memcpy(data, a8g_dev_desc, sizeof(a8g_dev_desc));
++			n = sizeof(a8g_dev_desc);
++			break;
++		case 2:
++		case 7:                         /* other-speed configuration */
++			memcpy(data, a8g_cfg_desc, sizeof(a8g_cfg_desc));
++			n = sizeof(a8g_cfg_desc);
++			break;
++		case 3:
++			n = a8g_string(value & 0xff, data);
++			ok = n != 0;
++			break;
++		case 6:
++			memcpy(data, a8g_qual_desc, sizeof(a8g_qual_desc));
++			n = sizeof(a8g_qual_desc);
++			break;
++		default:
++			ok = false;
++			break;
++		}
++	} else if (req == 5) {                  /* SET_ADDRESS */
++		uint32_t dcfg = a8_usb_rd(a8g.dwc, A8_DCFG) & ~(0x7fu << 3);
++
++		a8_dwc_wr(A8_DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
++		printf("A5XELTE USB: address %u\n", value & 0x7f);
++	} else if (req == 9) {                  /* SET_CONFIGURATION */
++		if (value == 1) {
++			a8g_configure();
++		}
++		printf("A5XELTE USB: configured (%u)\n", value);
++	} else if (req == 8) {                  /* GET_CONFIGURATION */
++		data[0] = a8g.configured ? 1 : 0;
++		n = 1;
++	} else if (req == 0) {                  /* GET_STATUS */
++		data[0] = 0;
++		data[1] = 0;
++		n = 2;
++	} else if (req == 10) {                 /* GET_INTERFACE */
++		data[0] = 0;
++		n = 1;
++	} else if (req == 11 || req == 1 || req == 3) {
++		/* SET_INTERFACE, CLEAR/SET_FEATURE: nothing to do. */
++	} else {
++		ok = false;
++	}
++	if (!ok) {
++		a8g_stall();
++		return;
++	}
++	if (length == 0) {
++		a8g.state = A8G_WAIT_STATUS2;
++		return;
++	}
++	a8g.state = A8G_DATA;
++	if (a8g.data_in) {
++		if (n > length) {
++			n = length;
++		}
++		a8g_start(1, A8G_DATA_BUF, n, A8_TRBCTL_DATA);
++	} else {
++		a8g_start(0, A8G_DATA_BUF, 64, A8_TRBCTL_DATA);
++	}
++}
++
++static void
++a8g_event(uint32_t ev)
++{
++	if (ev & 1) {                           /* device event */
++		uint32_t type = (ev >> 8) & 0xf;
++
++		if (type == 1) {                /* USB reset */
++			a8_dwc_wr(A8_DCFG,
++			    a8_usb_rd(a8g.dwc, A8_DCFG) & ~(0x7fu << 3));
++			a8g.configured = false;
++			printf("A5XELTE USB: bus reset\n");
++		} else if (type == 2) {         /* connect done */
++			uint32_t speed = a8_usb_rd(a8g.dwc, A8_DSTS) & 7;
++
++			a8g_epcmd(0, A8_DEPCMD_SETEPCONFIG,
++			    (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (0u << 25), 0);
++			a8g_epcmd(1, A8_DEPCMD_SETEPCONFIG,
++			    (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (1u << 25), 0);
++			printf("A5XELTE USB: connected, speed %u\n", speed);
++		} else if (type == 0) {
++			printf("A5XELTE USB: disconnect\n");
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++
++	if (ep == A8G_EP_RX && type == 1) {
++		a8g_rx_arm();           /* drop whatever the host sent */
++		return;
++	}
++	if (ep == A8G_EP_TX && type == 1) {
++		return;
++	}
++	if (ep > 1) {
++		return;
++	}
++	if (type == 1) {                        /* XferComplete */
++		switch (a8g.state) {
++		case A8G_SETUP:
++			a8g_sync(A8G_SETUP_BUF, 8);
++			a8g_setup();
++			break;
++		case A8G_DATA:
++			a8g.state = A8G_WAIT_STATUS3;
++			break;
++		case A8G_STATUS:
++			a8g_start_setup();
++			break;
++		default:
++			break;
++		}
++		return;
++	}
++	if (type == 3 && status == 2) {         /* XferNotReady: status */
++		if (a8g.state == A8G_WAIT_STATUS2 ||
++		    a8g.state == A8G_WAIT_STATUS3) {
++			uint32_t ctl = a8g.state == A8G_WAIT_STATUS3 ?
++			    A8_TRBCTL_STATUS3 : A8_TRBCTL_STATUS2;
++
++			a8g.state = A8G_STATUS;
++			a8g_start(ep, A8G_DATA_BUF, 0, ctl);
++		}
++	}
++}
++
++static void
++a8g_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t ticks = 0;
++
++	for (;;) {
++		uint32_t count = a8_usb_rd(a8g.dwc, A8_GEVNTCOUNT) & 0xffff;
++
++		if (count) {
++			a8g_sync(A8G_EVT, A8G_EVT_SIZE);
++			for (uint32_t done = 0; done < count; done += 4) {
++				uint32_t ev = *(volatile uint32_t *)
++				    (a8g.dma + A8G_EVT + a8g.evt_pos);
++
++				a8g.evt_pos = (a8g.evt_pos + 4) % A8G_EVT_SIZE;
++				if (a8g.events++ < 300) {
++					printf("A5XELTE USB: event 0x%08x\n", ev);
++				}
++				a8g_event(ev);
++			}
++			a8_dwc_wr(A8_GEVNTCOUNT, count);
++		}
++		if ((++ticks % 60000) == 0 && a8g.events == 0) {
++			printf("A5XELTE USB: no events yet (DSTS 0x%08x)\n",
++			    a8_usb_rd(a8g.dwc, A8_DSTS));
++		}
++		a8g_sleep_ms(1);
++	}
++}
++
++/*
++ * Restart the device controller in the state the bootloader left it, which is
++ * how the donor's SWEET port does it: S-Boot itself runs this controller in
++ * device mode for fastboot, so the core is powered, clocked and halted.
++ */
++static void
++a8_usb_gadget_start(vm_offset_t dwc, vm_offset_t phy)
++{
++	int enable = 1;
++	thread_t thread;
++	uint32_t v;
++	int i;
++
++	PE_parse_boot_argn("a8usbgadget", &enable, sizeof(enable));
++	if (!enable) {
++		return;
++	}
++
++	/*
++	 * PHY: this board has no VBUS pad (the dwc3 node sets
++	 * is_not_vbus_pad = <1>), so the vendor PHY driver *forces*
++	 * BVALID/VBUSVALID and selects the external VBUS valid input on the
++	 * UTMI/HSP blocks instead of reading a pad (phy-exynos-usb3p1.c:315-330).
++	 * Without those the PHY never reports a session.  The same function's
++	 * COMMONONN handling is skipped on purpose: it only applies with the
++	 * common_block_disable property, which this DTS does not set.
++	 *
++	 * The PHY's PMU isolate step is not reproduced: the 7885 PHY node has
++	 * pmu_mask = <0x0> (exynos7885.dtsi:1970), so the vendor's
++	 * phy_isol(inst, 0, 0) is a regmap_update_bits with mask 0 -- a no-op.
++	 */
++	v = a8_usb_rd(phy, A8_PHY_UTMI);
++	printf("A5XELTE USB: PHY UTMI 0x%08x HSP 0x%08x LINKPORT 0x%08x\n",
++	    v, a8_usb_rd(phy, A8_PHY_HSP), a8_usb_rd(phy, A8_PHY_LINK_PORT));
++	v &= ~(A8_UTMI_FORCE_SUSPEND | A8_UTMI_FORCE_SLEEP |
++	    A8_UTMI_DP_PULLDOWN | A8_UTMI_DM_PULLDOWN);
++	v |= A8_UTMI_FORCE_BVALID | A8_UTMI_FORCE_VBUSVALID;
++	a8_usb_wr(phy, A8_PHY_UTMI, v);
++	v = a8_usb_rd(phy, A8_PHY_HSP);
++	v |= A8_HSP_VBUSVLDEXTSEL | A8_HSP_VBUSVLDEXT;
++	a8_usb_wr(phy, A8_PHY_HSP, v);
++	printf("A5XELTE USB: PHY UTMI 0x%08x HSP 0x%08x after force\n",
++	    a8_usb_rd(phy, A8_PHY_UTMI), a8_usb_rd(phy, A8_PHY_HSP));
++
++	if (kmem_alloc_contig(kernel_map, &a8g.dma, A8G_DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		printf("A5XELTE USB: no DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)a8g.dma);
++	if (!pn) {
++		printf("A5XELTE USB: DMA has no physical page\n");
++		return;
++	}
++	a8g.dma_pa = ptoa_64(pn);
++	a8g.dwc = dwc;
++
++	/* The 2.0 PHY must not be held in soft reset or suspend. */
++	v = a8_usb_rd(a8g.dwc, A8_GUSB2PHYCFG);
++	if (v & (A8_GUSB2PHYCFG_PHYSOFTRST | A8_GUSB2PHYCFG_SUSPHY)) {
++		a8_dwc_wr(A8_GUSB2PHYCFG,
++		    v & ~(A8_GUSB2PHYCFG_PHYSOFTRST | A8_GUSB2PHYCFG_SUSPHY));
++		printf("A5XELTE USB: GUSB2PHYCFG 0x%08x -> 0x%08x\n", v,
++		    a8_usb_rd(a8g.dwc, A8_GUSB2PHYCFG));
++	}
++
++	/* The core must be in device mode: GCTL.PRTCAPDIR (bits 13:12), where
++	 * 2 = device (Linux core.h DWC3_GCTL_PRTCAP_DEVICE).  S-Boot runs this
++	 * controller in device mode for its own download mode, so the value
++	 * should already be there; setting it costs one write and removes the
++	 * "core was left in host mode" failure mode. */
++	v = a8_usb_rd(a8g.dwc, A8_GCTL);
++	if ((v & (3u << 12)) != (2u << 12)) {
++		a8_dwc_wr(A8_GCTL, (v & ~(3u << 12)) | (2u << 12));
++		printf("A5XELTE USB: GCTL 0x%08x -> 0x%08x (device mode)\n", v,
++		    a8_usb_rd(a8g.dwc, A8_GCTL));
++	}
++
++	a8_dwc_wr(A8_DCTL, A8_DCTL_CSFTRST);
++	for (i = 0; i < 500 &&
++	    (a8_usb_rd(a8g.dwc, A8_DCTL) & A8_DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	printf("A5XELTE USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++	    (a8_usb_rd(a8g.dwc, A8_DCTL) & A8_DCTL_CSFTRST) ? "STUCK" : "done",
++	    i, a8_usb_rd(a8g.dwc, A8_GCTL), a8_usb_rd(a8g.dwc, A8_DCFG));
++	if (a8_usb_rd(a8g.dwc, A8_DCTL) & A8_DCTL_CSFTRST) {
++		return;
++	}
++
++	a8_dwc_wr(A8_GEVNTADRLO, (uint32_t)(a8g.dma_pa + A8G_EVT));
++	a8_dwc_wr(A8_GEVNTADRHI, (uint32_t)((a8g.dma_pa + A8G_EVT) >> 32));
++	a8_dwc_wr(A8_GEVNTSIZ, (1u << 31) | A8G_EVT_SIZE);  /* polled */
++	a8_dwc_wr(A8_GEVNTCOUNT, a8_usb_rd(a8g.dwc, A8_GEVNTCOUNT) & 0xffff);
++	a8g.evt_pos = 0;
++
++	/* High speed, address 0. */
++	a8_dwc_wr(A8_DCFG, a8_usb_rd(a8g.dwc, A8_DCFG) & ~(7u | (0x7fu << 3)));
++	a8_dwc_wr(A8_DEVTEN, 0x7);      /* disconnect, reset, connect done */
++
++	if (a8g_epcmd(0, A8_DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    a8g_epcmd(0, A8_DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3),
++	    (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    a8g_epcmd(0, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    a8g_epcmd(1, A8_DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3),
++	    (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    a8g_epcmd(1, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("A5XELTE USB: endpoint 0 setup failed\n");
++		return;
++	}
++	a8_dwc_wr(A8_DALEPENA, 0x3);
++	a8g_start_setup();
++
++	a8_dwc_wr(A8_DCTL, a8_usb_rd(a8g.dwc, A8_DCTL) | A8_DCTL_RUN_STOP);
++	for (i = 0; i < 500 &&
++	    (a8_usb_rd(a8g.dwc, A8_DSTS) & A8_DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	printf("A5XELTE USB: running (DSTS 0x%08x after %d ms), DMA 0x%llx\n",
++	    a8_usb_rd(a8g.dwc, A8_DSTS), i, a8g.dma_pa);
++	if (kernel_thread_start(a8g_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ #else  /* ARM64_BOARD_CONFIG_A5XELTE && !JACKPOTLTE */

@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/hid/IOHIDEventService.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventService.h
+@@ -51,6 +51,9 @@
+ 	virtual IOReturn        newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ 	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ 
++	/* Open user clients (backboardd); diagnostics only. */
++	UInt32                  clientCount() const { return _clients ? _clients->getCount() : 0; }
++
+ protected:
+ 	virtual bool            handleOpen(IOService *client, IOOptionBits options, void *argument) APPLE_KEXT_OVERRIDE;
+ 	virtual void            handleClose(IOService *client, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -378,6 +378,21 @@
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
++/*
++ * Diagnostic (boot-arg sweethidtest=N): how many user clients have opened
++ * each Sweet HID service.  With the quiet console the screen keeps
++ * drawing until the GUI's first present and only then goes silent, so the
++ * last visible line of this report is the state at the moment backboardd
++ * started presenting -- i.e. whether it had opened the digitizer/buttons.
++ */
++static void
++sweet_hid_report_clients(void)
++{
++	IOLog("SWEET HID: clients buttons=%u touch=%u\n",
++	    gSweetButtons ? gSweetButtons->clientCount() : 0u,
++	    gSweetTouch ? gSweetTouch->clientCount() : 0u);
++}
++
+ bool
+ SweetHIDButtons::start(IOService *provider)
+ {
+@@ -419,10 +434,14 @@
+ 	 * screen waits for it. Even counts press, odd counts release.
+ 	 */
+ 	bool press = (self->fTestCount & 1) == 0;
+-	self->key(kHIDUsage_Csmr_Menu, press);
+-	if (++self->fTestCount < 60) {
+-		sender->setTimeoutMS(press ? 100 : self->fTestSecs * 1000);
++	if (self->fTestCount < 60) {
++		self->key(kHIDUsage_Csmr_Menu, press);
+ 	}
++	self->fTestCount++;
++	/* Keep reporting after the presses stop: this is the line that answers
++	 * whether backboardd ever opened the Sweet HID services. */
++	sweet_hid_report_clients();
++	sender->setTimeoutMS(press ? 100 : self->fTestSecs * 1000);
+ }
+ 
+ bool

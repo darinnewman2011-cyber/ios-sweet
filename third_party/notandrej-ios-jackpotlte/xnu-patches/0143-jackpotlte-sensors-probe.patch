@@ -1,0 +1,349 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/a5xelte_panel.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
++bsd/dev/a5xelte_sensors.c		standard
+ bsd/dev/a5xelte_wifi.c			standard
+ bsd/dev/a5xelte_flashlight.c		standard
+ bsd/dev/jackpotlte_pmic.c		standard
+diff --git a/bsd/dev/a5xelte_sensors.c b/bsd/dev/a5xelte_sensors.c
+new file mode 100644
+index 0000000..85b0c86
+--- /dev/null
++++ b/bsd/dev/a5xelte_sensors.c
+@@ -0,0 +1,311 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) sensors: opt-in
++ * bring-up probe.
++ *
++ * The A8's "easy" sensors split into two very different worlds:
++ *
++ *   - hall / certify_hall (cover flip) are plain GPIO inputs on gpa0; and
++ *   - the grip sensor is a single Abov A96T3X6 on I2C5 at slave 0x20.
++ *
++ * The accelerometer, gyroscope, magnetometer, ambient-light, proximity and
++ * barometer are NOT on the AP bus: they live behind a Samsung SSP sensor-hub
++ * MCU (a STM32F on SPI4).  Only the hub is AP-visible, so this file reports the
++ * hub and its six channels rather than trying to clock the SPI bus.
++ *
++ * Every address below cites its source in docs/research/jackpotlte-sensors.md.
++ * Read-only: nothing but the I2C controller's own registers is written (which
++ * every I2C transfer needs), the pin controller is never written, no interrupt
++ * is registered and no input device is created.  A default boot (no
++ * "a8sensors=1") does nothing at all.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++void a5xelte_sensors_probe(void);
++
++/* ---- S3C2440 I2C5 (grip) ------------------------------------------------
++ * i2c_5: i2c@13880000, "samsung,s3c2440-i2c", reg <0 0x13880000 0x100>
++ * (Eureka arch/arm64/boot/dts/exynos/dtb/exynos7885.dtsi:1077-1079).
++ * The register map and bits are the common s3c2440 set the touch probe uses:
++ * drivers/i2c/busses/i2c-s3c2410.c:51-75. */
++#define A8SNS_I2C5_PA		0x13880000u
++#define A8SNS_GRIP_SLAVE	0x20u	/* exynos7885-jackpotlte_common.dtsi:738 */
++#define A8SNS_GRIP_VENDORID	0x12u	/* abov_touchkey_3x6.c:65 */
++#define A8SNS_GRIP_MODEL_NO	0x14u	/* abov_touchkey_3x6.c:68 */
++#define A8SNS_GRIP_FW_VER	0x01u	/* abov_touchkey_3x6.c:60 */
++
++#define A8SNS_IICCON		0x00u
++#define A8SNS_IICSTAT		0x04u
++#define A8SNS_IICADD		0x08u
++#define A8SNS_IICDS		0x0cu
++#define A8SNS_IICLC		0x10u
++#define A8SNS_IICCON_ACKEN	0x80u
++#define A8SNS_IICCON_IRQPEND	0x10u
++#define A8SNS_IICSTAT_MASTER_TX	0xd0u	/* MASTER_TX | TXRXEN */
++#define A8SNS_IICSTAT_MASTER_RX	0x90u	/* MASTER_RX | TXRXEN */
++#define A8SNS_IICSTAT_START	0x20u	/* also BUSBUSY when read */
++#define A8SNS_IICSTAT_LASTBIT	0x01u	/* 0 = ACK, 1 = NACK */
++
++/* ---- hall / certify_hall (cover flip) -----------------------------------
++ * flip_cover { hall gpa0-3; certify_hall gpa0-4 }
++ * (exynos7885-jackpotlte_common.dtsi:843-858).  gpa0 is in pin-controller 0
++ * (ALIVE) pinctrl@11CB0000 (exynos7885.dtsi:601); bank offset 0x040 with
++ * CON/PUD/DAT at +0x00/+0x08/+0x04 (pinctrl-exynos.c:1709, bank_type_7 :49-52
++ * -> DAT at 0x11CB0044). */
++#define A8SNS_PINCTRL0		0x11cb0000u
++#define A8SNS_GPA0_OFF		0x040u
++#define A8SNS_PIN_DAT		0x04u
++#define A8SNS_HALL_BIT		3u
++#define A8SNS_CERTHALL_BIT	4u
++
++/* ---- sensor hub (accel/gyro/mag/light/prox/baro) ------------------------
++ * spi@13980000 / STM32F@0, compatible "ssp,STM32F"
++ * (exynos7885-jackpotlte_eur_open_03.dts:29-43).  The AP reaches only the hub;
++ * its id is the SSP WHOAMI (0x0F -> DEVICE_ID 0x55, ssp.h:88, ssp_dev.h:28). */
++#define A8SNS_SPI4_PA		0x13980000u
++
++static vm_offset_t a8sns_bus;
++
++static uint32_t
++a8sns_read(vm_offset_t base, uint32_t offset)
++{
++	return *(volatile uint32_t *)(base + offset);
++}
++
++static void
++a8sns_write(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + offset) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++a8sns_wait_irq(void)
++{
++	for (unsigned n = 0; n < 20000; n++) {
++		if (a8sns_read(a8sns_bus, A8SNS_IICCON) & A8SNS_IICCON_IRQPEND) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++a8sns_clear_irq(void)
++{
++	a8sns_write(a8sns_bus, A8SNS_IICCON,
++	    a8sns_read(a8sns_bus, A8SNS_IICCON) & ~A8SNS_IICCON_IRQPEND);
++}
++
++static void
++a8sns_stop(void)
++{
++	a8sns_write(a8sns_bus, A8SNS_IICSTAT,
++	    a8sns_read(a8sns_bus, A8SNS_IICSTAT) & ~A8SNS_IICSTAT_START);
++	a8sns_clear_irq();
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(a8sns_read(a8sns_bus, A8SNS_IICSTAT) & A8SNS_IICSTAT_START)) {
++			break;
++		}
++		delay(1);
++	}
++}
++
++/* START + 8-bit slave address; true when the address was ACKed. */
++static bool
++a8sns_address(uint32_t mode, uint8_t addr8)
++{
++	a8sns_write(a8sns_bus, A8SNS_IICCON, 0xe3u);	/* ACKEN|IRQEN|div */
++	a8sns_write(a8sns_bus, A8SNS_IICLC, 7u);	/* SDA delay + filter */
++	a8sns_write(a8sns_bus, A8SNS_IICSTAT, mode);
++	a8sns_write(a8sns_bus, A8SNS_IICDS, addr8);
++	delay(1);
++	a8sns_write(a8sns_bus, A8SNS_IICSTAT, mode | A8SNS_IICSTAT_START);
++	if (!a8sns_wait_irq()) {
++		return false;
++	}
++	return !(a8sns_read(a8sns_bus, A8SNS_IICSTAT) & A8SNS_IICSTAT_LASTBIT);
++}
++
++static bool
++a8sns_tx(const uint8_t *bytes, unsigned count)
++{
++	for (unsigned n = 0; n < count; n++) {
++		a8sns_write(a8sns_bus, A8SNS_IICDS, bytes[n]);
++		delay(1);
++		a8sns_clear_irq();
++		if (!a8sns_wait_irq()) {
++			return false;
++		}
++		if (a8sns_read(a8sns_bus, A8SNS_IICSTAT) & A8SNS_IICSTAT_LASTBIT) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++a8sns_rx(uint8_t *bytes, unsigned count)
++{
++	if (count == 1) {
++		a8sns_write(a8sns_bus, A8SNS_IICCON,
++		    a8sns_read(a8sns_bus, A8SNS_IICCON) & ~A8SNS_IICCON_ACKEN);
++	}
++	for (unsigned n = 0; n < count; n++) {
++		a8sns_clear_irq();
++		if (!a8sns_wait_irq()) {
++			return false;
++		}
++		bytes[n] = (uint8_t)a8sns_read(a8sns_bus, A8SNS_IICDS);
++		if (n + 2 == count) {
++			a8sns_write(a8sns_bus, A8SNS_IICCON,
++			    a8sns_read(a8sns_bus, A8SNS_IICCON) & ~A8SNS_IICCON_ACKEN);
++		}
++	}
++	return true;
++}
++
++/* One register read: write the register, repeated START, read count bytes. */
++static bool
++a8sns_read_reg(uint8_t reg, uint8_t *data, unsigned count)
++{
++	bool ok = false;
++	if (!count || count > 4) {
++		return false;
++	}
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(a8sns_read(a8sns_bus, A8SNS_IICSTAT) & A8SNS_IICSTAT_START)) {
++			break;
++		}
++		if (n == 4999) {
++			printf("A8SENSORS: i2c5 busy before read\n");
++			return false;
++		}
++		delay(1);
++	}
++	if (!a8sns_address(A8SNS_IICSTAT_MASTER_TX, A8SNS_GRIP_SLAVE << 1)) {
++		goto out;
++	}
++	if (!a8sns_tx(&reg, 1)) {
++		goto out;
++	}
++	if (!a8sns_address(A8SNS_IICSTAT_MASTER_RX, (A8SNS_GRIP_SLAVE << 1) | 1u)) {
++		goto out;
++	}
++	if (!a8sns_rx(data, count)) {
++		goto out;
++	}
++	ok = true;
++out:
++	a8sns_stop();
++	return ok;
++}
++
++/* ---- hall ---------------------------------------------------------------- */
++
++static void
++a8sns_hall_report(void)
++{
++	vm_offset_t pinctrl0 = ml_io_map(A8SNS_PINCTRL0, 0x1000);
++	uint32_t dat;
++	if (!pinctrl0) {
++		printf("A8SENSORS: pinctrl_0 mapping failed\n");
++		return;
++	}
++	dat = a8sns_read(pinctrl0, A8SNS_GPA0_OFF + A8SNS_PIN_DAT);
++	printf("A8SENSORS: hall gpa0-%u level=%u; certify_hall gpa0-%u level=%u (gpa0 dat=%#x)\n",
++	    A8SNS_HALL_BIT, (dat >> A8SNS_HALL_BIT) & 1u,
++	    A8SNS_CERTHALL_BIT, (dat >> A8SNS_CERTHALL_BIT) & 1u, dat);
++}
++
++/* ---- grip (Abov A96T3X6 on I2C5) ---------------------------------------- */
++
++static void
++a8sns_grip_report(void)
++{
++	uint8_t vendor = 0, model = 0, fw = 0;
++
++	a8sns_bus = ml_io_map(A8SNS_I2C5_PA, 0x1000);
++	if (!a8sns_bus) {
++		printf("A8SENSORS: i2c5@%#x mapping failed\n", (unsigned)A8SNS_I2C5_PA);
++		return;
++	}
++	printf("A8SENSORS: grip i2c5@%#x addr %#x con=%#x stat=%#x lc=%#x\n",
++	    (unsigned)A8SNS_I2C5_PA, (unsigned)A8SNS_GRIP_SLAVE,
++	    a8sns_read(a8sns_bus, A8SNS_IICCON),
++	    a8sns_read(a8sns_bus, A8SNS_IICSTAT),
++	    a8sns_read(a8sns_bus, A8SNS_IICLC));
++	if (!a8sns_read_reg(A8SNS_GRIP_VENDORID, &vendor, 1)) {
++		printf("A8SENSORS: grip A96T3X6 i2c5@%#x addr %#x no ACK stat=%#x\n",
++		    (unsigned)A8SNS_I2C5_PA, (unsigned)A8SNS_GRIP_SLAVE,
++		    a8sns_read(a8sns_bus, A8SNS_IICSTAT));
++		return;
++	}
++	if (!a8sns_read_reg(A8SNS_GRIP_MODEL_NO, &model, 1)) {
++		printf("A8SENSORS: grip A96T3X6 i2c5@%#x addr %#x vendor=%#x model read failed\n",
++		    (unsigned)A8SNS_I2C5_PA, (unsigned)A8SNS_GRIP_SLAVE, vendor);
++		return;
++	}
++	(void)a8sns_read_reg(A8SNS_GRIP_FW_VER, &fw, 1);
++	printf("A8SENSORS: grip A96T3X6 i2c5@%#x addr %#x vendor=%#x model=%#x fw=%#x\n",
++	    (unsigned)A8SNS_I2C5_PA, (unsigned)A8SNS_GRIP_SLAVE, vendor, model, fw);
++}
++
++/* ---- sensor hub report (not clocked) ------------------------------------
++ * The hub and its six chips are not AP I2C parts; reaching them needs the
++ * exynos SPI master plus the SSP framing (ssp_spi.c), which this probe does
++ * not do.  Report the channels the defconfig wires (lines 4406-4426), one per
++ * line, so the log names every sensor and its hub-owned part. */
++static void
++a8sns_hub_report(void)
++{
++	printf("A8SENSORS: hub spi4@%#x cs=gpp8-0 part=STM32F id=hub (not clocked)\n",
++	    (unsigned)A8SNS_SPI4_PA);
++	printf("A8SENSORS: accel  bus=ssp-spi4@%#x part=LSM6DSL  id=hub\n",
++	    (unsigned)A8SNS_SPI4_PA);
++	printf("A8SENSORS: gyro   bus=ssp-spi4@%#x part=LSM6DSL  id=hub\n",
++	    (unsigned)A8SNS_SPI4_PA);
++	printf("A8SENSORS: mag    bus=ssp-spi4@%#x part=AK09918C id=hub\n",
++	    (unsigned)A8SNS_SPI4_PA);
++	printf("A8SENSORS: light  bus=ssp-spi4@%#x part=TMD3725 id=hub\n",
++	    (unsigned)A8SNS_SPI4_PA);
++	printf("A8SENSORS: prox   bus=ssp-spi4@%#x part=TMD3725 id=hub\n",
++	    (unsigned)A8SNS_SPI4_PA);
++	printf("A8SENSORS: baro   bus=ssp-spi4@%#x part=LPS22H  id=hub\n",
++	    (unsigned)A8SNS_SPI4_PA);
++}
++
++void
++a5xelte_sensors_probe(void)
++{
++	int enabled = 0;
++
++	/* Opt-in and default-inert: without "a8sensors=1" a boot is unchanged. */
++	(void)PE_parse_boot_argn("a8sensors", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++
++	printf("A8SENSORS: probe (a8sensors=1)\n");
++	a8sns_hall_report();
++	a8sns_grip_report();
++	a8sns_hub_report();
++}
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++void
++a5xelte_sensors_probe(void)
++{
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -74,6 +74,7 @@ extern void a5xelte_panel_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void a5xelte_usb_probe(void);
+ extern void a5xelte_scsc_probe(void);
++extern void a5xelte_sensors_probe(void);
+ extern void a5xelte_wifi_probe(void);
+ extern void a5xelte_flashlight_probe(void);
+ #if defined(JACKPOTLTE)
+@@ -792,6 +793,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	 * default; full bring-up only with the "a8wifi" boot argument
+ 	 * (bsd/dev/a5xelte_scsc.c). */
+ 	a5xelte_scsc_probe();
++	/* Galaxy A8 2018: hall/grip/sensor-hub probe, off unless
++	 * "a8sensors" is 1 (bsd/dev/a5xelte_sensors.c). */
++	a5xelte_sensors_probe();
+ 	/* Galaxy A8 2018: Apple80211 glue (en0 + SIOCS/GA80211), off unless
+ 	 * "a8wifi" is 1 (bsd/dev/a5xelte_wifi.c). */
+ 	a5xelte_wifi_probe();

@@ -1,0 +1,33 @@
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -435,6 +435,12 @@
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gMaliLock);
++	/* Bring-up aid: Mesa maps a buffer by its handle and prints one line
++	 * when the mapping fails, without saying which handle it was.  The type
++	 * is that handle, so this says whether the request arrived and whether
++	 * the buffer was still there -- a "not found" here and "ok" everywhere
++	 * else puts the failure on the userspace side of the mapping. */
++	IOLog("JackpotlteMali: map %u: %s\n", type, b != NULL ? "ok" : "not found");
+ 	return ret;
+ }
+ 
+@@ -550,6 +556,16 @@
+ 				}
+ 			}
+ 		}
++		/* Bring-up aid: a chain that reaches here is the first thing the
++		 * GPU is asked to draw in this port, so its presence or absence
++		 * in the log says how far the GL path got.  The first few only:
++		 * a frame submits many. */
++		if (fSubmits <= 8) {
++			IOLog("JackpotlteMali: job %u: chain %#llx, %u buffers, "
++			    "requirements %#x, seq %llu\n", fSubmits,
++			    (unsigned long long) r.submit.jc, r.submit.bo_handle_count,
++			    r.submit.requirements, (unsigned long long) seq);
++		}
+ 		r.submit.jc = seq;
+ 		break;
+ 	}

@@ -1,0 +1,211 @@
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1019,6 +1019,16 @@
+ #define JTTS_ERR_EVENT_QUEUE_FULL 0x01u
+ #define JTTS_CMD_SENSE_ON	0x10u
+ #define JTTS_CMD_CLEAR_EVENT_STACK 0x62u
++/* SEC_TS_CMD_SET_TOUCHFUNCTION with TOUCH_FUNCTION_TOUCH (sec_ts.h): the
++ * working S8 sec_ts driver sends {0x30,0x01,0x00} before SENSE_ON
++ * (bsd/dev/a5xelte_touch.c DREAMLTE path, patch 0124). */
++#define JTTS_CMD_TOUCH_FUNCTION	0x30u
++#define JTTS_TOUCH_FUNCTION_TOUCH 0x01u
++/* sec_ts_i2c_read() retries a NACKing read up to 10 times (sec_ts.c:489);
++ * a dropped READ_ONE_EVENT loses finger movement and iOS then misses the
++ * swipe (the S7 hit this and added the same retry in its 0217). */
++#define JTTS_READ_ATTEMPTS	10u
++#define JTTS_READ_RETRY_US	200u
+ 
+ static vm_offset_t jt_ts_bus;
+ 
+@@ -1298,6 +1308,9 @@
+ static bool jt_ts_down[5];
+ static uint16_t jt_ts_x[5];
+ static uint16_t jt_ts_y[5];
++static unsigned jt_ts_moves;	/* coordinate move events decoded */
++static unsigned jt_ts_retries;	/* I2C read retries taken */
++static unsigned jt_ts_lost;	/* reads that failed every attempt */
+ 
+ static void
+ jackpotlte_touch_wait(unsigned ms)
+@@ -1344,6 +1357,63 @@
+ 	return ok;
+ }
+ 
++/* sec_ts multi-byte command write: START, slave write address, N bytes, STOP.
++ * Mirrors sec_ts_i2c_write(ts, cmd, data, len) (sec_ts.c:489) and the S8's
++ * s8i2c_xfer(addr, func, 3, NULL, 0) for SET_TOUCHFUNCTION (0124). */
++static bool
++jtts_write_bytes(const uint8_t *bytes, unsigned count)
++{
++	bool ok = false;
++	int recovered = 0;
++	if (!count) {
++		return false;
++	}
++retry:
++	for (unsigned n = 0; n < 2000; n++) {
++		if (!(a5touch_read(jt_ts_bus, JTTS_IICSTAT) & JTTS_IICSTAT_START)) {
++			break;
++		}
++		if (n == 1999) {
++			if (recovered++) {
++				printf("A8 TOUCH: i2c4 still busy on write\n");
++				return false;
++			}
++			jtts_bus_recover();
++			goto retry;
++		}
++		delay(1);
++	}
++	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1)) {
++		goto out;
++	}
++	if (!jtts_tx(bytes, count)) {
++		goto out;
++	}
++	ok = true;
++out:
++	jtts_stop();
++	return ok;
++}
++
++/* sec_ts register read with the native driver's retry: a read that NACKs
++ * while the IC is scanning (seen on the phone as stat=0x30 with SDA held low)
++ * is retried instead of dropped, so finger movement is not lost. */
++static bool
++jtts_read_retry(uint8_t reg, uint8_t *data, unsigned count)
++{
++	for (unsigned attempt = 0; attempt < JTTS_READ_ATTEMPTS; attempt++) {
++		if (attempt) {
++			jt_ts_retries++;
++			delay(JTTS_READ_RETRY_US);
++		}
++		if (jtts_read_reg(reg, data, count)) {
++			return true;
++		}
++	}
++	jt_ts_lost++;
++	return false;
++}
++
+ /* Release every finger we believe is down, e.g. after a watchdog reset or a
+  * full event queue (sec_ts.c:1041,1066). */
+ static void
+@@ -1384,8 +1454,11 @@
+ 		 * (sec_ts.c:1039-1045). */
+ 		if (stype == JTTS_STATUS_EVENT_INFO &&
+ 		    status_id == JTTS_ACK_BOOT_COMPLETE && data1 == 0x20u) {
++			const uint8_t func[3] = { JTTS_CMD_TOUCH_FUNCTION,
++						  JTTS_TOUCH_FUNCTION_TOUCH, 0x00u };
+ 			printf("A8 TOUCH: watchdog reset, re-sense\n");
+ 			jackpotlte_touch_release_all();
++			(void)jtts_write_bytes(func, sizeof(func));
+ 			(void)jtts_write_cmd(JTTS_CMD_SENSE_ON);
+ 		} else if (stype == JTTS_STATUS_EVENT_ERR &&
+ 		    status_id == JTTS_ERR_EVENT_QUEUE_FULL) {
+@@ -1414,6 +1487,9 @@
+ 	    action == 1u ? "press" : action == 2u ? "move" : "release",
+ 	    tid, rx, ry, x, y);
+ 	if (action == 1u || action == 2u) {		/* press, move */
++		if (action == 2u) {
++			jt_ts_moves++;
++		}
+ 		jt_ts_down[tid] = true;
+ 		jt_ts_x[tid] = (uint16_t)x;
+ 		jt_ts_y[tid] = (uint16_t)y;
+@@ -1430,11 +1506,26 @@
+ 	uint8_t buf[8 * 4];
+ 	unsigned errors = 0;
+ 	unsigned idle = 0;
++	unsigned ticks = 0, last_moves = 0, last_retries = 0, last_lost = 0;
+ 	int last_irq = -1;
+ 	(void)arg;
+ 	(void)result;
+ 	printf("A8 TOUCH: contact worker started (debug log on)\n");
+ 	for (;;) {
++		/* Every ~16 s with activity: movement events and I2C recoveries,
++		 * so a swipe that drops events is visible without the raw log. */
++		if (++ticks == 2000) {
++			ticks = 0;
++			if (jt_ts_moves != last_moves ||
++			    jt_ts_retries != last_retries ||
++			    jt_ts_lost != last_lost) {
++				printf("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u\n",
++				    jt_ts_moves, jt_ts_retries, jt_ts_lost);
++				last_moves = jt_ts_moves;
++				last_retries = jt_ts_retries;
++				last_lost = jt_ts_lost;
++			}
++		}
+ 		/* IRQ gpa0-0 (DTS line 635) is level low while events queue. */
+ 		int irq = !!(a5touch_read(jt_ts_pinctrl0,
+ 		    JTTS_GPA0_OFF + JTTS_PIN_DAT) & 1u);
+@@ -1453,7 +1544,7 @@
+ 			continue;
+ 		}
+ 		idle = 0;
+-		if (!jtts_read_reg(JTTS_READ_ONE_EVENT, buf, 8)) {
++		if (!jtts_read_retry(JTTS_READ_ONE_EVENT, buf, 8)) {
+ 			if (++errors <= 8 || !(errors & 255)) {
+ 				printf("A8 TOUCH: event read failed (%u) stat=%#x\n",
+ 				    errors,
+@@ -1486,7 +1577,7 @@
+ 		 * time the IRQ is low, so nothing is lost. */
+ 		unsigned have = 0;
+ 		if (left >= 1u && left <= 2u &&
+-		    jtts_read_reg(JTTS_READ_ALL_EVENT, buf + 8, left * 8)) {
++		    jtts_read_retry(JTTS_READ_ALL_EVENT, buf + 8, left * 8)) {
+ 			have = left;
+ 		}
+ 		for (unsigned i = 0; i <= have; i++) {
+@@ -1515,8 +1606,21 @@
+ 	printf("A8 TOUCH: contact path; status before power=%#x pwr=%d\n",
+ 	    boot, power);
+ 	if (power) {
++		const uint8_t func[3] = { JTTS_CMD_TOUCH_FUNCTION,
++					  JTTS_TOUCH_FUNCTION_TOUCH, 0x00u };
++		bool st_ok = false;
++		bool have_id;
+ 		jackpotlte_touch_power_up();
+-		if (jtts_read_reg(JTTS_READ_BOOT_STATUS, &st, 1)) {
++		for (unsigned attempt = 0; attempt < JTTS_READ_ATTEMPTS; attempt++) {
++			if (attempt) {
++				delay(JTTS_READ_RETRY_US);
++			}
++			if (jtts_read_reg(JTTS_READ_BOOT_STATUS, &st, 1)) {
++				st_ok = true;
++				break;
++			}
++		}
++		if (st_ok) {
+ 			boot = st;
+ 			printf("A8 TOUCH: status after power=%#x (%s)\n", boot,
+ 			    boot == JTTS_STATUS_APP_MODE ? "app mode" :
+@@ -1525,14 +1629,22 @@
+ 		} else {
+ 			printf("A8 TOUCH: status read failed after power\n");
+ 		}
+-		if (jtts_read_reg(JTTS_READ_ID, id, sizeof(id))) {
++		have_id = jtts_read_reg(JTTS_READ_ID, id, sizeof(id));
++		if (have_id) {
+ 			printf("A8 TOUCH: id after power %02x%02x%02x\n",
+ 			    id[0], id[1], id[2]);
+ 		}
+-		/* The IC only scans the panel after SENSE_ON; the native
+-		 * driver sends it once the IC is in app mode
+-		 * (sec_ts.c:2311,3042). */
+-		if (boot == JTTS_STATUS_APP_MODE) {
++		/* The IC reports coordinates only after SET_TOUCHFUNCTION and
++		 * SENSE_ON; the S8's working sec_ts driver sends both once the
++		 * IC is in app mode (0124; sec_ts.c:2311,3042).  Send them
++		 * whenever the IC answers, even if the boot-status read was
++		 * transiently lost, because the IC is clearly running. */
++		if (boot == JTTS_STATUS_APP_MODE || have_id) {
++			if (jtts_write_bytes(func, sizeof(func))) {
++				printf("A8 TOUCH: touch-function sent\n");
++			} else {
++				printf("A8 TOUCH: touch-function write failed\n");
++			}
+ 			if (jtts_write_cmd(JTTS_CMD_SENSE_ON)) {
+ 				printf("A8 TOUCH: sense-on sent\n");
+ 			} else {

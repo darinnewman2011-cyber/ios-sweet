@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -182,7 +182,7 @@
+ 
+ 	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
+ 	uint32_t                fNextBuffer;
+-	uint32_t                fSubmits, fFailed, fRequests;
++	uint32_t                fSubmits, fFailed, fRequests, fParams;
+ 
+ 	struct mali_buffer * buffer(uint32_t handle);
+ 	void freeBuffer(struct mali_buffer * b);
+@@ -492,8 +492,18 @@
+ 	}
+ 	switch (selector) {
+ 	case kPanfrostGetParam:
++		/* Bring-up aid: what Mesa asked and what it was told.  panfrost
++		 * bails without a word when the answer is not a GPU it knows
++		 * (debug_printf is compiled out of a release build), so the
++		 * only way to see it from the phone is here. */
+ 		if (!jackpotlte_mali_parameter(r.param.param, &r.param.value)) {
++			if (fParams++ < 48) {
++				IOLog("JackpotlteMali: param %u not answered\n", r.param.param);
++			}
+ 			ret = kIOReturnBadArgument;
++		} else if (fParams++ < 48) {
++			IOLog("JackpotlteMali: param %u = %#llx\n", r.param.param,
++			    (unsigned long long) r.param.value);
+ 		}
+ 		break;
+ 	case kPanfrostCreateBO:

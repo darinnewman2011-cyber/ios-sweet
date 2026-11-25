@@ -1,0 +1,748 @@
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -14,6 +14,30 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ 
++/*
++ * Every touch log line goes through jt_log(), which is silent unless
++ * a8touchverbose=1.  A printf() per event to the framebuffer console is
++ * itself load on the path a swipe depends on (0150), and the lines are
++ * noise on a boot that is being watched; the switch turns the whole set
++ * back on when a bring-up needs them.
++ */
++static bool
++jt_touch_log(void)
++{
++	static int parsed = 0;
++	static bool on = false;
++	int value = 0;
++
++	if (!parsed) {
++		(void)PE_parse_boot_argn("a8touchverbose", &value, sizeof(value));
++		on = (value != 0);
++		parsed = 1;
++	}
++	return on;
++}
++
++#define jt_log(...)	do { if (jt_touch_log()) { printf(__VA_ARGS__); } } while (0)
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void thread_terminate_self(void);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+@@ -99,7 +123,7 @@
+ 			a5touch_write(hsi, 0x24, irq);
+ 		}
+ 		if (irq & 0xf00u) {
+-			printf("A5XELTE TOUCH: PMIC HSI2C error rx=%d done=%u/%u irq=%#x state=%#x fifo=%#x\n",
++			jt_log("A5XELTE TOUCH: PMIC HSI2C error rx=%d done=%u/%u irq=%#x state=%#x fifo=%#x\n",
+ 			    receive, done, count, last_irq, a5touch_read(hsi, 0x50), fifo);
+ 			goto fail;
+ 		}
+@@ -127,7 +151,7 @@
+ 					}
+ 					delay(1);
+ 				}
+-				printf("A5XELTE TOUCH: PMIC STOP busy irq=%#x state=%#x\n",
++				jt_log("A5XELTE TOUCH: PMIC STOP busy irq=%#x state=%#x\n",
+ 				    last_irq, a5touch_read(hsi, 0x50));
+ 				goto fail;
+ 			}
+@@ -135,7 +159,7 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("A5XELTE TOUCH: PMIC HSI2C timeout rx=%d done=%u/%u irq=%#x state=%#x fifo=%#x\n",
++	jt_log("A5XELTE TOUCH: PMIC HSI2C timeout rx=%d done=%u/%u irq=%#x state=%#x fifo=%#x\n",
+ 	    receive, done, count, last_irq | a5touch_read(hsi, 0x24),
+ 	    a5touch_read(hsi, 0x50), a5touch_read(hsi, 0x30));
+ fail:
+@@ -181,7 +205,7 @@
+ 	uint8_t ldo = 0xff;
+ 	uint8_t check = 0xff;
+ 	if (!hsi) {
+-		printf("A5XELTE TOUCH: PMIC HSI2C mapping failed\n");
++		jt_log("A5XELTE TOUCH: PMIC HSI2C mapping failed\n");
+ 		return false;
+ 	}
+ 	old_con = a5touch_read(mifpins, 0);
+@@ -192,26 +216,26 @@
+ 	a5pmic_bus_init(hsi);
+ 	if (!a5pmic_read(hsi, 0x00, &id) ||
+ 	    !a5pmic_read(hsi, 0x4e, &ldo)) {
+-		printf("A5XELTE TOUCH: PMIC identity/control read failed\n");
++		jt_log("A5XELTE TOUCH: PMIC identity/control read failed\n");
+ 		goto fail;
+ 	}
+-	printf("A5XELTE TOUCH: S2MPU03 ID=%#x LDO33=%#x\n", id, ldo);
++	jt_log("A5XELTE TOUCH: S2MPU03 ID=%#x LDO33=%#x\n", id, ldo);
+ 	/* Working Linux device read ID 0x02 and LDO33 0x3c before enable. */
+ 	if (id != 0x02 || (ldo & 0x3fu) != 0x3cu) {
+-		printf("A5XELTE TOUCH: unexpected PMIC or LDO33 voltage, leave off\n");
++		jt_log("A5XELTE TOUCH: unexpected PMIC or LDO33 voltage, leave off\n");
+ 		goto fail;
+ 	}
+ 	if (!(ldo & 0xc0u)) {
+ 		if (!a5pmic_write(hsi, 0x4e, ldo | 0xc0u)) {
+-			printf("A5XELTE TOUCH: LDO33 enable failed\n");
++			jt_log("A5XELTE TOUCH: LDO33 enable failed\n");
+ 			goto fail;
+ 		}
+ 	}
+ 	if (!a5pmic_read(hsi, 0x4e, &check) || check != (ldo | 0xc0u)) {
+-		printf("A5XELTE TOUCH: LDO33 readback failed value=%#x\n", check);
++		jt_log("A5XELTE TOUCH: LDO33 readback failed value=%#x\n", check);
+ 		goto fail;
+ 	}
+-	printf("A5XELTE TOUCH: LDO33 enabled at 3.3 V, readback=%#x\n", check);
++	jt_log("A5XELTE TOUCH: LDO33 enabled at 3.3 V, readback=%#x\n", check);
+ 	a5_touch_hsi = hsi;
+ 	delay(15000);
+ 	return true;
+@@ -266,7 +290,7 @@
+ 			break;
+ 		}
+ 		if (n == 4999) {
+-			printf("A5XELTE TOUCH: I2C2 busy before message\n");
++			jt_log("A5XELTE TOUCH: I2C2 busy before message\n");
+ 			return false;
+ 		}
+ 		delay(1);
+@@ -279,12 +303,12 @@
+ 	delay(1);
+ 	a5touch_write(i2c, 4, mode | 0x20u);
+ 	if (!a5touch_wait_irq(i2c)) {
+-		printf("A5XELTE TOUCH: I2C2 address timeout stat=%#x con=%#x\n",
++		jt_log("A5XELTE TOUCH: I2C2 address timeout stat=%#x con=%#x\n",
+ 		    a5touch_read(i2c, 4), a5touch_read(i2c, 0));
+ 		goto out;
+ 	}
+ 	if (a5touch_read(i2c, 4) & 1u) {
+-		printf("A5XELTE TOUCH: I2C2 address NACK stat=%#x\n",
++		jt_log("A5XELTE TOUCH: I2C2 address NACK stat=%#x\n",
+ 		    a5touch_read(i2c, 4));
+ 		goto out;
+ 	}
+@@ -299,14 +323,14 @@
+ 		}
+ 		a5touch_clear_irq(i2c);
+ 		if (!a5touch_wait_irq(i2c)) {
+-			printf("A5XELTE TOUCH: I2C2 data timeout byte=%u stat=%#x\n",
++			jt_log("A5XELTE TOUCH: I2C2 data timeout byte=%u stat=%#x\n",
+ 			    n, a5touch_read(i2c, 4));
+ 			goto out;
+ 		}
+ 		if (receive) {
+ 			bytes[n] = (uint8_t)a5touch_read(i2c, 0xc);
+ 		} else if (a5touch_read(i2c, 4) & 1u) {
+-			printf("A5XELTE TOUCH: I2C2 data NACK byte=%u stat=%#x\n",
++			jt_log("A5XELTE TOUCH: I2C2 data NACK byte=%u stat=%#x\n",
+ 			    n, a5touch_read(i2c, 4));
+ 			goto out;
+ 		}
+@@ -328,7 +352,7 @@
+ 	bool sent;
+ 	bool got;
+ 	if (!i2c) {
+-		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
++		jt_log("A5XELTE TOUCH: I2C2 mapping failed\n");
+ 		return;
+ 	}
+ 	old_con = a5touch_read(nfc, 0);
+@@ -342,7 +366,7 @@
+ 		delay(75); /* ZT7538 requires a STOP and 50 us before receive. */
+ 	}
+ 	got = sent && a5touch_message(i2c, true, code, sizeof(code));
+-	printf("A5XELTE TOUCH: I2C2 chip-code sent=%d received=%d value=%#x stat=%#x con=%#x\n",
++	jt_log("A5XELTE TOUCH: I2C2 chip-code sent=%d received=%d value=%#x stat=%#x con=%#x\n",
+ 	    sent, got, (unsigned)code[0] | ((unsigned)code[1] << 8),
+ 	    a5touch_read(i2c, 4), a5touch_read(i2c, 0));
+ 	a5touch_write(nfc, 0, old_con);
+@@ -424,13 +448,13 @@
+ 	if (!a5_touch_hsi || !a5pmic_read(a5_touch_hsi, 0x4e, &ldo) ||
+ 	    (ldo & 0x3fu) != 0x3cu ||
+ 	    !a5pmic_write(a5_touch_hsi, 0x4e, ldo & ~0xc0u)) {
+-		printf("A5XELTE TOUCH: LDO33 recovery power-off failed\n");
++		jt_log("A5XELTE TOUCH: LDO33 recovery power-off failed\n");
+ 		return false;
+ 	}
+ 	delay(50000);
+ 	if (!a5pmic_write(a5_touch_hsi, 0x4e, ldo | 0xc0u) ||
+ 	    !a5pmic_read(a5_touch_hsi, 0x4e, &check) || check != (ldo | 0xc0u)) {
+-		printf("A5XELTE TOUCH: LDO33 recovery power-on failed value=%#x\n", check);
++		jt_log("A5XELTE TOUCH: LDO33 recovery power-on failed value=%#x\n", check);
+ 		return false;
+ 	}
+ 	delay(50000);
+@@ -446,7 +470,7 @@
+ 	unsigned recoveries = 0;
+ 	(void)arg;
+ 	(void)result;
+-	printf("A5XELTE TOUCH: contact HID worker started (GPA1-1)\n");
++	jt_log("A5XELTE TOUCH: contact HID worker started (GPA1-1)\n");
+ 	for (;;) {
+ 		/* ZT7538 holds INTN low until CLEAR_INT_STATUS. */
+ 		if (!(a5touch_read(a5_touch_alive, 0x24) & 2u)) {
+@@ -457,7 +481,7 @@
+ 			if (!read_ok || !ack_ok ||
+ 			    (read_ok && ack_ok && !a5touch_report_packet(packet, &lines))) {
+ 				if (++errors <= 8) {
+-					printf("A5XELTE TOUCH: packet/ACK failed read=%d ack=%d errors=%u\n",
++					jt_log("A5XELTE TOUCH: packet/ACK failed read=%d ack=%d errors=%u\n",
+ 					    read_ok, ack_ok, errors);
+ 				}
+ 			} else {
+@@ -467,10 +491,10 @@
+ 			idle_ticks++;
+ 		}
+ 		if (errors >= 8 || idle_ticks >= 600) {
+-			printf("A5XELTE TOUCH: recovery reason=%s attempt=%u\n",
++			jt_log("A5XELTE TOUCH: recovery reason=%s attempt=%u\n",
+ 			    errors >= 8 ? "transfer" : "health IRQ", recoveries + 1);
+ 			if (!a5touch_recover() && ++recoveries >= 3) {
+-				printf("A5XELTE TOUCH: worker stopped after recovery failures\n");
++				jt_log("A5XELTE TOUCH: worker stopped after recovery failures\n");
+ 				break;
+ 			}
+ 			errors = 0;
+@@ -504,7 +528,7 @@
+ 		return true;
+ 	}
+ 	if (status == 0xffffu || status == 1u || (status & (1u << 13)) || count > 5) {
+-		printf("A5XELTE TOUCH: corrupt packet status=%#x count=%u\n", status, count);
++		jt_log("A5XELTE TOUCH: corrupt packet status=%#x count=%u\n", status, count);
+ 		return false;
+ 	}
+ 	for (unsigned slot = 0; slot < 5; slot++) {
+@@ -517,7 +541,7 @@
+ 		if (active) {
+ 			if (*lines < 256 && (!a5_touch_active[slot] ||
+ 			    a5_touch_x[slot] != x || a5_touch_y[slot] != y)) {
+-				printf("A5XELTE TOUCH: contact slot=%u x=%u y=%u width=%u flags=%#x status=%#x\n",
++				jt_log("A5XELTE TOUCH: contact slot=%u x=%u y=%u width=%u flags=%#x status=%#x\n",
+ 				    slot, x, y, packet[at + 4], sub, status);
+ 				(*lines)++;
+ 			}
+@@ -543,44 +567,44 @@
+ 	/* Native ZT7538 power-on sequence; abort on each failed transfer. */
+ 	if (!a5touch_write_reg(0xc000, 1) ||
+ 	    !a5touch_read_u16(0xcc00, &chip) || chip != 0xe538) {
+-		printf("A5XELTE TOUCH: chip-code failed value=%#x\n", chip);
++		jt_log("A5XELTE TOUCH: chip-code failed value=%#x\n", chip);
+ 		goto fail;
+ 	}
+-	printf("A5XELTE TOUCH: ZT7538 chip-code=%#x\n", chip);
++	jt_log("A5XELTE TOUCH: ZT7538 chip-code=%#x\n", chip);
+ 	if (!a5touch_cmd(0xc004) || !a5touch_write_reg(0xc002, 1)) {
+-		printf("A5XELTE TOUCH: firmware init sequence failed\n");
++		jt_log("A5XELTE TOUCH: firmware init sequence failed\n");
+ 		goto fail;
+ 	}
+ 	delay(2000);
+ 	if (!a5touch_write_reg(0xc001, 1)) {
+-		printf("A5XELTE TOUCH: program start failed\n");
++		jt_log("A5XELTE TOUCH: program start failed\n");
+ 		goto fail;
+ 	}
+ 	delay(150000);
+ 	if (!a5touch_read_u16(0x012c, &crc) || crc != 0x55aau ||
+ 	    !a5touch_read_u16(0x00c0, &x) || !a5touch_read_u16(0x00c1, &y)) {
+-		printf("A5XELTE TOUCH: firmware CRC/geometry failed crc=%#x x=%u y=%u\n",
++		jt_log("A5XELTE TOUCH: firmware CRC/geometry failed crc=%#x x=%u y=%u\n",
+ 		    crc, x, y);
+ 		goto fail;
+ 	}
+-	printf("A5XELTE TOUCH: firmware CRC=%#x geometry=%ux%u\n", crc, x, y);
++	jt_log("A5XELTE TOUCH: firmware CRC=%#x geometry=%ux%u\n", crc, x, y);
+ 	if (!a5touch_cmd(0x0000) || !a5touch_write_reg(0x00f0, 0) ||
+ 	    !a5touch_write_reg(0x0010, 0) ||
+ 	    !a5touch_write_reg(0x00f0, 0x003f)) {
+-		printf("A5XELTE TOUCH: mode 0 setup failed\n");
++		jt_log("A5XELTE TOUCH: mode 0 setup failed\n");
+ 		goto fail;
+ 	}
+ 	for (unsigned n = 0; n < 10; n++) {
+ 		if (!a5touch_cmd(0x0003)) {
+-			printf("A5XELTE TOUCH: interrupt queue ACK failed\n");
++			jt_log("A5XELTE TOUCH: interrupt queue ACK failed\n");
+ 			goto fail;
+ 		}
+ 	}
+ 	if (!a5touch_write_reg(0x00f1, 100)) {
+-		printf("A5XELTE TOUCH: heartbeat setup failed\n");
++		jt_log("A5XELTE TOUCH: heartbeat setup failed\n");
+ 		goto fail;
+ 	}
+-	printf("A5XELTE TOUCH: mode 0 ready, INTN=%u\n",
++	jt_log("A5XELTE TOUCH: mode 0 ready, INTN=%u\n",
+ 	    (unsigned)!!(a5touch_read(a5_touch_alive, 0x24) & 2u));
+ 	return true;
+ fail:
+@@ -596,7 +620,7 @@
+ 	a5_touch_bus = ml_io_map(0x13850000, 0x1000);
+ 	a5_touch_alive = alive;
+ 	if (!a5_touch_bus) {
+-		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
++		jt_log("A5XELTE TOUCH: I2C2 mapping failed\n");
+ 		return;
+ 	}
+ 	con = a5touch_read(nfc, 0);
+@@ -612,7 +636,7 @@
+ 	if (kernel_thread_start(a5touch_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+-		printf("A5XELTE TOUCH: contact thread start failed\n");
++		jt_log("A5XELTE TOUCH: contact thread start failed\n");
+ 	}
+ }
+ 
+@@ -1084,7 +1108,7 @@
+ 	a5touch_write(jt_ts_bus, JTTS_IICADD, JT_TS_SLAVE << 1);
+ 	a5touch_write(jt_ts_bus, JTTS_IICLC, JTTS_IICLC_VALUE);
+ 	a5touch_write(jt_ts_bus, JTTS_IICCON, JTTS_IICCON_INIT);
+-	printf("A8 TOUCH: i2c4 init con=%#x stat=%#x add=%#x lc=%#x\n",
++	jt_log("A8 TOUCH: i2c4 init con=%#x stat=%#x add=%#x lc=%#x\n",
+ 	    a5touch_read(jt_ts_bus, JTTS_IICCON),
+ 	    a5touch_read(jt_ts_bus, JTTS_IICSTAT),
+ 	    a5touch_read(jt_ts_bus, JTTS_IICADD),
+@@ -1111,11 +1135,11 @@
+ 	vm_offset_t pinctrl3 = jtts_pinctrl3();
+ 	uint32_t dat;
+ 	if (!pinctrl3) {
+-		printf("A8 TOUCH: %s pinctrl3 map failed\n", tag);
++		jt_log("A8 TOUCH: %s pinctrl3 map failed\n", tag);
+ 		return;
+ 	}
+ 	dat = a5touch_read(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_DAT);
+-	printf("A8 TOUCH: %s gpp4 dat=%#x sda=%u scl=%u\n",
++	jt_log("A8 TOUCH: %s gpp4 dat=%#x sda=%u scl=%u\n",
+ 	    tag, dat, dat & 1u, (dat >> 1) & 1u);
+ }
+ 
+@@ -1131,7 +1155,7 @@
+ 	uint32_t pud;
+ 	bool sda_high;
+ 
+-	printf("A8 TOUCH: bus busy stat=%#x, recovering\n",
++	jt_log("A8 TOUCH: bus busy stat=%#x, recovering\n",
+ 	    a5touch_read(jt_ts_bus, JTTS_IICSTAT));
+ 	jtts_pad_levels("busy");
+ 	a5touch_write(jt_ts_bus, JTTS_IICSTAT,
+@@ -1156,7 +1180,7 @@
+ 		delay(1);
+ 		sda_high = (a5touch_read(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_DAT) & 1u) != 0;
+ 	}
+-	printf("A8 TOUCH: bus recover clocks sda_high=%u\n", sda_high);
++	jt_log("A8 TOUCH: bus recover clocks sda_high=%u\n", sda_high);
+ 
+ 	pud = a5touch_read(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_PUD);
+ 	con = a5touch_read(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_CON);
+@@ -1245,7 +1269,7 @@
+ 		}
+ 		if (n == 1999) {
+ 			if (recovered++) {
+-				printf("A8 TOUCH: i2c4 still busy after recovery\n");
++				jt_log("A8 TOUCH: i2c4 still busy after recovery\n");
+ 				return false;
+ 			}
+ 			jtts_bus_recover();
+@@ -1283,17 +1307,17 @@
+ 	uint32_t gpg3_pud;
+ 	uint32_t gpa0_dat;
+ 	if (!pinctrl0 || !pinctrl3) {
+-		printf("A8 TOUCH: pinctrl mapping failed\n");
++		jt_log("A8 TOUCH: pinctrl mapping failed\n");
+ 		return;
+ 	}
+ 	gpg3_con = a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_CON);
+ 	gpg3_dat = a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_DAT);
+ 	gpg3_pud = a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_PUD);
+ 	gpa0_dat = a5touch_read(pinctrl0, JTTS_GPA0_OFF + JTTS_PIN_DAT);
+-	printf("A8 TOUCH: tsp_ldo_en gpg3-0 %u uV dat=%u -> %s\n",
++	jt_log("A8 TOUCH: tsp_ldo_en gpg3-0 %u uV dat=%u -> %s\n",
+ 	    JT_TS_LDO_UV, gpg3_dat & 1u,
+ 	    (gpg3_dat & 1u) ? "S-Boot left it enabled" : "NOT enabled by S-Boot");
+-	printf("A8 TOUCH: gpg3 con=%#x dat=%#x pud=%#x id(gpg3-6)=%u; gpa0 dat=%#x irq(gpa0-0)=%u\n",
++	jt_log("A8 TOUCH: gpg3 con=%#x dat=%#x pud=%#x id(gpg3-6)=%u; gpa0 dat=%#x irq(gpa0-0)=%u\n",
+ 	    gpg3_con, gpg3_dat, gpg3_pud, (gpg3_dat >> 6) & 1u,
+ 	    gpa0_dat, gpa0_dat & 1u);
+ }
+@@ -1349,7 +1373,7 @@
+ 		}
+ 		if (n == 1999) {
+ 			if (recovered++) {
+-				printf("A8 TOUCH: i2c4 still busy on write\n");
++				jt_log("A8 TOUCH: i2c4 still busy on write\n");
+ 				return false;
+ 			}
+ 			jtts_bus_recover();
+@@ -1387,7 +1411,7 @@
+ 		}
+ 		if (n == 1999) {
+ 			if (recovered++) {
+-				printf("A8 TOUCH: i2c4 still busy on write\n");
++				jt_log("A8 TOUCH: i2c4 still busy on write\n");
+ 				return false;
+ 			}
+ 			jtts_bus_recover();
+@@ -1455,7 +1479,7 @@
+ 	unsigned y;
+ 
+ 	if (jt_ts_verbose) {
+-		printf("A8 TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x eid=%u tid=%u act=%u\n",
++		jt_log("A8 TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x eid=%u tid=%u act=%u\n",
+ 		    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7],
+ 		    eid, tid, action);
+ 	}
+@@ -1470,13 +1494,13 @@
+ 		    status_id == JTTS_ACK_BOOT_COMPLETE && data1 == 0x20u) {
+ 			const uint8_t func[3] = { JTTS_CMD_TOUCH_FUNCTION,
+ 						  JTTS_TOUCH_FUNCTION_TOUCH, 0x00u };
+-			printf("A8 TOUCH: watchdog reset, re-sense\n");
++			jt_log("A8 TOUCH: watchdog reset, re-sense\n");
+ 			jackpotlte_touch_release_all();
+ 			(void)jtts_write_bytes(func, sizeof(func));
+ 			(void)jtts_write_cmd(JTTS_CMD_SENSE_ON);
+ 		} else if (stype == JTTS_STATUS_EVENT_ERR &&
+ 		    status_id == JTTS_ERR_EVENT_QUEUE_FULL) {
+-			printf("A8 TOUCH: IC event queue full, release all\n");
++			jt_log("A8 TOUCH: IC event queue full, release all\n");
+ 			jackpotlte_touch_release_all();
+ 		}
+ 		return;		/* other status event: nothing to forward */
+@@ -1509,7 +1533,7 @@
+ 			 * a8touchverbose=1 restores the per-event dump. */
+ 			jt_ts_moves++;
+ 		} else if (!jt_ts_down[tid]) {
+-			printf("A8 TOUCH: press id=%u raw=(%u,%u) panel=(%u,%u)\n",
++			jt_log("A8 TOUCH: press id=%u raw=(%u,%u) panel=(%u,%u)\n",
+ 			    tid, rx, ry, x, y);
+ 		}
+ 		jt_ts_down[tid] = true;
+@@ -1517,7 +1541,7 @@
+ 		jt_ts_y[tid] = (uint16_t)y;
+ 		sweet_hid_touch((int)tid, 1, (int)x, (int)y);
+ 	} else if (action == 3u && jt_ts_down[tid]) {	/* release */
+-		printf("A8 TOUCH: release id=%u raw=(%u,%u) panel=(%u,%u)\n",
++		jt_log("A8 TOUCH: release id=%u raw=(%u,%u) panel=(%u,%u)\n",
+ 		    tid, rx, ry, x, y);
+ 		jt_ts_down[tid] = false;
+ 		sweet_hid_touch((int)tid, 0, jt_ts_x[tid], jt_ts_y[tid]);
+@@ -1536,14 +1560,14 @@
+ 	int last_irq = -1;
+ 	(void)arg;
+ 	(void)result;
+-	printf("A8 TOUCH: contact worker started (debug log on)\n");
++	jt_log("A8 TOUCH: contact worker started (debug log on)\n");
+ 	for (;;) {
+ 		/* Every ~16 s, always: movement events and I2C recoveries, and a
+ 		 * heartbeat proving the worker runs even with no touch at all
+ 		 * (the counters are otherwise only visible during activity). */
+ 		if (++ticks == 2000) {
+ 			ticks = 0;
+-			printf("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u backlog=%u\n",
++			jt_log("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u backlog=%u\n",
+ 			    jt_ts_moves, jt_ts_retries, jt_ts_lost,
+ 			    jt_ts_overflows);
+ 		}
+@@ -1558,7 +1582,7 @@
+ 			quiet = 0;
+ 			for (unsigned t = 0; t < 5u; t++) {
+ 				if (jt_ts_down[t]) {
+-					printf("A8 TOUCH: lift watchdog, releasing\n");
++					jt_log("A8 TOUCH: lift watchdog, releasing\n");
+ 					jackpotlte_touch_release_all();
+ 					break;
+ 				}
+@@ -1568,13 +1592,13 @@
+ 		int irq = !!(a5touch_read(jt_ts_pinctrl0,
+ 		    JTTS_GPA0_OFF + JTTS_PIN_DAT) & 1u);
+ 		if (irq != last_irq) {
+-			printf("A8 TOUCH: irq gpa0-0 -> %s\n",
++			jt_log("A8 TOUCH: irq gpa0-0 -> %s\n",
+ 			    irq ? "high" : "low");
+ 			last_irq = irq;
+ 		}
+ 		if (irq) {
+ 			if (++idle == 4000) {	/* ~32 s heartbeat */
+-				printf("A8 TOUCH: idle, irq high for %u polls\n",
++				jt_log("A8 TOUCH: idle, irq high for %u polls\n",
+ 				    idle);
+ 				idle = 0;
+ 			}
+@@ -1584,7 +1608,7 @@
+ 		idle = 0;
+ 		if (!jtts_read_retry(JTTS_READ_ONE_EVENT, buf, 8)) {
+ 			if (++errors <= 8 || !(errors & 255)) {
+-				printf("A8 TOUCH: event read failed (%u) stat=%#x\n",
++				jt_log("A8 TOUCH: event read failed (%u) stat=%#x\n",
+ 				    errors,
+ 				    a5touch_read(jt_ts_bus, JTTS_IICSTAT));
+ 			}
+@@ -1592,7 +1616,7 @@
+ 			continue;
+ 		}
+ 		if (jt_ts_verbose) {
+-			printf("A8 TOUCH: read %02x %02x %02x %02x %02x %02x %02x %02x left=%u\n",
++			jt_log("A8 TOUCH: read %02x %02x %02x %02x %02x %02x %02x %02x left=%u\n",
+ 			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+ 			    buf[6], buf[7], buf[7] & 0x3fu);
+ 		}
+@@ -1619,7 +1643,7 @@
+ 			 * in that very backlog. */
+ 			jt_ts_overflows++;
+ 			if (jt_ts_overflows <= 4 || !(jt_ts_overflows & 31u)) {
+-				printf("A8 TOUCH: event backlog left=%u, draining\n",
++				jt_log("A8 TOUCH: event backlog left=%u, draining\n",
+ 				    left);
+ 			}
+ 			left = JTTS_MAX_EVENT_COUNT - 1u;
+@@ -1651,7 +1675,7 @@
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("a8touchpwr", &power, sizeof(power));
+-	printf("A8 TOUCH: contact path; status before power=%#x pwr=%d\n",
++	jt_log("A8 TOUCH: contact path; status before power=%#x pwr=%d\n",
+ 	    boot, power);
+ 	if (power) {
+ 		const uint8_t func[3] = { JTTS_CMD_TOUCH_FUNCTION,
+@@ -1670,16 +1694,16 @@
+ 		}
+ 		if (st_ok) {
+ 			boot = st;
+-			printf("A8 TOUCH: status after power=%#x (%s)\n", boot,
++			jt_log("A8 TOUCH: status after power=%#x (%s)\n", boot,
+ 			    boot == JTTS_STATUS_APP_MODE ? "app mode" :
+ 			    boot == JTTS_STATUS_BOOT_MODE ? "boot mode" :
+ 			    "unknown");
+ 		} else {
+-			printf("A8 TOUCH: status read failed after power\n");
++			jt_log("A8 TOUCH: status read failed after power\n");
+ 		}
+ 		have_id = jtts_read_retry(JTTS_READ_ID, id, sizeof(id));
+ 		if (have_id) {
+-			printf("A8 TOUCH: id after power %02x%02x%02x\n",
++			jt_log("A8 TOUCH: id after power %02x%02x%02x\n",
+ 			    id[0], id[1], id[2]);
+ 		}
+ 		/* The IC reports coordinates only after SET_TOUCHFUNCTION and
+@@ -1689,27 +1713,27 @@
+ 		 * transiently lost, because the IC is clearly running. */
+ 		if (boot == JTTS_STATUS_APP_MODE || have_id) {
+ 			if (jtts_write_bytes(func, sizeof(func))) {
+-				printf("A8 TOUCH: touch-function sent\n");
++				jt_log("A8 TOUCH: touch-function sent\n");
+ 			} else {
+-				printf("A8 TOUCH: touch-function write failed\n");
++				jt_log("A8 TOUCH: touch-function write failed\n");
+ 			}
+ 			if (jtts_write_cmd(JTTS_CMD_SENSE_ON)) {
+-				printf("A8 TOUCH: sense-on sent\n");
++				jt_log("A8 TOUCH: sense-on sent\n");
+ 			} else {
+-				printf("A8 TOUCH: sense-on write failed\n");
++				jt_log("A8 TOUCH: sense-on write failed\n");
+ 			}
+ 		}
+ 	}
+ 	jt_ts_pinctrl0 = ml_io_map(JTTS_PINCTRL0, 0x1000);
+ 	if (!jt_ts_pinctrl0) {
+-		printf("A8 TOUCH: contact pinctrl mapping failed\n");
++		jt_log("A8 TOUCH: contact pinctrl mapping failed\n");
+ 		return;
+ 	}
+ 	if (kernel_thread_start(jackpotlte_touch_thread, NULL, &thread) ==
+ 	    KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+-		printf("A8 TOUCH: contact thread start failed\n");
++		jt_log("A8 TOUCH: contact thread start failed\n");
+ 	}
+ }
+ 
+@@ -1742,30 +1766,30 @@
+ 	}
+ 	pinctrl3 = ml_io_map(JTTS_PINCTRL3, 0x1000);
+ 	if (!pinctrl3) {
+-		printf("A8 TOUCH PWR: pinctrl3 mapping failed\n");
++		jt_log("A8 TOUCH PWR: pinctrl3 mapping failed\n");
+ 		return;
+ 	}
+ 	con = a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_CON);
+ 	dat = a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_DAT);
+-	printf("A8 TOUCH PWR: ldo before con=%#x dat=%#x\n", con, dat);
++	jt_log("A8 TOUCH PWR: ldo before con=%#x dat=%#x\n", con, dat);
+ 	/* gpg3-0 -> output (func 1); leave the other pins' nibbles alone. */
+ 	a5touch_write(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_CON,
+ 	    (con & ~0xfu) | 0x1u);
+ 	a5touch_write(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_DAT, dat | 0x1u);
+-	printf("A8 TOUCH PWR: ldo on con=%#x dat=%#x\n",
++	jt_log("A8 TOUCH PWR: ldo on con=%#x dat=%#x\n",
+ 	    a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_CON),
+ 	    a5touch_read(pinctrl3, JTTS_GPG3_OFF + JTTS_PIN_DAT));
+ 	peri = ml_io_map(JTTS_PERI_QCH_I2C4 & ~0xfffu, 0x1000);
+ 	if (!peri) {
+-		printf("A8 TOUCH PWR: peri cmu mapping failed\n");
++		jt_log("A8 TOUCH PWR: peri cmu mapping failed\n");
+ 		return;
+ 	}
+ 	qch = a5touch_read(peri, JTTS_PERI_QCH_I2C4 & 0xfffu);
+ 	if (qch & 0x1u) {
+-		printf("A8 TOUCH PWR: i2c4 qch=%#x already enabled\n", qch);
++		jt_log("A8 TOUCH PWR: i2c4 qch=%#x already enabled\n", qch);
+ 	} else {
+ 		a5touch_write(peri, JTTS_PERI_QCH_I2C4 & 0xfffu, qch | 0x3u);
+-		printf("A8 TOUCH PWR: i2c4 qch %#x -> %#x\n", qch,
++		jt_log("A8 TOUCH PWR: i2c4 qch %#x -> %#x\n", qch,
+ 		    a5touch_read(peri, JTTS_PERI_QCH_I2C4 & 0xfffu));
+ 	}
+ 	/* Mux the I2C4 bus pads.  gpp4-0/1 are function 2 with pull-up in
+@@ -1779,7 +1803,7 @@
+ 	    (con & ~0xffu) | 0x22u);
+ 	a5touch_write(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_PUD,
+ 	    (pud & ~0xffu) | 0x33u);
+-	printf("A8 TOUCH PWR: gpp4 i2c4 pads con %#x -> %#x pud %#x -> %#x\n",
++	jt_log("A8 TOUCH PWR: gpp4 i2c4 pads con %#x -> %#x pud %#x -> %#x\n",
+ 	    con, a5touch_read(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_CON),
+ 	    pud, a5touch_read(pinctrl3, JTTS_GPP4_OFF + JTTS_PIN_PUD));
+ 	jtts_pad_levels("after mux");
+@@ -1809,10 +1833,10 @@
+ 	jackpotlte_touch_power_up();
+ 	jt_ts_bus = ml_io_map(JT_TS_I2C_PA, 0x1000);
+ 	if (!jt_ts_bus) {
+-		printf("A8 TOUCH: i2c4@%#x mapping failed\n", (unsigned)JT_TS_I2C_PA);
++		jt_log("A8 TOUCH: i2c4@%#x mapping failed\n", (unsigned)JT_TS_I2C_PA);
+ 		return;
+ 	}
+-	printf("A8 TOUCH: i2c4@%#x con=%#x stat=%#x add=%#x lc=%#x\n",
++	jt_log("A8 TOUCH: i2c4@%#x con=%#x stat=%#x add=%#x lc=%#x\n",
+ 	    (unsigned)JT_TS_I2C_PA,
+ 	    a5touch_read(jt_ts_bus, JTTS_IICCON),
+ 	    a5touch_read(jt_ts_bus, JTTS_IICSTAT),
+@@ -1830,7 +1854,7 @@
+ 	have_id = jtts_read_retry(JTTS_READ_ID, id, sizeof(id));
+ 	if (!have_id) {
+ 		jtts_pad_levels("read failed");
+-		printf("A8 TOUCH: product id read failed stat=%#x con=%#x, "
++		jt_log("A8 TOUCH: product id read failed stat=%#x con=%#x, "
+ 		    "recovering\n",
+ 		    a5touch_read(jt_ts_bus, JTTS_IICSTAT),
+ 		    a5touch_read(jt_ts_bus, JTTS_IICCON));
+@@ -1839,32 +1863,32 @@
+ 		have_id = jtts_read_retry(JTTS_READ_ID, id, sizeof(id));
+ 	}
+ 	if (!have_id) {
+-		printf("A8 TOUCH: no product id; starting the contact path "
++		jt_log("A8 TOUCH: no product id; starting the contact path "
+ 		    "anyway\n");
+ 		jackpotlte_touch_contacts(boot);
+ 		return;
+ 	}
+-	printf("A8 TOUCH: sec_ts product id %02x%02x%02x\n", id[0], id[1], id[2]);
++	jt_log("A8 TOUCH: sec_ts product id %02x%02x%02x\n", id[0], id[1], id[2]);
+ 	if (jtts_read_reg(JTTS_READ_DEVICE_ID, dev, sizeof(dev))) {
+-		printf("A8 TOUCH: device id %02x%02x%02x%02x%02x\n",
++		jt_log("A8 TOUCH: device id %02x%02x%02x%02x%02x\n",
+ 		    dev[0], dev[1], dev[2], dev[3], dev[4]);
+ 	}
+ 	if (jtts_read_reg(JTTS_READ_BOOT_STATUS, &boot, 1)) {
+-		printf("A8 TOUCH: boot status %#x (%s)\n", boot,
++		jt_log("A8 TOUCH: boot status %#x (%s)\n", boot,
+ 		    boot == JTTS_STATUS_APP_MODE ? "app mode" :
+ 		    boot == JTTS_STATUS_BOOT_MODE ? "boot mode" : "unknown");
+ 	}
+ 	if (jtts_read_reg(JTTS_READ_FW_INTEGRITY, &integrity, 1)) {
+-		printf("A8 TOUCH: fw integrity %#x\n", integrity);
++		jt_log("A8 TOUCH: fw integrity %#x\n", integrity);
+ 	}
+ 	if (jtts_read_reg(JTTS_READ_PANEL_INFO, panel, sizeof(panel))) {
+-		printf("A8 TOUCH: panel nTX=%u nRX=%u resX=%u resY=%u\n",
++		jt_log("A8 TOUCH: panel nTX=%u nRX=%u resX=%u resY=%u\n",
+ 		    panel[8], panel[9],
+ 		    ((unsigned)panel[0] << 8) | panel[1],
+ 		    ((unsigned)panel[2] << 8) | panel[3]);
+ 	}
+ 	if (jtts_read_reg(JTTS_READ_FW_VERSION, fw, sizeof(fw))) {
+-		printf("A8 TOUCH: fw version %02x%02x%02x%02x\n",
++		jt_log("A8 TOUCH: fw version %02x%02x%02x%02x\n",
+ 		    fw[0], fw[1], fw[2], fw[3]);
+ 	}
+ 	jackpotlte_touch_contacts(boot);
+@@ -1902,22 +1926,22 @@
+ 	peri = ml_io_map(0x139f0000, 0x1000);
+ 	mif = ml_io_map(0x10430000, 0x1000);
+ 	if (!alive || !nfc || !mifpins || !peri || !mif) {
+-		printf("A5XELTE TOUCH: probe MMIO mapping failed\n");
++		jt_log("A5XELTE TOUCH: probe MMIO mapping failed\n");
+ 		return;
+ 	}
+ 	pclk = a5touch_read(peri, 0x904);
+ 	mifclk = a5touch_read(mif, 0x900);
+-	printf("A5XELTE TOUCH: INT GPA1 con=%#x dat=%#x; GPC3 con=%#x dat=%#x pud=%#x\n",
++	jt_log("A5XELTE TOUCH: INT GPA1 con=%#x dat=%#x; GPC3 con=%#x dat=%#x pud=%#x\n",
+ 	    a5touch_read(alive, 0x20), a5touch_read(alive, 0x24),
+ 	    a5touch_read(nfc, 0), a5touch_read(nfc, 4), a5touch_read(nfc, 8));
+-	printf("A5XELTE TOUCH: I2C2 gate=%d MIF HSI2C3 gate=%d GPM0 con=%#x dat=%#x pud=%#x\n",
++	jt_log("A5XELTE TOUCH: I2C2 gate=%d MIF HSI2C3 gate=%d GPM0 con=%#x dat=%#x pud=%#x\n",
+ 	    !!(pclk & (1u << 9)), !!(mifclk & (1u << 27)),
+ 	    a5touch_read(mifpins, 0), a5touch_read(mifpins, 4),
+ 	    a5touch_read(mifpins, 8));
+ 	if (pclk & (1u << 9)) {
+ 		vm_offset_t i2c = ml_io_map(0x13850000, 0x1000);
+ 		if (i2c) {
+-			printf("A5XELTE TOUCH: I2C2 con=%#x stat=%#x add=%#x lc=%#x (read only)\n",
++			jt_log("A5XELTE TOUCH: I2C2 con=%#x stat=%#x add=%#x lc=%#x\n",
+ 			    a5touch_read(i2c, 0), a5touch_read(i2c, 4),
+ 			    a5touch_read(i2c, 8), a5touch_read(i2c, 0x10));
+ 		}
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -399,6 +399,27 @@
+ 	return on;
+ }
+ 
++/*
++ * Touch logging is off unless a8touchverbose=1 -- the same switch the
++ * A5XELTE touch driver uses (bsd/dev/a5xelte_touch.c).  One line per
++ * contact is noise on the framebuffer console, and printing on the path a
++ * swipe depends on is itself load on it.
++ */
++static bool
++sweet_hid_touch_log(void)
++{
++	static int parsed = 0;
++	static bool on = false;
++	int value = 0;
++
++	if (!parsed) {
++		(void)PE_parse_boot_argn("a8touchverbose", &value, sizeof(value));
++		on = (value != 0);
++		parsed = 1;
++	}
++	return on;
++}
++
+ static void
+ sweet_hid_report_clients(void)
+ {
+@@ -506,7 +527,9 @@
+ #endif
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered\n");
++	if (sweet_hid_touch_log()) {
++		IOLog("SWEET HID: touch registered\n");
++	}
+ 	return true;
+ }
+ 
+@@ -592,7 +615,7 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
+ 
+-	if (was != down) {
++	if (was != down && sweet_hid_touch_log()) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s (%u clients)\n", finger,
+ 		    down ? "down" : "up", x, y, fEdge[finger] ? " edge" : "",
+ 		    _clients ? _clients->getCount() : 0);

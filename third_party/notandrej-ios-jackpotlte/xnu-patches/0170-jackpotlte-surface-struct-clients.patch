@@ -1,0 +1,167 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -67,6 +67,14 @@
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
++/* Smallest structure output that is a surface client and not a value: the
++ * framework builds its own IOSurfaceClient (0x150 bytes at planeCount 0,
++ * 0xa68 at 16) out of this, and then dereferences the two addresses the
++ * result starts with (JT 61: backboardd, IOSurface + 0x4ffc, far 0x30). */
++#define SWEET_SURFACE_CLIENT_MIN        0x100
++#define SWEET_SURFACE_REQ_LOG           384     /* request lines this boot */
++#define SWEET_SURFACE_SHAPE_LOG         64      /* one shape line per selector */
++
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+@@ -443,6 +451,95 @@
+ 	IOLog("SWEET SURF: %s %s %u\n", name, what, n);
+ }
+ 
++/* Bring-up instrumentation (jt62): one line per request, so the sequence a
++ * dying display server leaves behind can be read off the panel, and one line
++ * per selector saying the shape of what it asked for.  Both are bounded so a
++ * frame's worth of traffic cannot scroll the crash report itself away. */
++static uint32_t sweet_surf_requests;
++static uint64_t sweet_surf_shaped;
++
++static uint32_t
++sweet_surf_in_size(IOExternalMethodArguments *args)
++{
++	return args->structureInputDescriptor != NULL ?
++	    (uint32_t)args->structureInputDescriptor->getLength() :
++	    (uint32_t)args->structureInputSize;
++}
++
++static uint32_t
++sweet_surf_out_size(IOExternalMethodArguments *args)
++{
++	return args->structureOutputDescriptor != NULL ?
++	    (uint32_t)args->structureOutputDescriptor->getLength() :
++	    (uint32_t)args->structureOutputSize;
++}
++
++/* The surface id a request names: the first scalar when it has one, otherwise
++ * the first u32 of its structure input.  IOSurface.framework's per-plane and
++ * per-buffer calls (JT 61 sel 6 and 9) pass no scalars at all and put the
++ * client id in the structure, so a fallback that only looks at scalars would
++ * refuse exactly the request that killed the display server. */
++static bool
++sweet_surf_in_id(IOExternalMethodArguments *args, uint32_t *idOut)
++{
++	uint32_t id;
++
++	if (args->scalarInputCount > 0) {
++		*idOut = (uint32_t)args->scalarInput[0];
++		return true;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->getLength() < sizeof(id) ||
++		    args->structureInputDescriptor->readBytes(0, &id, sizeof(id)) !=
++		    sizeof(id)) {
++			return false;
++		}
++		*idOut = id;
++		return true;
++	}
++	if (args->structureInput != NULL && args->structureInputSize >= sizeof(id)) {
++		memcpy(&id, args->structureInput, sizeof(id));
++		*idOut = id;
++		return true;
++	}
++	return false;
++}
++
++static void
++sweet_surf_log_request(uint32_t selector, IOExternalMethodArguments *args, uint64_t arg0)
++{
++	char name[32];
++	uint32_t id = 0;
++	bool haveId = sweet_surf_in_id(args, &id);
++
++	if (sweet_surf_requests++ >= SWEET_SURFACE_REQ_LOG) {
++		return;
++	}
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF REQ: %s sel %u arg0 %#llx id %u%s scalarin %u struct %u/%u desc %u/%u\n",
++	    name, selector, (unsigned long long)arg0, id,
++	    haveId ? (args->scalarInputCount > 0 ? "" : " (from struct)") : " (none)",
++	    args->scalarInputCount, sweet_surf_in_size(args), sweet_surf_out_size(args),
++	    args->structureInputDescriptor != NULL,
++	    args->structureOutputDescriptor != NULL);
++}
++
++static void
++sweet_surf_log_shape(uint32_t selector, IOExternalMethodArguments *args)
++{
++	char name[32];
++
++	if (selector >= SWEET_SURFACE_SHAPE_LOG ||
++	    (sweet_surf_shaped & (1ULL << selector))) {
++		return;
++	}
++	sweet_surf_shaped |= 1ULL << selector;
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF SHAPE: %s sel %u scalarin %u struct %u/%u\n",
++	    name, selector, args->scalarInputCount, sweet_surf_in_size(args),
++	    sweet_surf_out_size(args));
++}
++
+ bool
+ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -728,6 +825,9 @@
+ {
+ 	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+ 
++	sweet_surf_log_request(selector, args, arg0);
++	sweet_surf_log_shape(selector, args);
++
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+ 		uint8_t limits[0x18] = { 0 };
+@@ -772,8 +872,32 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
+-	default:
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
++	default: {
++		/* Values, notifications, ownership, timestamps...: accept and
++		 * ignore.  A structure as large as a surface client is not a
++		 * value, though: the caller builds an IOSurfaceClient out of
++		 * it and dereferences the addresses it starts with.  Answering
++		 * that with zeros is what killed the display server in jt61
++		 * (IOSurface + 0x4ffc read NULL + 0x30), so hand back a real
++		 * surface when the first scalar names one, and refuse the rest
++		 * rather than return a zeroed one. */
++		uint32_t out = sweet_surf_out_size(args);
++		uint32_t id = 0;
++
++		if (out >= SWEET_SURFACE_CLIENT_MIN &&
++		    sweet_surf_in_id(args, &id)) {
++			SweetSurface *s = sweet_surface_copy(id);
++			if (s != NULL) {
++				IOReturn ret = sweet_surface_get(s) ?
++				    returnSurface(s, args) : kIOReturnNotFound;
++				s->release();
++				return ret;
++			}
++			IOLog("SWEET SURF: sel %u wants a %u-byte structure; "
++			    "id %u is no surface\n", selector, out, id);
++			sweet_surf_log_once("sel", selector);
++			return kIOReturnUnsupported;
++		}
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+ 		}
+@@ -783,6 +907,7 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	}
+ }
+ 
+ IOReturn

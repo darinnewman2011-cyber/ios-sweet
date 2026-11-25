@@ -1,0 +1,309 @@
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1004,9 +1004,21 @@ dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+ #define JTTS_READ_PANEL_INFO	0x23u
+ #define JTTS_READ_ID		0x52u
+ #define JTTS_READ_BOOT_STATUS	0x55u
++#define JTTS_READ_ONE_EVENT	0x60u
++#define JTTS_READ_ALL_EVENT	0x61u
+ #define JTTS_READ_FW_VERSION	0xa3u
+ #define JTTS_STATUS_BOOT_MODE	0x10u
+ #define JTTS_STATUS_APP_MODE	0x20u
++#define JTTS_EVENT_COORDINATE	0x00u
++#define JTTS_EVENT_STATUS	0x01u
++#define JTTS_EVENT_BUFF_SIZE	8u
++#define JTTS_MAX_EVENT_COUNT	32u	/* sec_ts.c:936, IC event queue depth */
++#define JTTS_STATUS_EVENT_ERR	1u	/* sec_ts.h:111 */
++#define JTTS_STATUS_EVENT_INFO	2u	/* sec_ts.h:112 */
++#define JTTS_ACK_BOOT_COMPLETE	0x00u
++#define JTTS_ERR_EVENT_QUEUE_FULL 0x01u
++#define JTTS_CMD_SENSE_ON	0x10u
++#define JTTS_CMD_CLEAR_EVENT_STACK 0x62u
+ 
+ static vm_offset_t jt_ts_bus;
+ 
+@@ -1271,6 +1283,276 @@ jackpotlte_touch_power_log(void)
+ 	    gpa0_dat, gpa0_dat & 1u);
+ }
+ 
++/*
++ * Mode-0 contact path.  Polls the sec_ts event queue and feeds
++ * SweetHIDTouch like the native driver's coordinate event.  Every event is
++ * logged raw and decoded so a dead controller can be diagnosed.  Like the
++ * native driver it also re-arms the IC with SENSE_ON after a watchdog reset
++ * and clears a corrupt event queue, and it sends SENSE_ON once at startup
++ * when the IC reports app mode.  The worker starts even if the controller is
++ * not yet in application mode, so the interrupt line can still be watched.
++ * Touches are forwarded to SweetHIDTouch as press/move/release.
++ */
++static int jt_ts_sleep;
++static vm_offset_t jt_ts_pinctrl0;
++static bool jt_ts_down[5];
++static uint16_t jt_ts_x[5];
++static uint16_t jt_ts_y[5];
++
++static void
++jackpotlte_touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&jt_ts_sleep, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* sec_ts single command write: START, slave write address, one command byte,
++ * STOP.  Mirrors the native sec_ts_i2c_write(ts, cmd, NULL, 0)
++ * (Eureka drivers/input/touchscreen/sec_ts/sec_ts.c:489 path) through the
++ * s3c2410-style I2C4 controller. */
++static bool
++jtts_write_cmd(uint8_t cmd)
++{
++	bool ok = false;
++	int recovered = 0;
++retry:
++	for (unsigned n = 0; n < 2000; n++) {
++		if (!(a5touch_read(jt_ts_bus, JTTS_IICSTAT) & JTTS_IICSTAT_START)) {
++			break;
++		}
++		if (n == 1999) {
++			if (recovered++) {
++				printf("A8 TOUCH: i2c4 still busy on write\n");
++				return false;
++			}
++			jtts_bus_recover();
++			goto retry;
++		}
++		delay(1);
++	}
++	if (!jtts_address(JTTS_IICSTAT_MASTER_TX, JT_TS_SLAVE << 1)) {
++		goto out;
++	}
++	if (!jtts_tx(&cmd, 1)) {
++		goto out;
++	}
++	ok = true;
++out:
++	jtts_stop();
++	return ok;
++}
++
++/* Release every finger we believe is down, e.g. after a watchdog reset or a
++ * full event queue (sec_ts.c:1041,1066). */
++static void
++jackpotlte_touch_release_all(void)
++{
++	for (unsigned t = 0; t < 5u; t++) {
++		if (jt_ts_down[t]) {
++			jt_ts_down[t] = false;
++			sweet_hid_touch((int)t, 0, jt_ts_x[t], jt_ts_y[t]);
++		}
++	}
++}
++
++/* Decode one 8-byte sec_ts coordinate event exactly like the native driver
++ * (Eureka drivers/input/touchscreen/sec_ts/sec_ts.c:1099-1105): tid is
++ * 1-based, x = x_11_4 << 4 | x_3_0, y = y_11_4 << 4 | y_3_0, and the action
++ * is tchsta (app/move/release).  The 8-byte bit layout is sec_ts.h:595-609. */
++static void
++jackpotlte_touch_report(const uint8_t *ev)
++{
++	unsigned eid = ev[0] & 0x3u;
++	unsigned tid = (ev[0] >> 2) & 0xfu;
++	unsigned action = (ev[0] >> 6) & 0x3u;
++	unsigned rx;
++	unsigned ry;
++	unsigned x;
++	unsigned y;
++
++	printf("A8 TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x eid=%u tid=%u act=%u\n",
++	    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7],
++	    eid, tid, action);
++	if (eid == JTTS_EVENT_STATUS) {
++		unsigned stype = (ev[0] >> 2) & 0xfu;
++		unsigned status_id = ev[1];
++		unsigned data1 = ev[2];
++		/* Watchdog reset: the IC has rebooted and dropped touch
++		 * sensing, so release fingers and re-arm it with SENSE_ON
++		 * (sec_ts.c:1039-1045). */
++		if (stype == JTTS_STATUS_EVENT_INFO &&
++		    status_id == JTTS_ACK_BOOT_COMPLETE && data1 == 0x20u) {
++			printf("A8 TOUCH: watchdog reset, re-sense\n");
++			jackpotlte_touch_release_all();
++			(void)jtts_write_cmd(JTTS_CMD_SENSE_ON);
++		} else if (stype == JTTS_STATUS_EVENT_ERR &&
++		    status_id == JTTS_ERR_EVENT_QUEUE_FULL) {
++			printf("A8 TOUCH: IC event queue full, release all\n");
++			jackpotlte_touch_release_all();
++		}
++		return;		/* status/other event: already logged raw */
++	}
++	if (eid != JTTS_EVENT_COORDINATE || tid == 0 || tid > 5) {
++		return;
++	}
++	tid -= 1;
++	rx = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
++	ry = ((unsigned)ev[2] << 4) | (ev[3] & 0xfu);
++	/* Raw 12-bit panel coordinates (DTS sec,max_coords = <4096 4096>,
++	 * line 638) into SweetHIDTouch's 1080x1920 A5XELTE space. */
++	x = rx * 1080u / 4096u;
++	y = ry * 1920u / 4096u;
++	if (x > 1079u) {
++		x = 1079u;
++	}
++	if (y > 1919u) {
++		y = 1919u;
++	}
++	printf("A8 TOUCH: %s id=%u raw=(%u,%u) panel=(%u,%u)\n",
++	    action == 1u ? "press" : action == 2u ? "move" : "release",
++	    tid, rx, ry, x, y);
++	if (action == 1u || action == 2u) {		/* press, move */
++		jt_ts_down[tid] = true;
++		jt_ts_x[tid] = (uint16_t)x;
++		jt_ts_y[tid] = (uint16_t)y;
++		sweet_hid_touch((int)tid, 1, (int)x, (int)y);
++	} else if (action == 3u && jt_ts_down[tid]) {	/* release */
++		jt_ts_down[tid] = false;
++		sweet_hid_touch((int)tid, 0, jt_ts_x[tid], jt_ts_y[tid]);
++	}
++}
++
++static void
++jackpotlte_touch_thread(void *arg, wait_result_t result)
++{
++	uint8_t buf[8 * 4];
++	unsigned errors = 0;
++	unsigned idle = 0;
++	int last_irq = -1;
++	(void)arg;
++	(void)result;
++	printf("A8 TOUCH: contact worker started (debug log on)\n");
++	for (;;) {
++		/* IRQ gpa0-0 (DTS line 635) is level low while events queue. */
++		int irq = !!(a5touch_read(jt_ts_pinctrl0,
++		    JTTS_GPA0_OFF + JTTS_PIN_DAT) & 1u);
++		if (irq != last_irq) {
++			printf("A8 TOUCH: irq gpa0-0 -> %s\n",
++			    irq ? "high" : "low");
++			last_irq = irq;
++		}
++		if (irq) {
++			if (++idle == 4000) {	/* ~32 s heartbeat */
++				printf("A8 TOUCH: idle, irq high for %u polls\n",
++				    idle);
++				idle = 0;
++			}
++			jackpotlte_touch_wait(8);
++			continue;
++		}
++		idle = 0;
++		if (!jtts_read_reg(JTTS_READ_ONE_EVENT, buf, 8)) {
++			if (++errors <= 8 || !(errors & 255)) {
++				printf("A8 TOUCH: event read failed (%u) stat=%#x\n",
++				    errors,
++				    a5touch_read(jt_ts_bus, JTTS_IICSTAT));
++			}
++			jackpotlte_touch_wait(20);
++			continue;
++		}
++		printf("A8 TOUCH: read %02x %02x %02x %02x %02x %02x %02x %02x left=%u\n",
++		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
++		    buf[7], buf[7] & 0x3fu);
++		if (!buf[0]) {
++			jackpotlte_touch_wait(4);	/* empty queue */
++			continue;
++		}
++		/* buf[7]&0x3f is the number of further events the IC still
++		 * holds (sec_ts.h:604).  If it exceeds the IC's queue depth
++		 * the event stream is corrupt; clear it like the native
++		 * driver (sec_ts.c:995) instead of indexing past buf. */
++		unsigned left = buf[7] & 0x3fu;
++		if (left > JTTS_MAX_EVENT_COUNT - 1u) {
++			printf("A8 TOUCH: event queue overflow left=%u\n", left);
++			(void)jtts_write_cmd(JTTS_CMD_CLEAR_EVENT_STACK);
++			jackpotlte_touch_wait(4);
++			continue;
++		}
++		/* Drain the rest only when they fit in buf; jtts_read_reg
++		 * caps a single read at 16 bytes (two events).  Any events
++		 * left behind stay queued and are read one per poll next
++		 * time the IRQ is low, so nothing is lost. */
++		unsigned have = 0;
++		if (left >= 1u && left <= 2u &&
++		    jtts_read_reg(JTTS_READ_ALL_EVENT, buf + 8, left * 8)) {
++			have = left;
++		}
++		for (unsigned i = 0; i <= have; i++) {
++			if (buf[i * 8]) {
++				jackpotlte_touch_report(buf + i * 8);
++			}
++		}
++		errors = 0;
++	}
++}
++
++static void
++jackpotlte_touch_contacts(uint8_t boot)
++{
++	thread_t thread;
++	uint8_t st = 0;
++	uint8_t id[3] = {0};
++	int enabled = 0;
++	int power = 0;
++
++	(void)PE_parse_boot_argn("a8touchlog", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	(void)PE_parse_boot_argn("a8touchpwr", &power, sizeof(power));
++	printf("A8 TOUCH: contact path; status before power=%#x pwr=%d\n",
++	    boot, power);
++	if (power) {
++		jackpotlte_touch_power_up();
++		if (jtts_read_reg(JTTS_READ_BOOT_STATUS, &st, 1)) {
++			boot = st;
++			printf("A8 TOUCH: status after power=%#x (%s)\n", boot,
++			    boot == JTTS_STATUS_APP_MODE ? "app mode" :
++			    boot == JTTS_STATUS_BOOT_MODE ? "boot mode" :
++			    "unknown");
++		} else {
++			printf("A8 TOUCH: status read failed after power\n");
++		}
++		if (jtts_read_reg(JTTS_READ_ID, id, sizeof(id))) {
++			printf("A8 TOUCH: id after power %02x%02x%02x\n",
++			    id[0], id[1], id[2]);
++		}
++		/* The IC only scans the panel after SENSE_ON; the native
++		 * driver sends it once the IC is in app mode
++		 * (sec_ts.c:2311,3042). */
++		if (boot == JTTS_STATUS_APP_MODE) {
++			if (jtts_write_cmd(JTTS_CMD_SENSE_ON)) {
++				printf("A8 TOUCH: sense-on sent\n");
++			} else {
++				printf("A8 TOUCH: sense-on write failed\n");
++			}
++		}
++	}
++	jt_ts_pinctrl0 = ml_io_map(JTTS_PINCTRL0, 0x1000);
++	if (!jt_ts_pinctrl0) {
++		printf("A8 TOUCH: contact pinctrl mapping failed\n");
++		return;
++	}
++	if (kernel_thread_start(jackpotlte_touch_thread, NULL, &thread) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A8 TOUCH: contact thread start failed\n");
++	}
++}
++
+ /*
+  * Optional touch power bring-up, debug only (boot-arg a8touchpwr=1, default
+  * off).  S-Boot can leave the touch rail cold: tsp_ldo_en (gpg3-0, DTS
+@@ -1404,6 +1686,7 @@ jackpotlte_touch_probe(void)
+ 		printf("A8 TOUCH: fw version %02x%02x%02x%02x\n",
+ 		    fw[0], fw[1], fw[2], fw[3]);
+ 	}
++	jackpotlte_touch_contacts(boot);
+ }
+ #endif /* JACKPOTLTE */
+ 

@@ -1,0 +1,398 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7dab39e..649b3c4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
++bsd/dev/jackpotlte_pmic.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/jackpotlte_pmic.c b/bsd/dev/jackpotlte_pmic.c
+new file mode 100644
+index 0000000..bd01079
+--- /dev/null
++++ b/bsd/dev/jackpotlte_pmic.c
+@@ -0,0 +1,356 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos 7885) power probe.
++ *
++ * Reads the charger and fuel-gauge identity, status, voltages and currents so
++ * the real values are visible instead of the donor's static "SWEET BATTERY"
++ * fallback.
++ *
++ * The fuel gauge and the sub-PMIC/MUIC (s2mu004) sit on ordinary S3C2440 I2C
++ * buses that S-Boot leaves muxed; they are read with the same polled transfer
++ * the A5 touch driver uses (bsd/dev/a5xelte_touch.c:224-318).
++ *
++ * The main PMIC (s2mpu08) is reached through the ACPM mailbox, not I2C
++ * (exynos7885-jackpotlte_common.dtsi:196-198, acpm_mfd.c:20,
++ * s2mpu08_core.c:76); its regulator map is named at the end of
++ * jackpotlte_pmic_probe() for a later stage.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void jackpotlte_pmic_probe(void);
++
++/*
++ * Buses (Exynos 7885 DTS, exynos7885.dtsi):
++ *   i2c_0 @ 0x13830000 = "I2C_FUELGAUGE", irq 248 (lines 1006-1018);
++ *   i2c_1 @ 0x13840000 = "I2C_TSP",       irq 249 (lines 1020-1032);
++ * both "samsung,s3c2440-i2c".  The I2C0/I2C1 gates are HWACG
++ * (clk-exynos7885.c:152-153), so register access enables the clock.
++ */
++#define JT_I2C_FUELGAUGE_PA	0x13830000u
++#define JT_I2C_CHARGER_PA	0x13840000u
++#define JT_I2C_WINDOW		0x1000u
++
++/* S3C2440 I2C register offsets (i2c-s3c2410.c:51-58). */
++#define JT_IICCON		0x00u	/* IICCON  */
++#define JT_IICSTAT		0x04u	/* IICSTAT */
++#define JT_IICDS		0x0cu	/* IICDS   */
++#define JT_IICLC		0x10u	/* IICLC   */
++
++/* IICCON / IICSTAT bits used by the polled transfer. */
++#define JT_IICCON_IRQPEND	0x10u	/* IRQ pending (IICCON[4])   */
++#define JT_IICCON_ACKEN		0x80u	/* ACK enable (IICCON[7])    */
++#define JT_IICSTAT_BUSY		0x20u	/* START/STOP pending        */
++#define JT_IICSTAT_NACK		0x01u	/* last byte NACK (IICSTAT[0]) */
++
++/*
++ * 8-bit slave addresses (7-bit << 1):
++ *   fuel gauge s2mu004 @ 7-bit 0x3B
++ *     (battery_data_jackpotlte_common.dtsi:48-50, reg = <0x3B>);
++ *   sub-PMIC/MUIC s2mu004 @ 7-bit 0x3D
++ *     (exynos7885-jackpotlte_common.dtsi:1102-1105, reg = <0x3D>;
++ *      s2mu004-private.h:29, S2MU004_I2C_ADDR = 0x7A = 0x3D << 1).
++ */
++#define JT_FG_ADDR		0x76u
++#define JT_CHG_ADDR		0x7au
++
++/*
++ * s2mu004 fuel-gauge registers (s2mu004_fuelgauge.h:35-49).
++ */
++#define JT_FG_STATUS		0x00u
++#define JT_FG_RVBAT		0x04u	/* battery voltage, 2 bytes LE   */
++#define JT_FG_RCUR_CC		0x06u	/* battery current, 2 bytes LE   */
++#define JT_FG_RSOC		0x08u	/* state of charge,  2 bytes LE   */
++#define JT_FG_MONOUT		0x0au
++#define JT_FG_ID		0x48u	/* revision / FG id, 1 byte      */
++
++/*
++ * s2mu004 charger/MUIC registers (s2mu004_charger.h:30-36); revision id
++ * (s2mu004-private.h:146, S2MU004_REG_REV_ID = 0x82).
++ */
++#define JT_CHG_STATUS0		0x0au	/* CHGIN_STATUS[7:5] (charger.h:83-85) */
++#define JT_CHG_STATUS1		0x0bu	/* fault/DONE (charger.h:94-113)       */
++#define JT_CHG_STATUS2		0x0cu
++#define JT_CHG_STATUS3		0x0du	/* BAT_STATUS[2:1] (charger.h:132-134) */
++#define JT_CHG_CTRL0		0x10u	/* EN_CHG[7] (charger.h:147)           */
++#define JT_CHG_CTRL6		0x16u	/* CV float voltage (charger.c:399-403) */
++#define JT_CHG_REV_ID		0x82u
++
++static uint32_t
++jp_read(vm_offset_t base, uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)(base + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++static void
++jp_write(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + offset) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Polled S3C2440 transfer, ported from bsd/dev/a5xelte_touch.c:224-318. */
++static bool
++jp_wait_irq(vm_offset_t i2c)
++{
++	for (unsigned n = 0; n < 20000; n++) {
++		if (jp_read(i2c, JT_IICCON) & JT_IICCON_IRQPEND) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++jp_clear_irq(vm_offset_t i2c)
++{
++	jp_write(i2c, JT_IICCON, jp_read(i2c, JT_IICCON) & ~JT_IICCON_IRQPEND);
++}
++
++static void
++jp_stop(vm_offset_t i2c)
++{
++	jp_write(i2c, JT_IICSTAT, jp_read(i2c, JT_IICSTAT) & ~JT_IICSTAT_BUSY);
++	jp_clear_irq(i2c);
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_BUSY)) {
++			break;
++		}
++		delay(1);
++	}
++}
++
++static bool
++jp_msg(vm_offset_t i2c, uint8_t addr8, bool receive, uint8_t *bytes,
++    unsigned count)
++{
++	const uint32_t mode = receive ? 0x90u : 0xd0u;
++	bool ok = false;
++	if (!count || count > 32) {
++		return false;
++	}
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_BUSY)) {
++			break;
++		}
++		if (n == 4999) {
++			printf("JACKPOTLTE PMIC: I2C busy before message\n");
++			return false;
++		}
++		delay(1);
++	}
++	/* Conservative divider, as in the proven A5 routine. */
++	jp_write(i2c, JT_IICCON, 0xe3u);
++	jp_write(i2c, JT_IICLC, 7u);
++	jp_write(i2c, JT_IICSTAT, mode);
++	jp_write(i2c, JT_IICDS, (uint32_t)(addr8 | (receive ? 1u : 0u)));
++	delay(1);
++	jp_write(i2c, JT_IICSTAT, mode | JT_IICSTAT_BUSY);
++	if (!jp_wait_irq(i2c)) {
++		printf("JACKPOTLTE PMIC: address timeout addr=%#x stat=%#x\n",
++		    addr8, jp_read(i2c, JT_IICSTAT));
++		goto out;
++	}
++	if (jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_NACK) {
++		printf("JACKPOTLTE PMIC: address NACK addr=%#x\n", addr8);
++		goto out;
++	}
++	for (unsigned n = 0; n < count; n++) {
++		if (receive) {
++			if (n + 1 == count) {
++				jp_write(i2c, JT_IICCON,
++				    jp_read(i2c, JT_IICCON) & ~JT_IICCON_ACKEN);
++			}
++		} else {
++			jp_write(i2c, JT_IICDS, bytes[n]);
++			delay(1);
++		}
++		jp_clear_irq(i2c);
++		if (!jp_wait_irq(i2c)) {
++			printf("JACKPOTLTE PMIC: data timeout addr=%#x byte=%u\n",
++			    addr8, n);
++			goto out;
++		}
++		if (receive) {
++			bytes[n] = (uint8_t)jp_read(i2c, JT_IICDS);
++		} else if (jp_read(i2c, JT_IICSTAT) & JT_IICSTAT_NACK) {
++			printf("JACKPOTLTE PMIC: data NACK addr=%#x byte=%u\n",
++			    addr8, n);
++			goto out;
++		}
++	}
++	ok = true;
++out:
++	jp_stop(i2c);
++	return ok;
++}
++
++/*
++ * SMBus-style register read: write the register index, then read `count`
++ * bytes.  This matches the fuel gauge's own read helper, which is a
++ * 2-byte block read of a register (s2mu004_fuelgauge.c:95-122).
++ */
++static bool
++jp_read_reg(vm_offset_t i2c, uint8_t addr8, uint8_t reg, uint8_t *buf,
++    unsigned count)
++{
++	uint8_t index = reg;
++	if (!jp_msg(i2c, addr8, false, &index, 1)) {
++		return false;
++	}
++	if (!count) {
++		return true;
++	}
++	return jp_msg(i2c, addr8, true, buf, count);
++}
++
++static void
++jp_charger(vm_offset_t chg)
++{
++	uint8_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, c0 = 0, c6 = 0, rev = 0;
++
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_REV_ID, &rev, 1)) {
++		printf("JACKPOTLTE PMIC: charger rev[0x82]=%#04x\n", rev);
++	} else {
++		printf("JACKPOTLTE PMIC: charger rev[0x82] read failed\n");
++	}
++	/* STATUS0 CHGIN_STATUS[7:5] = input source (charger.h:83-85). */
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_STATUS0, &s0, 1)) {
++		printf("JACKPOTLTE PMIC: charger status0[0x0a]=%#04x "
++		    "chgin=%u\n", s0, (s0 >> 5) & 0x7u);
++	}
++	/* STATUS1: fault[6:3], DONE[0], TOP_OFF[1] (charger.h:94-113). */
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_STATUS1, &s1, 1)) {
++		printf("JACKPOTLTE PMIC: charger status1[0x0b]=%#04x "
++		    "chg_status=%u done=%u top_off=%u\n",
++		    s1, (s1 >> 3) & 0xfu, s1 & 1u, (s1 >> 1) & 1u);
++	}
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_STATUS2, &s2, 1)) {
++		printf("JACKPOTLTE PMIC: charger status2[0x0c]=%#04x\n", s2);
++	}
++	/* STATUS3 BAT_STATUS[2:1] = battery presence (charger.h:132-134). */
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_STATUS3, &s3, 1)) {
++		printf("JACKPOTLTE PMIC: charger status3[0x0d]=%#04x "
++		    "bat_status=%u\n", s3, (s3 >> 1) & 0x3u);
++	}
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_CTRL0, &c0, 1)) {
++		printf("JACKPOTLTE PMIC: charger ctrl0[0x10]=%#04x en_chg=%u\n",
++		    c0, (c0 >> 7) & 1u);
++	}
++	/* CTRL6 = (V-3900)/10 mV, i.e. V = reg*10 + 3900 (charger.c:399-403). */
++	if (jp_read_reg(chg, JT_CHG_ADDR, JT_CHG_CTRL6, &c6, 1)) {
++		printf("JACKPOTLTE PMIC: charger ctrl6[0x16]=%#04x "
++		    "cv=%umV\n", c6, (unsigned)c6 * 10u + 3900u);
++	}
++}
++
++static void
++jp_fuelgauge(vm_offset_t fg)
++{
++	uint8_t b[4];
++	unsigned raw;
++	unsigned vbat_mv;
++	int ma;
++
++	/* Identity / revision (s2mu004_fuelgauge.c:2159-2168, reg 0x48). */
++	if (jp_read_reg(fg, JT_FG_ADDR, JT_FG_ID, b, 1)) {
++		printf("JACKPOTLTE PMIC: fuel gauge id[0x48]=%#04x "
++		    "rev=%u ver=%u\n", b[0], (b[0] & 0xf0u) >> 4, b[0] & 0x0fu);
++	} else {
++		printf("JACKPOTLTE PMIC: fuel gauge id[0x48] read failed\n");
++	}
++
++	/* Status (s2mu004_fuelgauge.h:35). */
++	if (jp_read_reg(fg, JT_FG_ADDR, JT_FG_STATUS, b, 1)) {
++		printf("JACKPOTLTE PMIC: fuel gauge status[0x00]=%#04x\n", b[0]);
++	}
++
++	/* Battery voltage: vbat = le16(RVBAT) * 1000 >> 13
++	 * (s2mu004_fuelgauge.c:1219-1223). */
++	if (jp_read_reg(fg, JT_FG_ADDR, JT_FG_RVBAT, b, 2)) {
++		raw = (unsigned)b[0] | ((unsigned)b[1] << 8);
++		vbat_mv = (raw * 1000u) >> 13;
++		printf("JACKPOTLTE PMIC: fuel gauge vbat[0x04]=%#04x %umV\n",
++		    raw, vbat_mv);
++	}
++
++	/* Battery current, 2's complement (s2mu004_fuelgauge.c:1084-1095):
++	 * bit15 set => charging, positive; else discharging, negative. */
++	if (jp_read_reg(fg, JT_FG_ADDR, JT_FG_RCUR_CC, b, 2)) {
++		raw = (unsigned)b[0] | ((unsigned)b[1] << 8);
++		if (raw & 0x8000u) {
++			ma = ((int)(((~raw & 0xffffu) + 1u)) * 1000) >> 12;
++		} else {
++			ma = ((int)(raw & 0x7fffu) * -1000) >> 12;
++		}
++		printf("JACKPOTLTE PMIC: fuel gauge current[0x06]=%#04x "
++		    "%dmA (%s)\n", raw, ma, (raw & 0x8000u) ? "chg" : "dis");
++	}
++
++	/* State of charge, 2's complement, 0.01% units
++	 * (s2mu004_fuelgauge.c:914-926). */
++	if (jp_read_reg(fg, JT_FG_ADDR, JT_FG_RSOC, b, 2)) {
++		int rsoc;
++		raw = (unsigned)b[0] | ((unsigned)b[1] << 8);
++		if (raw & 0x8000u) {
++			rsoc = ((int)(((~raw & 0xffffu) + 1u)) * -10000) /
++			    (1 << 14);
++		} else {
++			rsoc = ((int)(raw & 0x7fffu) * 10000) / (1 << 14);
++		}
++		printf("JACKPOTLTE PMIC: fuel gauge rsoc[0x08]=%#04x "
++		    "%d.%02d%%\n", raw, rsoc / 100, (rsoc < 0 ? -rsoc : rsoc) % 100);
++	}
++}
++
++void
++jackpotlte_pmic_probe(void)
++{
++	vm_offset_t fg;
++	vm_offset_t chg;
++
++	printf("JACKPOTLTE PMIC: probe "
++	    "(fuel gauge/charger state)\n");
++
++	/* I2C_FUELGAUGE (i2c_0, 0x13830000): s2mu004 fuel gauge @0x3B. */
++	fg = ml_io_map(JT_I2C_FUELGAUGE_PA, JT_I2C_WINDOW);
++	if (!fg) {
++		printf("JACKPOTLTE PMIC: fuel-gauge bus mapping failed\n");
++	} else {
++		jp_fuelgauge(fg);
++	}
++
++	/*
++	 * I2C_CHARGER (i2c_1, 0x13840000): s2mu004 MFD/charger @0x3D
++	 * (exynos7885-jackpotlte_common.dtsi:1102-1105).  Only reads.
++	 */
++	chg = ml_io_map(JT_I2C_CHARGER_PA, JT_I2C_WINDOW);
++	if (!chg) {
++		printf("JACKPOTLTE PMIC: charger bus mapping failed\n");
++	} else {
++		jp_charger(chg);
++	}
++
++	/*
++	 * Main PMIC rails: not read.  The s2mpu08 is ACPM-gated
++	 * (exynos7885-jackpotlte_common.dtsi:196-198, acpm-ipc-channel = <2>)
++	 * so its registers are only reachable through the ACPM mailbox
++	 * (acpm_mfd.c:20).  For the later approved reader stage, the regulator
++	 * enable/vsel registers are the B*CTRL1/CTRL2 and L*CTRL blocks in
++	 * Eureka s2mpu08-private.h:50-110 (B1CTRL1 0x14 ... B8CTRL3 0x25,
++	 * L1CTRL 0x2c ... L37CTRL), and enable_mask is S2MPU08_ENABLE_MASK
++	 * (s2mpu08.c:465).
++	 */
++	printf("JACKPOTLTE PMIC: main PMIC s2mpu08 rails not read: "
++	    "ACPM-gated via the mailbox, not the I2C bus "
++	    "(exynos7885-jackpotlte_common.dtsi:196-198)\n");
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index c745d46..a344650 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -72,6 +72,9 @@ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void a5xelte_usb_probe(void);
++#if defined(JACKPOTLTE)
++extern void jackpotlte_pmic_probe(void);
++#endif
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -775,6 +778,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++#if defined(JACKPOTLTE)
++	jackpotlte_pmic_probe();
++#endif
+ #if defined(JACKPOTLTE)
+ 	/* Galaxy A8 2018: read-only DWC3 + PHY state probe (bsd/dev/a5xelte_usb.c). */
+ 	a5xelte_usb_probe();

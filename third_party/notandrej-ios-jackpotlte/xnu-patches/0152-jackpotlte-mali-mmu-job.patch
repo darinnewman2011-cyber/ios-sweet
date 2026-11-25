@@ -1,0 +1,281 @@
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -6,9 +6,15 @@
+  * M1: with jtmalipwr=1, power pd_g3d and its clocks first, so M0 can then
+  *     read a powered GPU: PMU 0x40A0/0x40A4, the CMU_G3D QCHs, the PLL_G3D
+  *     and the per-IP clock gates.
++ * M2: with jtmalijob=1, after M1, the address space 0 and one no-op job --
++ *     the smallest there is, a write of an immediate into memory -- first
++ *     with the MMU in identity mode, then through AArch64 4 KB page tables.
++ *     No rendering; success is the word written and the job-done bit set.
+  *
+  * Sources: docs/jackpotlte-mali.md sec. 3 and the Samsung Eureka 4.4.302 tree
+- * (a path is cited per register group below).
++ * (a path is cited per register group below); M2 from the HakiOS reference
++ * (redwood_mali.c, a Mali-G52 on MediaTek) whose MMU and job manager are the
++ * same ARM blocks a Bifrost G71 has.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
+ 
+@@ -16,9 +22,14 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <mach/vm_param.h>
++#include <mach/vm_statistics.h>
+ #include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t kvtophys(vm_offset_t va);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ 
+ void jackpotlte_mali_probe(void);
+ 
+@@ -88,6 +99,47 @@
+ #define JT_MALI_L2_PWRON	0x1a0u
+ #define JT_MALI_IRQ_RESET_DONE	(1u << 8)	/* GPU_INT_RAWSTAT */
+ 
++/* MMU, address space 0 and job slot 1 (Linux panfrost register map, the same
++ * offsets the reference drives: redwood_mali.c:302-341). */
++#define JT_MALI_GPU_MMU_FEATURES 0x014u		/* (RO) input-address size in
++						 * bits [15:8]; panfrost takes
++						 * its DMA mask from 0xff00
++						 * (panfrost_gpu.c:386) */
++#define JT_MALI_JOB_INT_RAWSTAT	0x1000u
++#define JT_MALI_JOB_INT_CLEAR	0x1004u
++#define JT_MALI_JOB_INT_MASK	0x1008u
++#define JT_MALI_JOB_DONE	(1u << 1)	/* JOB_INT_RAWSTAT */
++#define JT_MALI_JOB_FAULT	(1u << 17)
++#define JT_MALI_JS1		0x1880u		/* job slot 1 */
++#define JT_MALI_JS_STATUS	0x24u
++#define JT_MALI_JS_HEAD_NEXT_LO	0x40u
++#define JT_MALI_JS_HEAD_NEXT_HI	0x44u
++#define JT_MALI_JS_AFFINITY_NEXT_LO 0x50u
++#define JT_MALI_JS_AFFINITY_NEXT_HI 0x54u
++#define JT_MALI_JS_CONFIG_NEXT	0x58u
++#define JT_MALI_JS_COMMAND_NEXT	0x60u
++#define JT_MALI_JS_COMMAND_START 1u
++#define JT_MALI_JS_CONFIG	((3u << 8) | (3u << 12) | (8u << 16)) /* AS 0,
++								     * flush both
++								     * ends
++								     * (redwood_mali.c:339) */
++#define JT_MALI_AS0		0x2400u		/* address space 0 */
++#define JT_MALI_AS_TRANSTAB_LO	0x00u
++#define JT_MALI_AS_TRANSTAB_HI	0x04u
++#define JT_MALI_AS_MEMATTR_LO	0x08u
++#define JT_MALI_AS_MEMATTR_HI	0x0cu
++#define JT_MALI_AS_COMMAND	0x18u		/* 1 = UPDATE */
++#define JT_MALI_AS_FAULTSTATUS	0x1cu
++#define JT_MALI_AS_STATUS	0x28u
++#define JT_MALI_AS_TRANSCFG_LO	0x30u
++#define JT_MALI_AS_TRANSCFG_HI	0x34u
++#define JT_MALI_AS_STATUS_ACTIVE 1u
++#define JT_MALI_AS_COMMAND_UPDATE 1u
++#define JT_MALI_AS_TRANSCFG_IDENTITY 2u		/* ADRMODE_IDENTITY */
++#define JT_MALI_AS_TRANSCFG_AARCH64_4K 6u	/* ADRMODE_AARCH64_4K */
++#define JT_MALI_AS_TRANSCFG_WALK_WB (2u << 24)	/* PTW_MEMATTR_WRITE_BACK */
++#define JT_MALI_JOB_WAIT_MS	100u
++
+ static volatile uint32_t *
+ jt_map(uint32_t pa, uint32_t size)
+ {
+@@ -231,6 +283,183 @@
+ 	return true;
+ }
+ 
++/* ---- M2: address space 0 and one no-op job ----
++ *
++ * The reference's first_jobs() (redwood_mali.c:353-501): the smallest job
++ * there is -- write a 32-bit immediate into memory -- run twice, first with
++ * address space 0 in identity mode (a GPU address is the physical one, no
++ * page tables), then through AArch64 4 KB page tables the driver builds.
++ * The job-manager and MMU blocks are the same ARM hardware on a Bifrost G71,
++ * so the reference's register sequence is used as-is; the one value read from
++ * this GPU is the MMU's input-address size (GPU_MMU_FEATURES), which fixes
++ * the AS_TRANSCFG address-bits field (55 - bits, redwood_mali.c:405-410).
++ */
++#define JT_PTE_TABLE		3ull
++#define JT_PTE_PAGE		3ull
++#define JT_PTE_AF		(1ull << 10)
++#define JT_PTE_SH_INNER		(3ull << 8)
++#define JT_PTE_AP_RW		(1ull << 6)
++#define JT_PTE_ADDRESS		0x0000fffffffff000ull
++#define JT_FIRST_JOB_GPU	0x00100000ull
++
++static uint64_t *jt_pt_top;
++static uint64_t *jt_pt_mid;
++static uint64_t *jt_pt_bot;
++static uint64_t jt_pt_top_phys;
++static uint64_t jt_pt_mid_phys;
++static uint64_t jt_pt_bot_phys;
++
++/* A zeroed page the GPU's own walk can read: its caches are not the
++ * processor's, so the page is flushed to memory (redwood_mali.c:441-456). */
++static uint64_t *
++jt_pt_page(uint64_t *phys)
++{
++	vm_offset_t page = 0;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	*phys = kvtophys(page);
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++	return (uint64_t *)page;
++}
++
++/* One 4 KB page of physical memory at GPU address `gpu`.  Three levels for
++ * the address bits a G71's MMU reports; single top/middle tables cover the
++ * low 1 GB, which is where the first jobs live (redwood_mali.c:412-479). */
++static bool
++jt_map_page(uint64_t gpu, uint64_t phys)
++{
++	if (jt_pt_top == NULL) {
++		jt_pt_top = jt_pt_page(&jt_pt_top_phys);
++		jt_pt_mid = jt_pt_page(&jt_pt_mid_phys);
++		jt_pt_bot = jt_pt_page(&jt_pt_bot_phys);
++		if (jt_pt_top == NULL || jt_pt_mid == NULL || jt_pt_bot == NULL) {
++			return false;
++		}
++		jt_pt_top[(gpu >> 30) & 31] = jt_pt_mid_phys | JT_PTE_TABLE;
++		jt_pt_mid[(gpu >> 21) & 511] = jt_pt_bot_phys | JT_PTE_TABLE;
++		FlushPoC_DcacheRegion((vm_offset_t)jt_pt_top, sizeof(uint64_t));
++		FlushPoC_DcacheRegion((vm_offset_t)jt_pt_mid, sizeof(uint64_t));
++	}
++	jt_pt_bot[(gpu >> 12) & 511] = (phys & JT_PTE_ADDRESS) | JT_PTE_AF |
++	    JT_PTE_SH_INNER | JT_PTE_AP_RW | JT_PTE_PAGE;
++	FlushPoC_DcacheRegion((vm_offset_t)&jt_pt_bot[(gpu >> 12) & 511],
++	    sizeof(uint64_t));
++	return true;
++}
++
++static void
++jt_as0_update(volatile uint32_t *mali, uint64_t transtab, uint32_t transcfg)
++{
++	unsigned n;
++
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_TRANSTAB_LO, (uint32_t)transtab);
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_TRANSCFG_LO, transcfg);
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_TRANSCFG_HI, 0);
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_MEMATTR_LO, 0x88888888u);
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_MEMATTR_HI, 0x88888888u);
++	jt_wr(mali, JT_MALI_AS0 + JT_MALI_AS_COMMAND, JT_MALI_AS_COMMAND_UPDATE);
++	for (n = 0; n < 50; n++) {
++		if (!(jt_rd(mali, JT_MALI_AS0 + JT_MALI_AS_STATUS) &
++		    JT_MALI_AS_STATUS_ACTIVE)) {
++			break;
++		}
++		delay(1);
++	}
++}
++
++/* The write-value job of redwood_mali.c:353-384: a header at page+0 saying
++ * "write value" (word[4]), the 64-bit target at +0x800, a 32-bit immediate
++ * (word[10] = 6) and the value 0xc0ffee01 (word[12]). */
++static bool
++jt_run_write_job(volatile uint32_t *mali, vm_offset_t page, uint64_t gpu,
++    uint32_t shaders, const char *what)
++{
++	volatile uint32_t *job = (volatile uint32_t *)page;
++	volatile uint32_t *target = (volatile uint32_t *)(page + 0x800);
++	bool ok;
++	unsigned n;
++
++	bzero((void *)page, PAGE_SIZE);
++	job[4] = (2u << 1) | 1u | (1u << 16);	/* write value; 64-bit
++						 * pointers; job index 1 */
++	job[8] = (uint32_t)(gpu + 0x800);
++	job[9] = (uint32_t)((gpu + 0x800) >> 32);
++	job[10] = 6u;				/* a 32-bit immediate */
++	job[12] = 0xc0ffee01u;
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++
++	jt_wr(mali, JT_MALI_JOB_INT_MASK, 0);
++	jt_wr(mali, JT_MALI_JOB_INT_CLEAR, 0xffffffffu);
++	jt_wr(mali, JT_MALI_JS1 + JT_MALI_JS_HEAD_NEXT_LO, (uint32_t)gpu);
++	jt_wr(mali, JT_MALI_JS1 + JT_MALI_JS_HEAD_NEXT_HI, (uint32_t)(gpu >> 32));
++	jt_wr(mali, JT_MALI_JS1 + JT_MALI_JS_AFFINITY_NEXT_LO, shaders);
++	jt_wr(mali, JT_MALI_JS1 + JT_MALI_JS_AFFINITY_NEXT_HI, 0);
++	jt_wr(mali, JT_MALI_JS1 + JT_MALI_JS_CONFIG_NEXT, JT_MALI_JS_CONFIG);
++	jt_wr(mali, JT_MALI_JS1 + JT_MALI_JS_COMMAND_NEXT,
++	    JT_MALI_JS_COMMAND_START);
++	for (n = 0; n < JT_MALI_JOB_WAIT_MS; n++) {
++		if (jt_rd(mali, JT_MALI_JOB_INT_RAWSTAT) & JT_MALI_JOB_DONE) {
++			break;
++		}
++		delay(1);
++	}
++
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++	ok = (*target == 0xc0ffee01u);
++	printf("JACKPOTLTE MALI: %s: job_int=%#x slot=%#x mmu_fault=%#x "
++	    "job[0]=%#x word=%#x %s\n", what,
++	    jt_rd(mali, JT_MALI_JOB_INT_RAWSTAT),
++	    jt_rd(mali, JT_MALI_JS1 + JT_MALI_JS_STATUS),
++	    jt_rd(mali, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS),
++	    job[0], *target, ok ? "-- the GPU ran it" : "-- NOT WRITTEN");
++	jt_wr(mali, JT_MALI_JOB_INT_CLEAR, 0xffffffffu);
++	return ok;
++}
++
++static void
++jt_mali_jobs(volatile uint32_t *mali)
++{
++	uint32_t mmu_features = jt_rd(mali, JT_MALI_GPU_MMU_FEATURES);
++	uint32_t addr_bits = (mmu_features >> 8) & 0xffu;
++	uint32_t addr_field = (addr_bits && addr_bits < 55u) ?
++	    (55u - addr_bits) : 20u;
++	uint32_t transcfg_4k = JT_MALI_AS_TRANSCFG_AARCH64_4K |
++	    (addr_field << 6) | JT_MALI_AS_TRANSCFG_WALK_WB | (1u << 30);
++	uint32_t shaders = jt_rd(mali, JT_MALI_SHADER_PRESENT);
++	vm_offset_t page = 0;
++
++	printf("JACKPOTLTE MALI: mmu_features=%#x addr_bits=%u transcfg=%#x "
++	    "shaders=%#x\n", mmu_features, addr_bits, transcfg_4k, shaders);
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("JACKPOTLTE MALI: no page for the first jobs\n");
++		return;
++	}
++
++	jt_as0_update(mali, 0, JT_MALI_AS_TRANSCFG_IDENTITY);
++	if (jt_run_write_job(mali, page, kvtophys(page), shaders,
++	    "job 1, identity mode")) {
++		if (jt_map_page(JT_FIRST_JOB_GPU, kvtophys(page))) {
++			jt_as0_update(mali, jt_pt_top_phys, transcfg_4k);
++			(void)jt_run_write_job(mali, page, JT_FIRST_JOB_GPU,
++			    shaders, "job 2, GPU page tables");
++		} else {
++			printf("JACKPOTLTE MALI: no memory for page tables\n");
++		}
++	}
++	kmem_free(kernel_map, page, PAGE_SIZE);
++	printf("JACKPOTLTE MALI: M2 done as0_status=%#x fault=%#x\n",
++	    jt_rd(mali, JT_MALI_AS0 + JT_MALI_AS_STATUS),
++	    jt_rd(mali, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS));
++}
++
+ void
+ jackpotlte_mali_probe(void)
+ {
+@@ -296,7 +525,13 @@
+ 	printf("JACKPOTLTE MALI: GPU_ID=%#x id=%#x arch=%u rev=%#x major=%u minor=%u\n",
+ 	    v, v >> 16, (v >> 28) & 0xf, v & 0xffff,
+ 	    ((v & 0xffff) >> 12) & 0xf, ((v & 0xffff) >> 4) & 0xff);
+-	(void)jt_mali_up(mali);
++	if (jt_mali_up(mali)) {
++		int job = 0;
++		(void)PE_parse_boot_argn("jtmalijob", &job, sizeof(job));
++		if (job) {
++			jt_mali_jobs(mali);
++		}
++	}
+ }
+ 
+ #else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */

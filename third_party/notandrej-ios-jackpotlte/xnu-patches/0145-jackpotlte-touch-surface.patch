@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -446,12 +446,20 @@
+ #endif
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++	/* A8 2018 s6e3fa7: 1080x2220, size = <67 138> mm (67.176 x 138.084),
++	 * exynos7885-display-lcd.dtsi:173-177.  The A5 2017 values below are
++	 * 16:9 and do not describe this 18.5:9 display. */
++	setProperty("SurfaceWidth", (unsigned long long)(67 << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)(138 << 16), 32);
++#else
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	setProperty("SurfaceHeight", (unsigned long long)(121 << 16), 32);
+ #else
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ #endif
++#endif
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -541,8 +549,9 @@
+ 	IOLockUnlock(fLock);
+ 
+ 	if (was != down) {
+-		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+-		    fEdge[finger] ? " edge" : "");
++		IOLog("SWEET HID: touch %d %s at %d,%d%s (%u clients)\n", finger,
++		    down ? "down" : "up", x, y, fEdge[finger] ? " edge" : "",
++		    _clients ? _clients->getCount() : 0);
+ 	}
+ 	dispatchEvent(collection);
+ 	collection->release();

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- SPDX-License-Identifier: MIT -->
+<plist version="1.0">
+<dict>
+	<!-- Run the probe once, at boot, and put its output on the panel.
+	     Install to /System/Library/LaunchDaemons/ in the iOS root image with
+	     the tool at /usr/local/bin/maliprobe (see userspace/README.md).
+	     RunAtLoad + KeepAlive=false: one shot, whatever it answers. -->
+	<key>Label</key>
+	<string>com.jackpotlte.maliprobe</string>
+	<key>Program</key>
+	<string>/usr/local/bin/maliprobe</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

@@ -1,0 +1,45 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1924,7 +1924,15 @@
+ #endif
+ 
+ 	// Slide the physical aperture to a random page-aligned location within the slide range
+-#if defined(DREAMLTE)
++	/*
++	 * The A8 (jackpotlte) has the same S-Boot handover and bootloader
++	 * framebuffer as the S8, and needs the same deterministic physmap: a
++	 * random slide plus an unaligned base broke the fixed bootstrap
++	 * repairs on the S8. The 0127 boot probe on jackpotlte showed
++	 * physmap_slide = 0x26c8000 and a physmap_base that is not TWIG
++	 * aligned, i.e. neither of the S8 fixes was in effect.
++	 */
++#if defined(DREAMLTE) || defined(JACKPOTLTE)
+ 	uint64_t physmap_slide = 0;
+ #else
+ 	uint64_t physmap_slide = early_random() & ARM64_PHYSMAP_SLIDE_MASK & ~((uint64_t)PAGE_MASK);
+@@ -1932,7 +1940,7 @@
+ 	assert(physmap_slide < ARM64_PHYSMAP_SLIDE_RANGE);
+ 
+ 	physmap_base += physmap_slide;
+-#if defined(DREAMLTE) && !XNU_MONITOR
++#if (defined(DREAMLTE) || defined(JACKPOTLTE)) && !XNU_MONITOR
+ 	physmap_base = ROUND_TWIG(physmap_base);
+ #endif
+ 
+@@ -2351,7 +2359,14 @@
+ 	va_l1 = dynamic_memory_begin;
+ 	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
+ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+-#if defined(DREAMLTE)
++	/*
++	 * Reserve the framebuffer and 64 MiB more VA for the boot-time
++	 * pmap_steal_memory() calls. The 0127 probe showed va_l1_end landing
++	 * exactly on the first stolen VA, whose L2 entry was still empty, so
++	 * pmap_expand() had to allocate a fresh L3 table before the VM free
++	 * list existed and blocked forever. Same fix as the S8.
++	 */
++#if defined(DREAMLTE) || defined(JACKPOTLTE)
+ 	va_l1_end += round_page((vm_size_t)A5_FB_STRIDE * A5_FB_HEIGHT) + (64ULL << 20);
+ #endif
+ 	va_l1_end = (va_l1_end + 0x00000000007FFFFFULL) & 0xFFFFFFFFFF800000ULL;

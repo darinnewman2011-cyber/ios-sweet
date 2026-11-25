@@ -1,0 +1,30 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5588,6 +5588,15 @@
+  */
+ static TUNABLE_STR(exec_inject_conf, 512, "jtexecinject", "");
+ 
++/*
++ * Bring-up aid: boot-arg jtgllog=1 says what the injector saw and set, one line
++ * per exec, so a program that never got the library can be told from one that
++ * did.  Off by default -- it is one line for every exec, and the console draws
++ * them.  The EAGL shim reads the same switch (from kern.bootargs) to put its
++ * own log on the console.
++ */
++static TUNABLE(uint32_t, jt_gl_log, "jtgllog", 0);
++
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5639,6 +5648,11 @@
+ 			any = true;
+ 		}
+ 	}
++	if (jt_gl_log != 0) {
++		printf("JT INJECT: %.*s -> %s\n",
++		    (int)(namelen > 200 ? 200 : namelen),
++		    name != NULL ? name : "(?)", any ? env : "(no match)");
++	}
+ 	return any;
+ }
+ 
