@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -379,15 +379,32 @@
+ static SweetHIDTouch *gSweetTouch;
+ 
+ /*
+- * Diagnostic (boot-arg sweethidtest=N): how many user clients have opened
+- * each Sweet HID service.  With the quiet console the screen keeps
+- * drawing until the GUI's first present and only then goes silent, so the
+- * last visible line of this report is the state at the moment backboardd
+- * started presenting -- i.e. whether it had opened the digitizer/buttons.
++ * Diagnostic (boot-arg sweethidclients=1): how many user clients have opened
++ * each Sweet HID service.  Off by default -- it used to ride on the
++ * sweethidtest timer and print every interval, which floods the framebuffer
++ * console (and the console is slow enough to be felt as system lag).
+  */
++static bool
++sweet_hid_clients_log(void)
++{
++	static int parsed = 0;
++	static bool on = false;
++	int value = 0;
++
++	if (!parsed) {
++		(void)PE_parse_boot_argn("sweethidclients", &value, sizeof(value));
++		on = (value != 0);
++		parsed = 1;
++	}
++	return on;
++}
++
+ static void
+ sweet_hid_report_clients(void)
+ {
++	if (!sweet_hid_clients_log()) {
++		return;
++	}
+ 	IOLog("SWEET HID: clients buttons=%u touch=%u\n",
+ 	    gSweetButtons ? gSweetButtons->clientCount() : 0u,
+ 	    gSweetTouch ? gSweetTouch->clientCount() : 0u);

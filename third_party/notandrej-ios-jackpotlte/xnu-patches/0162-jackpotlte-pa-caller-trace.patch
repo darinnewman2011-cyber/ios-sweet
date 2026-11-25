@@ -1,0 +1,61 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -366,6 +366,37 @@ typedef struct {
+ SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SIZE];
+ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+ 
++#if defined(JACKPOTLTE)
++/*
++ * Bring-up aid.  An illegal PA panics deep inside a cache maintenance
++ * routine, so the message names phystokv, nothing about who asked.  Walk the
++ * frame pointer chain from the checking function and print the return
++ * addresses, which is the only way to tell a device address flushed by
++ * mistake from a managed page that went bad.  Every step is range checked:
++ * a walk that runs off the frame chain stops instead of faulting.
++ */
++static void
++jt_illegal_pa_callers(uint64_t frame)
++{
++	uint64_t *fp = (uint64_t *)(uintptr_t)frame;
++
++	kprintf("JT: illegal PA caller chain:");
++	for (int i = 0; (i < 6) && (fp != NULL); i++) {
++		uint64_t lr = fp[1];
++		uint64_t next = fp[0];
++
++		if ((lr < 0xfffffff000000000ULL) || (lr >= 0xffffffff00000000ULL)) {
++			break;
++		}
++		kprintf(" %#llx", (unsigned long long)lr);
++		if ((next <= (uint64_t)(uintptr_t)fp) || (next >= 0xfffffffe00000000ULL)) {
++			break;
++		}
++		fp = (uint64_t *)(uintptr_t)next;
++	}
++	kprintf("\n");
++}
++#endif /* JACKPOTLTE */
+ 
+ vm_map_address_t
+ phystokv(pmap_paddr_t pa)
+@@ -377,6 +408,9 @@ phystokv(pmap_paddr_t pa)
+ 		}
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
++#if defined(JACKPOTLTE)
++		jt_illegal_pa_callers((uint64_t)(uintptr_t)__builtin_frame_address(0));
++#endif
+ 		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+ 		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
+ 	}
+@@ -402,6 +436,9 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
+ 		*max_len = len;
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
++#if defined(JACKPOTLTE)
++		jt_illegal_pa_callers((uint64_t)(uintptr_t)__builtin_frame_address(0));
++#endif
+ 		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+ 		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
+ 	}

@@ -1,0 +1,95 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,7 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+-#if defined(DREAMLTE)
++#if defined(DREAMLTE) || defined(JACKPOTLTE)
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #endif
+ 
+@@ -314,6 +314,9 @@
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 	IOLog(CPU_PORT_NAME " CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
++#if defined(JACKPOTLTE)
++	int32_t rc0 = -1;
++#endif
+ #if defined(DREAMLTE)
+ 	{
+ 		/*
+@@ -362,9 +365,72 @@
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
+ 		    getCPUNumber(), rc0, cfg[0], cfg[1]);
+ 	}
++#elif defined(JACKPOTLTE)
++	{
++		/*
++		 * Same 32-bit entry limit as DREAMLTE: sweet_secondary_entry is in
++		 * the high bank (0x88xxxxxxx), and firmware keeps the CPU_ON entry
++		 * in a 32-bit register, so the core would start at the truncated
++		 * address (entry 0x881417000 -> 0x81417000) and never reach the
++		 * reset stub. Give it a trampoline in the unused low bank: the
++		 * jackpotlte low bank is 0x80000000+0x3da00000, S-Boot puts the
++		 * boot image at 0x800xxxxx and the initrd at 0x84000000, and the
++		 * loader's probe scratch is 0x8ff00000.
++		 */
++		static vm_offset_t tramp;
++		const uint64_t tramp_pa = 0x8f000000ULL;
++		if (tramp == 0) {
++			tramp = ml_io_map(tramp_pa, 0x1000);
++		}
++		volatile uint32_t *t = (volatile uint32_t *)tramp;
++		t[0] = 0x58000041;              /* ldr x1, #8 */
++		t[1] = 0xd61f0020;              /* br x1 */
++		t[2] = (uint32_t)entry;
++		t[3] = (uint32_t)((uint64_t)entry >> 32);
++		__builtin_arm_dsb(DSB_SY);
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
++		    getCPUNumber(), (uint64_t)entry, tramp_pa);
++		entry = (vm_offset_t)tramp_pa;
++
++		/*
++		 * Core power. SAM-K drivers/soc/samsung/exynos-pmu.c pmu_cpu_ctrl()
++		 * writes CPU_LOCAL_PWR_CFG (0xf) to PMU_CPU_CONFIG_BASE (0x2000) +
++		 * off and reads PMU_CPU_STATUS_BASE (0x2004) + off, step 0x80. The
++		 * 7885 overrides pmu_cpu_offset() with its own core numbering:
++		 * Aff1=1 -> 4+Aff0 (0x100-0x103), Aff1=2 -> 2+Aff0 (0x200-0x201),
++		 * Aff1=0 -> Aff0 (A73 0x0-0x1). The generic ((Aff1<<2)|Aff0)
++		 * formula the S8 uses would place the 0x200 pair at 8-9.
++		 */
++		static vm_offset_t pmu;
++		if (pmu == 0) {
++			pmu = ml_io_map(0x11c80000, 0x10000);
++		}
++		const uint32_t aff0 = (uint32_t)(cpu->phys_id & 0xf);
++		const uint32_t aff1 = (uint32_t)((cpu->phys_id >> 8) & 0xf);
++		const uint32_t core = (aff1 == 1) ? 4 + aff0 : ((aff1 == 2) ? 2 + aff0 : aff0);
++		volatile uint32_t *cfg = (volatile uint32_t *)(pmu + 0x2000 + core * 0x80);
++		/* Start from a known-off core so the 0 -> 0xf edge is real. */
++		cfg[0] &= ~0xfu;
++		for (int i = 0; i < 10000 && (cfg[1] & 0xf) != 0; i++) {
++			IODelay(1);
++		}
++		__builtin_arm_dsb(DSB_SY);
++		rc0 = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++		cfg[0] |= 0xf;
++		for (int i = 0; i < 10000 && (cfg[1] & 0xf) != 0xf; i++) {
++			IODelay(1);
++		}
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU core=%u cfg=0x%x status=0x%x\n",
++		    getCPUNumber(), rc0, core, cfg[0], cfg[1]);
++	}
+ #endif
+ 	__builtin_arm_dsb(DSB_SY);
++#if defined(JACKPOTLTE)
++	/* A successful first CPU_ON already started the core; -4 is ALREADY_ON. */
++	int32_t rc = rc0 == 0 ? 0 : sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++#else
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++#endif
+ 	IOLog(CPU_PORT_NAME " CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {

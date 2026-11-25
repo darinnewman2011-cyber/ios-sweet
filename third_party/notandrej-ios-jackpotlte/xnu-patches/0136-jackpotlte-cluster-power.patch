@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -409,6 +409,31 @@
+ 		const uint32_t aff1 = (uint32_t)((cpu->phys_id >> 8) & 0xf);
+ 		const uint32_t core = (aff1 == 1) ? 4 + aff0 : ((aff1 == 2) ? 2 + aff0 : aff0);
+ 		volatile uint32_t *cfg = (volatile uint32_t *)(pmu + 0x2000 + core * 0x80);
++		volatile uint32_t *reset = (volatile uint32_t *)(pmu + 0x200c + core * 0x80);
++		volatile uint32_t *cpuseq = (volatile uint32_t *)(pmu + 0x2488 + aff1 * 0x20);
++		volatile uint32_t *noncpu = (volatile uint32_t *)(pmu + 0x2404 + aff1 * 0x20);
++		volatile uint32_t *l2 = (volatile uint32_t *)(pmu + 0x2604 + aff1 * 0x20);
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u cluster=%u pmu before: cfg=0x%x status=0x%x "
++		    "reset=0x%x cpuseq=0x%x noncpu=0x%x l2=0x%x\n",
++		    getCPUNumber(), aff1, cfg[0], cfg[1], reset[0], cpuseq[0], noncpu[0], l2[0]);
++		/*
++		 * Cluster power. SAM-K exynos-pmu.c exynos_cluster_up() clears bit 0
++		 * of PMU_CPUSEQ_OPTION_BASE (0x2488) + cluster*0x20, which lets the
++		 * PMU run its sequence for the cluster; exynos_cluster_down() sets
++		 * it again. Cluster state is L2 power at 0x2604 + cluster*0x20
++		 * (bits 0-2) and non-CPU logic at 0x2404 + cluster*0x20 (bits
++		 * 0-3). Only the boot cluster is known to have the sequence
++		 * enabled, and cpus=4 (boot cluster only) works while cpus=8 does
++		 * not, so enable it for every cluster before powering a core in it.
++		 */
++		static uint32_t clusters_up;
++		if (!(clusters_up & (1u << aff1))) {
++			cpuseq[0] &= ~1u;
++			__builtin_arm_dsb(DSB_SY);
++			clusters_up |= 1u << aff1;
++			IOLog(CPU_PORT_NAME " CPU: cpu=%u cluster=%u cpuseq=0x%x (sequence enabled)\n",
++			    getCPUNumber(), aff1, cpuseq[0]);
++		}
+ 		/* Start from a known-off core so the 0 -> 0xf edge is real. */
+ 		cfg[0] &= ~0xfu;
+ 		for (int i = 0; i < 10000 && (cfg[1] & 0xf) != 0; i++) {
+@@ -420,8 +445,9 @@
+ 		for (int i = 0; i < 10000 && (cfg[1] & 0xf) != 0xf; i++) {
+ 			IODelay(1);
+ 		}
+-		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU core=%u cfg=0x%x status=0x%x\n",
+-		    getCPUNumber(), rc0, core, cfg[0], cfg[1]);
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU core=%u cfg=0x%x status=0x%x "
++		    "noncpu=0x%x l2=0x%x\n",
++		    getCPUNumber(), rc0, core, cfg[0], cfg[1], noncpu[0], l2[0]);
+ 	}
+ #endif
+ 	__builtin_arm_dsb(DSB_SY);

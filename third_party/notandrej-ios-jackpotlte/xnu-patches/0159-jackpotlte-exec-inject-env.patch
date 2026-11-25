@@ -1,0 +1,64 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5597,6 +5597,21 @@
+  */
+ static TUNABLE(uint32_t, jt_gl_log, "jtgllog", 0);
+ 
++/*
++ * Bring-up aid: boot-arg jtexecenv adds NAME=VALUE variables to the environment
++ * of the same programs jtexecinject names, for the same reason the library is
++ * added there: launchd will not pass DYLD_* from a job description.  It exists
++ * for DYLD_AMFI_FAKE=0x2, which dyld honours only when the comm page says
++ * testMode (boot-arg dyld_flags=2) and the install is internal (this ADT says
++ * /chosen debug-enabled=1).  With it dyld reads DYLD_INSERT_LIBRARIES itself
++ * instead of ignoring it: no AMFI policy answers amfi_check_dyld_policy_self()
++ * on this port, so dyld otherwise sees flags 0 and drops the variable.
++ *
++ * Value: NAME=VALUE[,NAME=VALUE...].  Commas separate variables, so a value
++ * cannot contain one.
++ */
++static TUNABLE_STR(exec_inject_vars, 256, "jtexecenv", "");
++
+ static bool
+ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5844,6 +5859,39 @@
+ 			}
+ 			imgp->ip_argspace -= new_ptr_size;
+ 			imgp->ip_envc++;
++
++			/* and the extra variables, for exactly those programs */
++			for (const char *var = exec_inject_vars; *var != 0; ) {
++				char extra[256];
++				size_t used = 0;
++
++				while (*var == ',') {
++					var++;
++				}
++				while (*var != 0 && *var != ',' && used + 1 < sizeof(extra)) {
++					extra[used++] = *var++;
++				}
++				extra[used] = 0;
++				while (*var != 0 && *var != ',') {
++					var++;	/* a variable too long to be added */
++				}
++				if (used == 0) {
++					continue;
++				}
++				printf("JT ENV: %.*s += %s\n",
++				    (int)imgp->ip_ndp->ni_cnd.cn_namelen,
++				    imgp->ip_ndp->ni_cnd.cn_nameptr, extra);
++				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(extra), UIO_SYSSPACE, TRUE);
++				if (error) {
++					goto bad;
++				}
++				if (imgp->ip_argspace < new_ptr_size) {
++					error = E2BIG;
++					goto bad;
++				}
++				imgp->ip_argspace -= new_ptr_size;
++				imgp->ip_envc++;
++			}
+ 		}
+ 	}
+ 

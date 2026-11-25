@@ -1,0 +1,244 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
++bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -71,6 +71,7 @@
+ extern void a5xelte_emmc_probe(void);
+ extern void a5xelte_keys_init(void);
+ extern void a5xelte_touch_probe(void);
++extern void a5xelte_usb_probe(void);
+ #endif
+ 
+ #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
+@@ -774,6 +775,10 @@
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	a5xelte_keys_init();
+ 	a5xelte_touch_probe();
++#if defined(JACKPOTLTE)
++	/* Galaxy A8 2018: read-only DWC3 + PHY state probe (bsd/dev/a5xelte_usb.c). */
++	a5xelte_usb_probe();
++#endif
+ 	{
+ 	uint32_t emmcprobe = 0;
+ 	PE_parse_boot_argn("emmcprobe", &emmcprobe, sizeof(emmcprobe));
+
+--- /dev/null
++++ b/bsd/dev/a5xelte_usb.c
+@@ -0,0 +1,208 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) USB bring-up, step 1:
++ * read-only DWC3 + PHY state probe.
++ *
++ * The USB device controller is a Synopsys DWC3 (USB 2.0 only; the board caps
++ * it at high speed) at 0x13600000, behind Samsung's "samsung,exynos-dwusb"
++ * glue, with the Samsung combo USB DRD PHY at 0x135D0000. Both live in the
++ * FSYS power/clock domain: the FSYS power switch is a PMU register and the
++ * FSYS block's clocks are Q-channel gates in the FSYS CMU. S-Boot drives
++ * this controller for Odin/download mode and hands it over in an unknown
++ * state; this probe only reports what it finds.
++ *
++ * It writes no register, and it reads the DWC3 / PHY register blocks only
++ * when the PMU says the FSYS domain is powered and the USB30DRD Q-channel
++ * says the block clock is enabled (a read of a gated block would hang).
++ *
++ * Every address and bit below cites Samsung's own 4.4 tree (Eureka-Kernel)
++ * or the mainline jackpotlte device tree; see the comments. Nothing here is
++ * guessed. This file is compiled for the A5XELTE machine config; the A8
++ * values are selected under JACKPOTLTE and no code is emitted otherwise.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void a5xelte_usb_probe(void);
++
++#if defined(JACKPOTLTE)
++
++/* ---- register blocks (physical addresses) ----
++ * controller  usb@13600000                 exynos7885.dtsi:1935-1958
++ * PHY         phy@135D0000                 exynos7885.dtsi:1960-1964
++ * PMU         system-controller@11c80000   exynos7885.dtsi:1289-1292
++ * CMU (top)   clock-controller@12060000    exynos7885.dtsi:368-373
++ *             0x12060000 + 0x8000          cmucal-sfr.c:10 (SFR_BLOCK CMU)
++ * FSYS block  0x13400000 + 0x8000          cmucal-sfr.c:16 (SFR_BLOCK FSYS)
++ */
++#define A8_USB_PA        0x13600000u
++#define A8_USB_SIZE      0x10000u
++#define A8_PHY_PA        0x135D0000u
++#define A8_PHY_SIZE      0x200u
++#define A8_PMU_PA        0x11c80000u
++#define A8_PMU_SIZE      0x10000u
++#define A8_CMU_PA        0x12060000u
++#define A8_CMU_SIZE      0x8000u
++#define A8_FSYS_PA       0x13400000u
++#define A8_FSYS_SIZE     0x8000u
++
++/* PMU: FSYS power switch. pmucal_system_exynos7885.h:182 spells the
++ * powered (SICD / awake) sequence as mask=(0xf<<0) value=(0xF<<0) at
++ * 0x11C80000 + 0x1418, and :362 the power-down (STOP) sequence as
++ * mask=(0xf<<0) value=(0x0<<0). Bits [3:0] therefore read 0xf while the
++ * FSYS domain is powered. */
++#define A8_PMU_FSYS_PWR      0x1418u
++#define A8_PMU_FSYS_ON       0xfu
++
++/* PMU: USB PHY control / isolation. The jackpotlte PHY node sets
++ * pmu_offset = <0x674> (exynos7885.dtsi:1971); the PHY driver toggles the
++ * bits at PMU + pmu_offset (phy-exynos-usbdrd3.c:408). Reported as-is. */
++#define A8_PMU_PHY_CTRL      0x674u
++
++/* FSYS block: USB30DRD Q-channel gates. cmucal-sfr.c:707-710 gives the
++ * registers (block FSYS = 0x13400000) and :2996-3001 the field layout:
++ * bit 0 = ENABLE, bit 1 = CLOCK_REQ, bits [25:16] = EXPIRE. */
++#define A8_FSYS_QCH_USB30_HSDRD 0x3034u
++#define A8_FSYS_QCH_USB20       0x3038u
++#define A8_FSYS_QCH_USB30_0     0x303cu
++#define A8_FSYS_QCH_USB30_1     0x3040u
++#define A8_QCH_ENABLE           0x1u
++
++/* CMU: FSYS USB30DRD bus gate
++ * (CLK_CON_GAT_GATE_CLKCMU_FSYS_USB30DRD, cmucal-sfr.c:244). Diagnostic. */
++#define A8_CMU_GATE_USB30DRD 0x2054u
++
++/* ---- DWC3 core registers (Synopsys DWC3 databook block layout; the same
++ * offsets the S8 probe uses in bsd/dev/sweet_usb.c / patch 0072) ---- */
++#define A8_GCTL        0xc110u
++#define A8_GSTS        0xc118u
++#define A8_GSNPSID     0xc120u
++#define A8_GHWPARAMS0  0xc140u
++#define A8_GEVNTADRLO  0xc400u
++#define A8_GEVNTADRHI  0xc404u
++#define A8_GEVNTSIZ    0xc408u
++#define A8_GEVNTCOUNT  0xc40cu
++#define A8_GUSB2PHYCFG 0xc200u
++#define A8_DCFG        0xc700u
++#define A8_DCTL        0xc704u
++#define A8_DEVTEN      0xc708u
++#define A8_DSTS        0xc70cu
++#define A8_DALEPENA    0xc720u
++
++/* ---- USB DRD PHY registers (phy-exynos-usbdrd.h:36-98; base = reg[0] of
++ * the phy@135D0000 node, i.e. 0x135D0000) ---- */
++#define A8_PHY_LINKSYSTEM    0x04u
++#define A8_PHY_PHYUTMI       0x08u
++#define A8_PHY_PHYCLKRST     0x10u
++#define A8_PHY_PHYREG0       0x14u
++#define A8_PHY_PHYREG1       0x18u
++#define A8_PHY_PHYPARAM0     0x1cu
++#define A8_PHY_PHYTERM       0x24u
++#define A8_PHY_PHYTEST       0x28u
++#define A8_PHY_PHYADP        0x2cu
++#define A8_PHY_PHYUTMICLKSEL 0x30u
++#define A8_PHY_PHYRESUME     0x34u
++#define A8_PHY_LINKPORT      0x44u
++
++static uint32_t
++a8_usb_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return value;
++}
++
++void
++a5xelte_usb_probe(void)
++{
++	int enabled = 1;
++	uint32_t fsys_pwr, phy_ctrl;
++	uint32_t qch_hsdrd, qch_usb20, qch_usb30_0, qch_usb30_1;
++	uint32_t cmu_gate;
++	bool powered, clocked;
++
++	/* a8usb=0 disables; 1 (the default) reports state only. */
++	PE_parse_boot_argn("a8usb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++
++	vm_offset_t pmu = ml_io_map(A8_PMU_PA, A8_PMU_SIZE);
++	vm_offset_t cmu = ml_io_map(A8_CMU_PA, A8_CMU_SIZE);
++	vm_offset_t fsys = ml_io_map(A8_FSYS_PA, A8_FSYS_SIZE);
++	if (pmu == 0 || cmu == 0 || fsys == 0) {
++		printf("A5XELTE USB: PMU/CMU/FSYS map failed\n");
++		return;
++	}
++
++	fsys_pwr = a8_usb_rd(pmu, A8_PMU_FSYS_PWR);
++	phy_ctrl = a8_usb_rd(pmu, A8_PMU_PHY_CTRL);
++	qch_hsdrd = a8_usb_rd(fsys, A8_FSYS_QCH_USB30_HSDRD);
++	qch_usb20 = a8_usb_rd(fsys, A8_FSYS_QCH_USB20);
++	qch_usb30_0 = a8_usb_rd(fsys, A8_FSYS_QCH_USB30_0);
++	qch_usb30_1 = a8_usb_rd(fsys, A8_FSYS_QCH_USB30_1);
++	cmu_gate = a8_usb_rd(cmu, A8_CMU_GATE_USB30DRD);
++
++	powered = (fsys_pwr & A8_PMU_FSYS_ON) == A8_PMU_FSYS_ON;
++	clocked = (qch_hsdrd & A8_QCH_ENABLE) != 0;
++
++	printf("A5XELTE USB: PMU FSYS pwr 0x%08x (%s) PHY ctrl 0x%08x\n",
++	    fsys_pwr, powered ? "on" : "off", phy_ctrl);
++	printf("A5XELTE USB: FSYS QCH hsdrd 0x%08x usb20 0x%08x usb30_0 0x%08x usb30_1 0x%08x\n",
++	    qch_hsdrd, qch_usb20, qch_usb30_0, qch_usb30_1);
++	printf("A5XELTE USB: CMU gate USB30DRD 0x%08x\n", cmu_gate);
++
++	/* Both the FSYS power switch and the USB30DRD clock must be on before
++	 * the DWC3 block may be touched (a read of a gated block would hang). */
++	if (!powered || !clocked) {
++		printf("A5XELTE USB: controller unpowered or unclocked; DWC3 not read\n");
++		return;
++	}
++
++	vm_offset_t dwc = ml_io_map(A8_USB_PA, A8_USB_SIZE);
++	if (dwc == 0) {
++		printf("A5XELTE USB: DWC3 map failed\n");
++		return;
++	}
++	printf("A5XELTE USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GHWPARAMS0 0x%08x\n",
++	    a8_usb_rd(dwc, A8_GSNPSID), a8_usb_rd(dwc, A8_GCTL), a8_usb_rd(dwc, A8_GSTS),
++	    a8_usb_rd(dwc, A8_GHWPARAMS0));
++	printf("A5XELTE USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
++	    a8_usb_rd(dwc, A8_DCFG), a8_usb_rd(dwc, A8_DCTL), a8_usb_rd(dwc, A8_DEVTEN),
++	    a8_usb_rd(dwc, A8_DSTS), a8_usb_rd(dwc, A8_DALEPENA));
++	printf("A5XELTE USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    a8_usb_rd(dwc, A8_GEVNTADRHI), a8_usb_rd(dwc, A8_GEVNTADRLO),
++	    a8_usb_rd(dwc, A8_GEVNTSIZ), a8_usb_rd(dwc, A8_GEVNTCOUNT),
++	    a8_usb_rd(dwc, A8_GUSB2PHYCFG));
++
++	vm_offset_t phy = ml_io_map(A8_PHY_PA, A8_PHY_SIZE);
++	if (phy == 0) {
++		printf("A5XELTE USB: PHY map failed\n");
++		return;
++	}
++	printf("A5XELTE USB: PHY LINKSYSTEM 0x%08x PHYUTMI 0x%08x PHYCLKRST 0x%08x PHYUTMICLKSEL 0x%08x\n",
++	    a8_usb_rd(phy, A8_PHY_LINKSYSTEM), a8_usb_rd(phy, A8_PHY_PHYUTMI),
++	    a8_usb_rd(phy, A8_PHY_PHYCLKRST), a8_usb_rd(phy, A8_PHY_PHYUTMICLKSEL));
++	printf("A5XELTE USB: PHY PHYREG0 0x%08x PHYREG1 0x%08x PHYPARAM0 0x%08x PHYTERM 0x%08x\n",
++	    a8_usb_rd(phy, A8_PHY_PHYREG0), a8_usb_rd(phy, A8_PHY_PHYREG1),
++	    a8_usb_rd(phy, A8_PHY_PHYPARAM0), a8_usb_rd(phy, A8_PHY_PHYTERM));
++	printf("A5XELTE USB: PHY PHYTEST 0x%08x PHYADP 0x%08x PHYRESUME 0x%08x LINKPORT 0x%08x\n",
++	    a8_usb_rd(phy, A8_PHY_PHYTEST), a8_usb_rd(phy, A8_PHY_PHYADP),
++	    a8_usb_rd(phy, A8_PHY_PHYRESUME), a8_usb_rd(phy, A8_PHY_LINKPORT));
++}
++
++#else  /* ARM64_BOARD_CONFIG_A5XELTE && !JACKPOTLTE */
++
++/*
++ * The A5 (Exynos7580) USB controller is not ported here and its register
++ * bases are not recorded in this tree, so nothing is touched or claimed.
++ */
++void
++a5xelte_usb_probe(void)
++{
++}
++
++#endif /* JACKPOTLTE */
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */

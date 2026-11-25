@@ -1,0 +1,96 @@
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1316,9 +1316,12 @@
+ static unsigned jt_ts_moves;	/* coordinate move events decoded */
+ static unsigned jt_ts_retries;	/* I2C read retries taken */
+ static unsigned jt_ts_lost;	/* reads that failed every attempt */
+-/* A8 TOUCH debug: raw event dump and per-poll read lines.  Off by default:
+- * two printf() per event to the framebuffer console is itself load on the
+- * drain path the swipe depends on.  a8touchverbose=1 turns it back on. */
++static unsigned jt_ts_events;	/* coordinate events forwarded, any action */
++static unsigned jt_ts_overflows;	/* backlog-overflow drains */
++/* Lift watchdog: a drag keeps producing events every few tens of ms, so
++ * this many quiet polls with a finger down means the release event was
++ * dropped and iOS would otherwise hold a phantom finger forever. */
++#define JTTS_LIFT_POLLS	50u	/* ~400 ms at the 8 ms idle poll */
+ static bool jt_ts_verbose;
+ 
+ static void
+@@ -1481,6 +1484,7 @@
+ 	if (eid != JTTS_EVENT_COORDINATE || tid == 0 || tid > 5) {
+ 		return;
+ 	}
++	jt_ts_events++;
+ 	tid -= 1;
+ 	rx = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
+ 	ry = ((unsigned)ev[2] << 4) | (ev[3] & 0xfu);
+@@ -1527,6 +1531,8 @@
+ 	unsigned errors = 0;
+ 	unsigned idle = 0;
+ 	unsigned ticks = 0;
++	unsigned quiet = 0;
++	unsigned seen_events = 0;
+ 	int last_irq = -1;
+ 	(void)arg;
+ 	(void)result;
+@@ -1537,8 +1543,26 @@
+ 		 * (the counters are otherwise only visible during activity). */
+ 		if (++ticks == 2000) {
+ 			ticks = 0;
+-			printf("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u\n",
+-			    jt_ts_moves, jt_ts_retries, jt_ts_lost);
++			printf("A8 TOUCH: moves=%u i2c_retries=%u lost_reads=%u backlog=%u\n",
++			    jt_ts_moves, jt_ts_retries, jt_ts_lost,
++			    jt_ts_overflows);
++		}
++		/* Lift watchdog: a drag produces events every few tens of
++		 * ms, so a long quiet stretch with a finger down means the
++		 * release event was dropped; synthesise it rather than let
++		 * iOS hold a phantom finger forever. */
++		if (jt_ts_events != seen_events) {
++			seen_events = jt_ts_events;
++			quiet = 0;
++		} else if (++quiet >= JTTS_LIFT_POLLS) {
++			quiet = 0;
++			for (unsigned t = 0; t < 5u; t++) {
++				if (jt_ts_down[t]) {
++					printf("A8 TOUCH: lift watchdog, releasing\n");
++					jackpotlte_touch_release_all();
++					break;
++				}
++			}
+ 		}
+ 		/* IRQ gpa0-0 (DTS line 635) is level low while events queue. */
+ 		int irq = !!(a5touch_read(jt_ts_pinctrl0,
+@@ -1584,16 +1608,21 @@
+ 		 * was thrown away, so iOS never saw the touch finish. */
+ 		unsigned left = buf[7] & 0x3fu;
+ 		if (left >= JTTS_MAX_EVENT_COUNT) {
+-			/* Impossible count: the event stream is corrupt.
+-			 * Drop what we hold, release every finger we think is
+-			 * down so iOS cannot be left stuck on a phantom
+-			 * press, and clear the IC queue (sec_ts.c:995). */
+-			printf("A8 TOUCH: event queue overflow left=%u, release all\n",
+-			    left);
+-			jackpotlte_touch_release_all();
+-			(void)jtts_write_cmd(JTTS_CMD_CLEAR_EVENT_STACK);
+-			jackpotlte_touch_wait(4);
+-			continue;
++			/* The count field saturated: the IC holds more events
++			 * than its FIFO depth because the queue overflowed
++			 * while the worker was not being scheduled.  Take the
++			 * FIFO's worth and let the rest stay queued for the
++			 * next poll.  Do NOT clear the queue and do NOT
++			 * release: a forced release here ends every drag as a
++			 * tap (jt36: dragging produced the long-press menu),
++			 * and the release event we need is normally sitting
++			 * in that very backlog. */
++			jt_ts_overflows++;
++			if (jt_ts_overflows <= 4 || !(jt_ts_overflows & 31u)) {
++				printf("A8 TOUCH: event backlog left=%u, draining\n",
++				    left);
++			}
++			left = JTTS_MAX_EVENT_COUNT - 1u;
+ 		}
+ 		if (left && !jtts_read_retry(JTTS_READ_ALL_EVENT, buf + 8,
+ 		    left * 8)) {

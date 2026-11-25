@@ -1,0 +1,718 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1ec5dfd..8eed139 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_panel.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
++bsd/dev/a5xelte_scsc.c			standard
+ bsd/dev/jackpotlte_pmic.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+new file mode 100644
+index 0000000..57eb7cb
+--- /dev/null
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -0,0 +1,519 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) Samsung SCSC / Maxwell
++ * (MX140) WiFi+BT transport, step 1: mailbox + MIF shared memory + interrupt
++ * bits + firmware download.
++ *
++ * The chip this board actually has is Samsung's SCSC/Maxwell block (compatible
++ * "samsung,scsc_wifibt", exynos7885.dtsi:1797-1813).  The AP talks to it over a
++ * mailbox bank and a reserved DRAM window, and starts it by loading mx140.bin
++ * into that window and releasing the WLBT reset.  This file ports the transport
++ * half of Samsung's vendor driver (Eureka-Kernel/drivers/misc/samsung/scsc/)
++ * onto XNU.  It does NOT port the wlan service or 802.11.
++ *
++ * What is real here (each offset cites its source in a5xelte_scsc.h):
++ *   - mailbox bank mapping and read/write (R4 and M4 banks);
++ *   - interrupt-bit operations: read/mask/unmask/clear the from-R4/M4 bank
++ *     and generate to-R4/M4 interrupts;
++ *   - MIF shared-DRAM mapping and a block allocator over it;
++ *   - reading mx140.bin from the staged iOS root and parsing the "smxf"
++ *     firmware header (entry point / runtime length);
++ *   - the mailbox startup contract (entry point, config ref, magic, flags);
++ *   - the PMU reset-release sequence and its power-state handshake.
++ *
++ * What is deliberately NOT real here (marked STUBBED in PORT-START.md):
++ *   - the mxconf transport streams (mxmgmt/gdb/mxlog) the vendor driver writes
++ *     into MIF RAM before releasing reset; a zeroed reservation with the correct
++ *     magic/version is placed instead, so the R4 can at least read it;
++ *   - the GIC interrupt is not registered: the mailbox ISR is not hooked (the
++ *     AP-side register plumbing to service it exists and is reported), and no
++ *     firmware handshake message is waited for;
++ *   - firmware CRC32 verification;
++ *   - the mx140 wlan service, the Apple80211 driver, and the 20 MHz USB PLL
++ *     handover (the jackpotlte DT leaves samsung,syscon-cmu_fsys commented out,
++ *     exynos7885.dtsi:1809, so that path is off).
++ *
++ * Safety: the default probe is read-only and touches only the PMU (always on)
++ * and the reserved MIF DRAM window.  The mailbox bank and the reset-release
++ * sequence run only when the "a8wifi" boot argument is 1, because reading a
++ * gated mailbox block or releasing WLBT reset changes the state of a live
++ * co-processor.  Nothing writes Android/S-Boot partitions.
++ *
++ * This file is compiled for the A5XELTE machine config and emits code only for
++ * JACKPOTLTE, matching the other A8 device files (e.g. bsd/dev/a5xelte_usb.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#include "a5xelte_scsc.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++void a5xelte_scsc_probe(void);
++
++/* ---- device state --------------------------------------------------------- */
++
++struct a5scsc_softc {
++	vm_offset_t mbox_r4;            /* R4 mailbox bank VA           */
++	vm_offset_t mbox_m4;            /* M4 mailbox bank VA           */
++	vm_offset_t pmu;                /* PMU syscon VA                */
++	vm_offset_t mif;                /* MIF shared DRAM VA           */
++	bool        mbox_mapped;
++	bool        pmu_mapped;
++	bool        mif_mapped;
++	uint32_t    mif_alloc_off;      /* bump allocator offset        */
++	uint32_t    mif_free;           /* bytes remaining in the heap  */
++	uint32_t    fw_entry;           /* parsed firmware entry point  */
++	uint32_t    fw_runtime_len;     /* parsed firmware runtime size */
++	bool        fw_loaded;
++};
++
++static struct a5scsc_softc a5scsc;
++
++/* ---- register access (32-bit, LE; little-endian AP identical to R4) ------- */
++
++static inline uint32_t
++a5scsc_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return value;
++}
++
++static inline void
++a5scsc_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static inline uint32_t
++a5scsc_mbox_rd(vm_offset_t bank, uint32_t off)
++{
++	return a5scsc_rd(bank, off);
++}
++
++/* RMW one field of a PMU register (the vendor driver uses regmap_update_bits;
++ * MIF:347, 367, 387). */
++static void
++a5scsc_pmu_set(uint32_t off, uint32_t mask, uint32_t value)
++{
++	uint32_t v = a5scsc_rd(a5scsc.pmu, off);
++	a5scsc_wr(a5scsc.pmu, off, (v & ~mask) | (value & mask));
++}
++
++/* ---- MIF shared-DRAM block allocator --------------------------------------
++ * A trimmed port of miframman.c (block size 64 bytes, MIFRAMMAN_BLOCK_SIZE,
++ * miframman.h:23).  The vendor allocator keeps a bitmap; a bump allocator is
++ * enough for the single load in this first patch and cannot fragment, but it
++ * has no free(), so it is marked STUBBED in PORT-START.md.
++ */
++static bool
++a5scsc_mifram_alloc(uint32_t nbytes, uint32_t align, uint32_t *out_off)
++{
++	uint32_t off;
++
++	if (align == 0 || (align & (align - 1)) != 0) {
++		return false;   /* align must be a power of two (miframman.c:147) */
++	}
++	off = (a5scsc.mif_alloc_off + (align - 1)) & ~(align - 1);
++	if (off < a5scsc.mif_alloc_off || off + nbytes > A5SCSC_MIF_DRAM_SIZE) {
++		return false;
++	}
++	a5scsc.mif_alloc_off = off + nbytes;
++	a5scsc.mif_free = A5SCSC_MIF_DRAM_SIZE - a5scsc.mif_alloc_off;
++	*out_off = off;
++	return true;
++}
++
++/* ---- firmware image header (fwhdr.c:16-92) -------------------------------- */
++
++static uint32_t
++a5scsc_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static bool
++a5scsc_parse_fwhdr(const uint8_t *fw, uint32_t size,
++    uint32_t *entry_point, uint32_t *runtime_len, uint32_t *hdr_length)
++{
++	if (size < A5SCSC_FWHDR_MIN_SIZE) {
++		return false;
++	}
++	if (memcmp(fw + A5SCSC_FWHDR_MAGIC_OFF, A5SCSC_FWHDR_MAGIC,
++	    sizeof(A5SCSC_FWHDR_MAGIC) - 1) != 0) {
++		/* fwhdr_parse() fails on a missing "smxf"; the vendor driver then
++		 * refuses the image unless allow_unidentified_firmware is set
++		 * (mxman.c:849-858), which we do not. */
++		return false;
++	}
++	*entry_point = a5scsc_le32(fw + A5SCSC_FWHDR_ENTRY_POINT_OFF);
++	*runtime_len = a5scsc_le32(fw + A5SCSC_FWHDR_FW_RUNTIME_LEN_OFF);
++	*hdr_length  = a5scsc_le32(fw + A5SCSC_FWHDR_HDR_LENGTH_OFF);
++	return true;
++}
++
++/* ---- firmware read from the staged iOS root -------------------------------
++ * Reads up to max bytes of path into dst.  Returns 0 on success.
++ * Same idiom as vfs_syscalls.c:517-525.
++ */
++static int
++a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int err, resid = 0;
++	size_t size;
++
++	err = vnode_lookup(path, 0, &vp, ctx);
++	if (err != 0) {
++		return err;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	err = vnode_getattr(vp, &va, ctx);
++	if (err != 0 || !VATTR_IS_SUPPORTED(&va, va_data_size)) {
++		vnode_put(vp);
++		return err != 0 ? err : ENOTSUP;
++	}
++	size = (size_t)va.va_data_size;
++	if (size == 0 || size > max) {
++		vnode_put(vp);
++		return size == 0 ? ENOENT : EFBIG;
++	}
++	err = vn_rdwr(UIO_READ, vp, (caddr_t)dst, (int)size, 0,
++	    UIO_SYSSPACE, IO_NOCACHE, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (err != 0) {
++		return err;
++	}
++	if (resid != 0) {
++		return EIO;
++	}
++	*out_size = size;
++	return 0;
++}
++
++static int
++a5scsc_load_firmware(void)
++{
++	uint8_t *dst = (uint8_t *)a5scsc.mif;
++	size_t size = 0;
++	uint32_t hdr_length = 0;
++	int err;
++
++	err = a5scsc_read_file(A5SCSC_FW_PATH, dst, A5SCSC_MIF_DRAM_SIZE, &size);
++	if (err != 0) {
++		return err;
++	}
++	if (!a5scsc_parse_fwhdr(dst, (uint32_t)size, &a5scsc.fw_entry,
++	    &a5scsc.fw_runtime_len, &hdr_length)) {
++		printf("A5XELTE SCSC: %s is not a smxf firmware image\n", A5SCSC_FW_PATH);
++		return EINVAL;
++	}
++	if (a5scsc.fw_runtime_len == 0 || a5scsc.fw_runtime_len > A5SCSC_MIF_DRAM_SIZE) {
++		printf("A5XELTE SCSC: bad fw runtime length 0x%x\n", a5scsc.fw_runtime_len);
++		return EINVAL;
++	}
++	/* The MIF heap starts after the firmware (mxman.c:972-975). */
++	a5scsc.mif_alloc_off = a5scsc.fw_runtime_len;
++	a5scsc.mif_free = A5SCSC_MIF_DRAM_SIZE - a5scsc.fw_runtime_len;
++	a5scsc.fw_loaded = true;
++	printf("A5XELTE SCSC: firmware %u bytes loaded, entry 0x%x runtime 0x%x\n",
++	    (unsigned)size, a5scsc.fw_entry, a5scsc.fw_runtime_len);
++	/* STUBBED: header/const/fw CRC32 checks (fwimage.c) are not run. */
++	return 0;
++}
++
++/* ---- mailbox startup (mxman.c:764-792) ------------------------------------ */
++
++static void
++a5scsc_mbox_init(uint32_t entry_point, uint32_t mxconf_ref)
++{
++	vm_offset_t b = a5scsc.mbox_r4;
++
++	/* MBOX0 = firmware entry point; MBOX1 = R4-relative config address. */
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_0), entry_point);
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_1), mxconf_ref);
++	/* MBOX2 = magic; MBOX3 = startup flags (0 == normal, mxman.c:116). */
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_2), A5SCSC_MBOX_MAGIC);
++	a5scsc_wr(b, A5SCSC_ISSR(A5SCSC_MBOX_INDEX_3), 0);
++	printf("A5XELTE SCSC: mailbox0 entry 0x%x conf 0x%x magic 0x%08x\n",
++	    entry_point, mxconf_ref, A5SCSC_MBOX_MAGIC);
++}
++
++/* The vendor driver zeroes every mailbox and pre-masks both banks
++ * (platform_mif.c:658-684).  Mask value 1 == masked. */
++static void
++a5scsc_mbox_bank_init(void)
++{
++	vm_offset_t r4 = a5scsc.mbox_r4;
++	vm_offset_t m4 = a5scsc.mbox_m4;
++	uint32_t i;
++
++	for (i = 0; i < A5SCSC_NUM_MBOX; i++) {
++		a5scsc_wr(r4, A5SCSC_ISSR(i), 0);
++		a5scsc_wr(m4, A5SCSC_ISSR(i), 0);
++	}
++	/* INTMR0 covers interrupts FROM R4/M4 in bits [31:16]: mask all. */
++	a5scsc_wr(r4, A5SCSC_INTMR0, 0xffff0000u);
++	a5scsc_wr(r4, A5SCSC_INTMR1, 0x0000ffffu);       /* to-R4 bank */
++	a5scsc_wr(m4, A5SCSC_INTMR1, 0x0000ffffu);       /* to-M4 bank (MIF:672) */
++	/* Clear every pending interrupt. */
++	a5scsc_wr(r4, A5SCSC_INTCR0, 0xffff0000u);
++	a5scsc_wr(r4, A5SCSC_INTCR1, 0x0000ffffu);
++	a5scsc_wr(m4, A5SCSC_INTCR1, 0x0000ffffu);
++	/* STUBBED: the mxconf transport streams are not serialised here. */
++}
++
++/* ---- interrupt bits (platform_mif.c:766-908) ------------------------------
++ * These are the operations a real ISR and a real service driver will call.
++ * They are implemented and used by the read-only report below; the GIC handler
++ * that would call them is not registered in this patch.
++ */
++
++/* Pending, enabled and unmasked interrupts from R4/M4 (MIF:776-786). */
++static uint32_t
++a5scsc_irq_get(void)
++{
++	return a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMSR0) >> 16;
++}
++
++static void
++a5scsc_irq_bit_clear(int bit)
++{
++	if (bit < 0 || bit >= 16) {
++		return;
++	}
++	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTCR0, ((1u << bit) << 16));   /* MIF:831-842 */
++}
++
++static void
++a5scsc_irq_bit_mask(int bit)
++{
++	uint32_t v;
++	if (bit < 0 || bit >= 16) {
++		return;
++	}
++	v = a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0);
++	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTMR0, v | ((1u << bit) << 16)); /* MIF:844-860 */
++}
++
++static void
++a5scsc_irq_bit_unmask(int bit)
++{
++	uint32_t v;
++	if (bit < 0 || bit >= 16) {
++		return;
++	}
++	v = a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0);
++	a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTMR0, v & ~((1u << bit) << 16)); /* MIF:862-878 */
++}
++
++/* Generate an interrupt TO R4 (target 0) or M4 (target 1); MIF:788-829. */
++static void
++a5scsc_irq_bit_set(int bit, int target)
++{
++	if (bit < 0 || bit >= 16) {
++		return;
++	}
++	if (target == 0) {
++		a5scsc_wr(a5scsc.mbox_r4, A5SCSC_INTGR1, (1u << bit));
++	} else {
++		a5scsc_wr(a5scsc.mbox_m4, A5SCSC_INTGR1, (1u << bit));
++	}
++}
++
++/* ---- PMU reset release / hold ---------------------------------------------
++ * The vendor driver's platform_mif_reset(release) + platform_mif_pmu_reset_release
++ * (MIF:538-609, 410-433) and platform_mif_pmu_reset (MIF:435-534).
++ */
++
++static void
++a5scsc_pmu_mem_windows(void)
++{
++	/* BASE in CONFIG1 and SIZE in CONFIG0, both in 4 KiB units (MIF:560-579). */
++	a5scsc_wr(a5scsc.pmu, A5SCSC_WIFI2AP_MEM_CONFIG1,
++	    (A5SCSC_MIF_DRAM_PA & 0xffffc000u) >> 12);
++	a5scsc_wr(a5scsc.pmu, A5SCSC_WIFI2AP_MEM_CONFIG0,
++	    A5SCSC_MIF_DRAM_SIZE >> 12);
++}
++
++static int
++a5scsc_pmu_reset_release(void)
++{
++	uint32_t v, state;
++	int n;
++
++	/* Take the WIFI domain out of low-power first (MIF:449-512). */
++	a5scsc_pmu_set(A5SCSC_RESET_AHEAD_WIFI_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
++	a5scsc_pmu_set(A5SCSC_CLEANY_BUS_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++	a5scsc_pmu_set(A5SCSC_LOGIC_RESET_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG_2, 0);
++	a5scsc_pmu_set(A5SCSC_TCXO_GATE_WIFI_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++	a5scsc_pmu_set(A5SCSC_WIFI_DISABLE_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 1);
++	a5scsc_pmu_set(A5SCSC_WIFI_RESET_ISO_SYS_PWR_REG, A5SCSC_SYS_PWR_CFG, 0);
++	a5scsc_pmu_set(A5SCSC_CENTRAL_SEQ_WIFI_CONFIGURATION, A5SCSC_SYS_PWR_CFG_16, 0);
++
++	a5scsc_pmu_mem_windows();
++	/* Boot from external DRAM, not IRAM (MIF:684). */
++	a5scsc_wr(a5scsc.pmu, A5SCSC_WLBT_BOOT_TEST_RST_CFG, 0);
++
++	/* Power on -> release reset -> start (MIF:418-426). */
++	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_NS, A5SCSC_WIFI_PWRON, A5SCSC_WIFI_PWRON);
++	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_NS, A5SCSC_WIFI_RESET_SET, 0);
++	a5scsc_pmu_set(A5SCSC_WIFI_CTRL_S, A5SCSC_WIFI_START, A5SCSC_WIFI_START);
++
++	/* Wait for the WLBT power state machine to reach UP (MIF:522-528). */
++	for (n = 0; n < 500; n++) {
++		v = a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS);
++		state = (v & A5SCSC_CENTRAL_SEQ_STATES) >> 16;
++		if (state == A5SCSC_CENTRAL_SEQ_UP) {
++			return 0;
++		}
++		delay(1000);    /* 1 ms between polls; 500 ms budget (MIF:438) */
++	}
++	printf("A5XELTE SCSC: PMU WLBT state timeout, STATUS 0x%08x\n", v);
++	return ETIMEDOUT;
++}
++
++/* ---- read-only identity report -------------------------------------------- */
++
++static void
++a5scsc_print_identity(void)
++{
++	uint32_t ctrl_ns, ctrl_s, stat, central;
++
++	ctrl_ns = a5scsc_rd(a5scsc.pmu, A5SCSC_WIFI_CTRL_NS);
++	ctrl_s = a5scsc_rd(a5scsc.pmu, A5SCSC_WIFI_CTRL_S);
++	stat = a5scsc_rd(a5scsc.pmu, A5SCSC_WIFI_STAT);
++	central = a5scsc_rd(a5scsc.pmu, A5SCSC_CENTRAL_SEQ_WIFI_STATUS);
++	printf("A5XELTE SCSC: PMU WIFI_CTRL_NS 0x%08x WIFI_CTRL_S 0x%08x WIFI_STAT 0x%08x seq 0x%08x\n",
++	    ctrl_ns, ctrl_s, stat, (central & A5SCSC_CENTRAL_SEQ_STATES) >> 16);
++
++	if (a5scsc.mbox_mapped) {
++		printf("A5XELTE SCSC: R4 IS_VERSION 0x%08x INTMR0 0x%08x INTSR0 0x%08x pending 0x%04x\n",
++		    a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_IS_VERSION),
++		    a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTMR0),
++		    a5scsc_mbox_rd(a5scsc.mbox_r4, A5SCSC_INTSR0),
++		    a5scsc_irq_get());
++		printf("A5XELTE SCSC: M4 IS_VERSION 0x%08x INTMR1 0x%08x\n",
++		    a5scsc_mbox_rd(a5scsc.mbox_m4, A5SCSC_IS_VERSION),
++		    a5scsc_mbox_rd(a5scsc.mbox_m4, A5SCSC_INTMR1));
++	}
++}
++
++/* ---- bring-up thread ------------------------------------------------------ */
++
++static void
++a5scsc_bringup_thread(void *param __unused, wait_result_t wr __unused)
++{
++	uint32_t mxconf_ref;
++	int attempt, err = 0;
++
++	/* The staged iOS root may not be mounted yet; retry for a while. */
++	for (attempt = 0; attempt < 60; attempt++) {
++		err = a5scsc_load_firmware();
++		if (err == 0) {
++			break;
++		}
++		delay(500000);  /* 500 ms */
++	}
++	if (err != 0) {
++		printf("A5XELTE SCSC: firmware not loaded (%d); restart later\n", err);
++		return;
++	}
++
++	a5scsc_mbox_bank_init();
++
++	/* Reserve the mxconf block and give it the magic/version the R4 checks
++	 * (mxman.c:721-733).  Transport streams: STUBBED. */
++	if (!a5scsc_mifram_alloc(A5SCSC_MXCONF_RESERVE, 64, &mxconf_ref)) {
++		printf("A5XELTE SCSC: mxconf allocation failed\n");
++		return;
++	}
++	{
++		uint8_t *mxconf = (uint8_t *)a5scsc.mif + mxconf_ref;
++		bzero(mxconf, A5SCSC_MXCONF_RESERVE);
++		*(volatile uint32_t *)(mxconf + 0) = A5SCSC_MXCONF_MAGIC;
++		*(volatile uint16_t *)(mxconf + 4) = A5SCSC_MXCONF_VERSION_MAJOR;
++		*(volatile uint16_t *)(mxconf + 6) = A5SCSC_MXCONF_VERSION_MINOR;
++	}
++
++	a5scsc_mbox_init(a5scsc.fw_entry, mxconf_ref);
++
++	err = a5scsc_pmu_reset_release();
++	if (err != 0) {
++		printf("A5XELTE SCSC: reset release failed (%d)\n", err);
++		return;
++	}
++	printf("A5XELTE SCSC: WLBT released from reset; firmware handshake STUBBED\n");
++}
++
++/* ---- public entry points -------------------------------------------------- */
++
++void
++a5xelte_scsc_probe(void)
++{
++	int enabled = 0;
++
++	/* Default: read-only report only.  a8wifi=1 additionally maps the
++	 * mailbox bank and starts the firmware bring-up thread. */
++	(void)PE_parse_boot_argn("a8wifi", &enabled, sizeof(enabled));
++
++	a5scsc.pmu = ml_io_map(A5SCSC_PMU_PA, A5SCSC_PMU_SIZE);
++	a5scsc.mif = ml_io_map(A5SCSC_MIF_DRAM_PA, A5SCSC_MIF_DRAM_SIZE);
++	if (a5scsc.pmu == 0 || a5scsc.mif == 0) {
++		printf("A5XELTE SCSC: PMU/MIF map failed (pmu %d mif %d); skipping\n",
++		    a5scsc.pmu != 0, a5scsc.mif != 0);
++		return;
++	}
++	a5scsc.pmu_mapped = true;
++	a5scsc.mif_mapped = true;
++	a5scsc.mif_free = A5SCSC_MIF_DRAM_SIZE;
++
++	if (!enabled) {
++		a5scsc_print_identity();
++		printf("A5XELTE SCSC: probe only (a8wifi=0); mailbox not touched\n");
++		return;
++	}
++
++	a5scsc.mbox_r4 = ml_io_map(A5SCSC_MBOX_R4_PA, A5SCSC_MBOX_SIZE);
++	a5scsc.mbox_m4 = ml_io_map(A5SCSC_MBOX_M4_PA, A5SCSC_MBOX_SIZE);
++	if (a5scsc.mbox_r4 == 0 || a5scsc.mbox_m4 == 0) {
++		printf("A5XELTE SCSC: mailbox map failed\n");
++		return;
++	}
++	a5scsc.mbox_mapped = true;
++
++	a5scsc_print_identity();
++
++	{
++		thread_t thread = THREAD_NULL;
++		if (kernel_thread_start((thread_continue_t)a5scsc_bringup_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("A5XELTE SCSC: bring-up thread failed to start\n");
++		}
++	}
++}
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++void
++a5xelte_scsc_probe(void)
++{
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+new file mode 100644
+index 0000000..443c406
+--- /dev/null
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -0,0 +1,152 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) Samsung SCSC / Maxwell
++ * (MX140) WiFi+BT transport: hardware facts.
++ *
++ * This header carries only addresses, register offsets and bit positions that
++ * are quoted from Samsung's own sources.  Nothing here is guessed.  Every
++ * constant names the file and line it came from:
++ *
++ *   DT    = Eureka-Kernel/arch/arm64/boot/dts/exynos/dtb/  (Exynos7885 board)
++ *   REG   = Eureka-Kernel/drivers/misc/samsung/scsc/mif_reg_S5E7885.h
++ *   MIF   = Eureka-Kernel/drivers/misc/samsung/scsc/platform_mif.c
++ *   MXMAN = Eureka-Kernel/drivers/misc/samsung/scsc/mxman.c
++ *   FWHDR = Eureka-Kernel/drivers/misc/samsung/scsc/fwhdr.c
++ *   MXCONF= Eureka-Kernel/drivers/misc/samsung/scsc/mxconf.h
++ *
++ * Status of each item is marked implemented / stubbed / unknown in
++ * docs/drafts/jackpotlte-wifi/PORT-START.md.
++ */
++#ifndef _A5XELTE_SCSC_H_
++#define _A5XELTE_SCSC_H_
++
++#include <sys/types.h>
++
++/* ---- physical address space ------------------------------------------------
++ * scsc_wifibt@120c0000 node, exynos7885.dtsi:1797-1813:
++ *   reg = <0 0x120c0000 0x180>,   R4 mailbox bank   (dtsi:1800)
++ *         <0 0x120e0000 0x180>;   M4 mailbox bank   (dtsi:1801)
++ *   interrupts = <0 57 4>, <0 21 4>, <0 286 4>      (dtsi:1803)
++ *   interrupt-names = "MBOX","ALIVE","WDOG"          (dtsi:1804)
++ *   samsung,syscon-phandle = <&pmu_system_controller>(dtsi:1807)
++ *
++ * pmu_system_controller: system-controller@11c80000, exynos7885.dtsi:1289-1292
++ *   reg = <0 0x11c80000 0x10000>;
++ *
++ * MIF shared DRAM ("wifibt_if" reserved memory), exynos7885-rmem.dtsi:55-58
++ *   compatible = "exynos,wifibt_if";
++ *   reg = <0 0xE9000000 0x400000>;   (4 MiB, matches MX_DRAM_SIZE below)
++ */
++#define A5SCSC_MBOX_R4_PA       0x120c0000u     /* exynos7885.dtsi:1800 */
++#define A5SCSC_MBOX_M4_PA       0x120e0000u     /* exynos7885.dtsi:1801 */
++#define A5SCSC_MBOX_SIZE        0x180u          /* exynos7885.dtsi:1800-1801 */
++#define A5SCSC_PMU_PA           0x11c80000u     /* exynos7885.dtsi:1291 */
++#define A5SCSC_PMU_SIZE         0x10000u        /* exynos7885.dtsi:1291 */
++#define A5SCSC_MIF_DRAM_PA      0xe9000000u     /* exynos7885-rmem.dtsi:57 */
++#define A5SCSC_MIF_DRAM_SIZE    0x400000u       /* exynos7885-rmem.dtsi:57 */
++
++/* ---- GIC interrupts --------------------------------------------------------
++ * exynos7885.dtsi:1803 gives three SPIs; the dtb uses <0 N 4> (SPI, level
++ * high).  GICv2 maps SPI n to interrupt ID n + 32.  Only the MBOX line is
++ * wired in this first patch (see the .c); ALIVE and WDOG are recorded for the
++ * next session.  The first interrupt cell of each triple is 0 == SPI.
++ */
++#define A5SCSC_SPI_MBOX         57u             /* exynos7885.dtsi:1803 -> ID 89  */
++#define A5SCSC_SPI_ALIVE        21u             /* exynos7885.dtsi:1803 -> ID 53  */
++#define A5SCSC_SPI_WDOG         286u            /* exynos7885.dtsi:1803 -> ID 318 */
++#define A5SCSC_SPI_TO_GIC_ID(n) ((n) + 32u)     /* GICv2: SPI n == ID n + 32 */
++
++/* ---- mailbox bank register offsets (NUM_MBOX_PLAT = 8) --------------------
++ * REG:16-40.  R0 is the interrupt bank for interrupts FROM R4/M4 (bits
++ * [31:16]); R1 is the bank for interrupts TO R4 (bits [15:0]).  For Exynos
++ * 7872/7885 the "to M4" interrupts reuse the R1 offsets in the *M4* bank
++ * (MIF:803-826), so both banks are mapped.
++ */
++#define A5SCSC_MCUCTRL          0x000u          /* REG:18 */
++#define A5SCSC_INTGR0           0x008u          /* REG:20, from R4/M4 */
++#define A5SCSC_INTCR0           0x00cu          /* REG:21 */
++#define A5SCSC_INTMR0           0x010u          /* REG:22 */
++#define A5SCSC_INTSR0           0x014u          /* REG:23 */
++#define A5SCSC_INTMSR0          0x018u          /* REG:24 */
++#define A5SCSC_INTGR1           0x01cu          /* REG:26, to R4 (M4 bank: to M4) */
++#define A5SCSC_INTCR1           0x020u          /* REG:27 */
++#define A5SCSC_INTMR1           0x024u          /* REG:28 */
++#define A5SCSC_INTSR1           0x028u          /* REG:29 */
++#define A5SCSC_INTMSR1          0x02cu          /* REG:30 */
++#define A5SCSC_MIF_INIT         0x04cu          /* REG:31 */
++#define A5SCSC_IS_VERSION       0x050u          /* REG:32 */
++#define A5SCSC_ISSR_BASE        0x080u          /* REG:33 */
++#define A5SCSC_ISSR(i)          (A5SCSC_ISSR_BASE + 4u * (i))   /* value mailbox i */
++#define A5SCSC_SEMAPHORE_BASE   0x180u          /* REG:35 (12 semaphores) */
++#define A5SCSC_NUM_MBOX         8u              /* REG:13 */
++
++/* ---- PMU offsets (base = A5SCSC_PMU_PA) -----------------------------------
++ * REG:46-135.  The vendor driver reaches these through the pmu_system_controller
++ * syscon regmap (MIF:1473); here they are direct MMIO.
++ */
++#define A5SCSC_WIFI_CTRL_NS     0x0140u         /* REG:46 */
++#define A5SCSC_WIFI_CTRL_S      0x0144u         /* REG:79 */
++#define A5SCSC_WIFI_STAT        0x0148u         /* REG:86 */
++#define A5SCSC_CENTRAL_SEQ_WIFI_CONFIGURATION 0x0380u  /* REG:124 */
++#define A5SCSC_CENTRAL_SEQ_WIFI_STATUS        0x0384u  /* REG:130 */
++#define A5SCSC_WIFI2AP_MEM_CONFIG0 0x7300u      /* REG:100, WLBT_MEM_SIZE */
++#define A5SCSC_WIFI2AP_MEM_CONFIG1 0x7304u      /* REG:101, WLBT_MEM_BA0  */
++#define A5SCSC_WIFI2AP_MEM_CONFIG2 0x7308u      /* REG:102, btabox size   */
++#define A5SCSC_WIFI2AP_MEM_CONFIG3 0x730cu      /* REG:103, btabox base   */
++#define A5SCSC_WLBT_BOOT_TEST_RST_CFG 0x7330u   /* REG:112 */
++#define A5SCSC_RESET_AHEAD_WIFI_PWR_REG 0x1360u /* REG:117 */
++#define A5SCSC_CLEANY_BUS_WIFI_SYS_PWR_REG 0x1364u /* REG:118 */
++#define A5SCSC_LOGIC_RESET_WIFI_SYS_PWR_REG 0x1368u /* REG:119 */
++#define A5SCSC_TCXO_GATE_WIFI_SYS_PWR_REG 0x136cu /* REG:120 */
++#define A5SCSC_WIFI_DISABLE_ISO_SYS_PWR_REG 0x1370u /* REG:121 */
++#define A5SCSC_WIFI_RESET_ISO_SYS_PWR_REG 0x1374u /* REG:122 */
++
++/* bit positions (REG:47-131) */
++#define A5SCSC_WIFI_PWRON       (1u << 1)       /* REG:47 */
++#define A5SCSC_WIFI_RESET_SET   (1u << 2)       /* REG:48 */
++#define A5SCSC_WIFI_ACTIVE_CLR  (1u << 6)       /* REG:50 */
++#define A5SCSC_WIFI_START       (1u << 3)       /* REG:80 */
++#define A5SCSC_WIFI_PWRDN_DONE  (1u << 0)       /* REG:87 */
++#define A5SCSC_WIFI_ACCESS_MIF  (1u << 4)       /* REG:88 */
++#define A5SCSC_SYS_PWR_CFG      (1u << 0)       /* REG:133 */
++#define A5SCSC_SYS_PWR_CFG_2    ((1u << 0) | (1u << 1)) /* REG:134 */
++#define A5SCSC_SYS_PWR_CFG_16   (1u << 16)      /* REG:135 */
++#define A5SCSC_CENTRAL_SEQ_STATES 0xff0000u     /* REG:131 */
++#define A5SCSC_CENTRAL_SEQ_UP   0x80u           /* MIF:526 (state == 0x80 is UP) */
++
++/* ---- Maxwell firmware image header (format "smxf", version 0.2) -----------
++ * FWHDR:16-30.  All fields little-endian, at fixed byte offsets:
++ */
++#define A5SCSC_FWHDR_MAGIC_OFF          8       /* FWHDR:17 */
++#define A5SCSC_FWHDR_MAGIC              "smxf"  /* FWHDR:52 */
++#define A5SCSC_FWHDR_HDR_LENGTH_OFF     16      /* FWHDR:20 */
++#define A5SCSC_FWHDR_FWAPI_MINOR_OFF    20      /* FWHDR:21 */
++#define A5SCSC_FWHDR_FWAPI_MAJOR_OFF    22      /* FWHDR:22 */
++#define A5SCSC_FWHDR_FW_RUNTIME_LEN_OFF 36      /* FWHDR:26 */
++#define A5SCSC_FWHDR_ENTRY_POINT_OFF    40      /* FWHDR:27 */
++#define A5SCSC_FWHDR_BUILD_ID_OFF       48      /* FWHDR:28 */
++#define A5SCSC_FWHDR_MIN_SIZE           52      /* through build_id (<= FWHDR:28) */
++
++/* ---- mailbox startup contract (mxman.c) -----------------------------------
++ * MXMAN:49-60, 764-792, mxconf.h:35-44.
++ */
++#define A5SCSC_MX_DRAM_SIZE     0x400000u       /* MXMAN:49 (4 MiB) */
++#define A5SCSC_MX_FW_RUNTIME_LEN 0x100000u      /* MXMAN:50 (1 MiB) */
++#define A5SCSC_MBOX_MAGIC       0xbcdeedcbU     /* MXMAN:52 */
++#define A5SCSC_MBOX_INDEX_0     0u              /* MXMAN:53 */
++#define A5SCSC_MBOX_INDEX_1     1u              /* MXMAN:54 */
++#define A5SCSC_MBOX_INDEX_2     2u              /* MXMAN:55 */
++#define A5SCSC_MBOX_INDEX_3     3u              /* MXMAN:56 */
++#define A5SCSC_MXCONF_MAGIC     0x79828486U     /* mxconf.h:35 */
++#define A5SCSC_MXCONF_VERSION_MAJOR 0u          /* mxconf.h:43 */
++#define A5SCSC_MXCONF_VERSION_MINOR 1u          /* mxconf.h:44 */
++/* Reserve one block for the mxconf transport description.  The real struct
++ * (mxconf.h:106-139) is 176 bytes; round up generously.  Transport streams are
++ * NOT configured in this first patch - see PORT-START.md. */
++#define A5SCSC_MXCONF_RESERVE   0x200u
++
++/* Where the firmware + configuration are expected at runtime.  The vendor
++ * driver reads mx140.bin and the *.hcf config from a base directory
++ * (mx140_file.c:38, 96-98); on iOS the staged iOS root supplies them. */
++#define A5SCSC_FW_PATH          "/private/var/wifi/mx140.bin"
++
++#endif /* _A5XELTE_SCSC_H_ */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 7b31ff2..8438685 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -73,6 +73,7 @@ extern void a5xelte_keys_init(void);
+ extern void a5xelte_panel_init(void);
+ extern void a5xelte_touch_probe(void);
+ extern void a5xelte_usb_probe(void);
++extern void a5xelte_scsc_probe(void);
+ #if defined(JACKPOTLTE)
+ extern void jackpotlte_pmic_probe(void);
+ #endif
+@@ -786,6 +787,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ #if defined(JACKPOTLTE)
+ 	/* Galaxy A8 2018: read-only DWC3 + PHY state probe (bsd/dev/a5xelte_usb.c). */
+ 	a5xelte_usb_probe();
++	/* Galaxy A8 2018: SCSC/Maxwell (MX140) WiFi+BT transport, probe only by
++	 * default; full bring-up only with the "a8wifi" boot argument
++	 * (bsd/dev/a5xelte_scsc.c). */
++	a5xelte_scsc_probe();
+ #endif
+ 	{
+ 	uint32_t emmcprobe = 0;

@@ -1,0 +1,51 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 6d56a33..3fd9809 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1056,8 +1056,27 @@ ml_parse_cpu_topology(void)
+ 		uint32_t phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P);
+ #endif
+ 		assert(phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID);
++#if defined(JACKPOTLTE)
++		/*
++		 * Exynos7885 has three hardware clusters: 4x A53 AFF1=1
++		 * (0x100-0x103), 2x A53 AFF1=2 (0x200-0x201) and 2x A73 AFF1=0
++		 * (0x0-0x1). Deriving a logical cluster per AFF1 creates three
++		 * psets under pset_node0 on this non-__AMP__ build, and the boot
++		 * CPU deadlocks on a half-owned ticket lock as soon as a second
++		 * cluster registers (lock_ticket.c:143). georgev-6974/s9plus-ios
++		 * logs the same failure on Exynos 9810 and fixes it by keeping
++		 * every core in one logical cluster.
++		 *
++		 * The ADT cpu nodes carry the intended logical cluster, and
++		 * tools/mkadt_jackpotlte.py sets cluster-id 0 for all of them, so
++		 * every CPU lands in one cluster and one pset. XNU reads this
++		 * property nowhere else, so nothing else depends on it.
++		 */
++		cpu->cluster_id = (uint32_t)ml_readprop(child, "cluster-id", 0);
++#else
+ 		cpu->cluster_id = ((cluster_phys_to_logical[phys_cluster_id] == -1) ?
+ 		    topology_info.num_clusters : cluster_phys_to_logical[phys_cluster_id]);
++#endif
+ 
+ 		assert(cpu->cluster_id < MAX_CPU_CLUSTERS);
+ 
+@@ -1084,6 +1103,18 @@ ml_parse_cpu_topology(void)
+ 			ml_read_reg_range(child, "cpm-impl-reg", &cluster->cpm_IMPL_pa, &cluster->cpm_IMPL_len);
+ 		}
+ 
++#if defined(JACKPOTLTE)
++		/*
++		 * The block above runs only for the first CPU of a logical cluster,
++		 * so with every core in cluster 0 only AFF1=1 would be registered.
++		 * cluster_offsets[] is indexed by the physical AFF1 (see
++		 * LOAD_PMAP_CPU_DATA in exception_asm.h), so every physical cluster
++		 * holding CPUs must be registered or the exception path computes a
++		 * bad per-CPU index for AFF1=0 and AFF1=2.
++		 */
++		cluster_phys_to_logical[phys_cluster_id] = cpu->cluster_id;
++#endif
++
+ #if HAS_CLUSTER || defined(A5XELTE)
+ 		if (MPIDR_CPU_ID(cpu->phys_id) > cluster_max_cpu_phys_id[phys_cluster_id]) {
+ 			cluster_max_cpu_phys_id[phys_cluster_id] = MPIDR_CPU_ID(cpu->phys_id);

@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/jackpotlte_mali.c b/bsd/dev/jackpotlte_mali.c
+--- a/bsd/dev/jackpotlte_mali.c
++++ b/bsd/dev/jackpotlte_mali.c
+@@ -152,6 +152,8 @@
+ #define JT_MALI_AS_MEMATTR_HI	0x0cu
+ #define JT_MALI_AS_COMMAND	0x18u		/* 1 = UPDATE */
+ #define JT_MALI_AS_FAULTSTATUS	0x1cu
++#define JT_MALI_AS_FAULTADDR_LO	0x20u
++#define JT_MALI_AS_FAULTADDR_HI	0x24u
+ #define JT_MALI_AS_STATUS	0x28u
+ #define JT_MALI_AS_TRANSCFG_LO	0x30u
+ #define JT_MALI_AS_TRANSCFG_HI	0x34u
+@@ -387,6 +389,30 @@
+ 	return true;
+ }
+ 
++/* The entry for GPU address `gpu`, or 0 when nothing maps it.  A read-only
++ * walk of the same tables jt_map_page fills, so a job that faults can be told
++ * whether the address it died on was ever mapped. */
++static uint64_t
++jt_pt_lookup(uint64_t gpu)
++{
++	uint64_t *table, entry;
++
++	if (jt_pt_top == NULL) {
++		return 0;
++	}
++	entry = jt_pt_top[(gpu >> 30) & 31];
++	if (!(entry & 1)) {
++		return 0;
++	}
++	table = (uint64_t *)phystokv(entry & JT_PTE_ADDRESS);
++	entry = table[(gpu >> 21) & 511];
++	if (!(entry & 1)) {
++		return 0;
++	}
++	table = (uint64_t *)phystokv(entry & JT_PTE_ADDRESS);
++	return table[(gpu >> 12) & 511];
++}
++
+ /* Take one page out of the tables (redwood_mali.c:672-696's loop). */
+ static void
+ jt_unmap_page(uint64_t gpu)
+@@ -761,6 +787,53 @@
+ 		    slot, raw, jt_rd(jt_gpu, js + JT_MALI_JS_STATUS),
+ 		    jt_rd(jt_gpu, JT_MALI_MMU_INT_RAWSTAT),
+ 		    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS));
++		/* Where the walk stopped, and whether the chain we just gave
++		 * the slot is in the tables at all: a permission fault at an
++		 * address nothing maps says the driver's buffer never made it
++		 * into address space 0, not that the GPU is broken. */
++		{
++			uint32_t fs = jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_FAULTSTATUS);
++			uint64_t bad = ((uint64_t)jt_rd(jt_gpu, JT_MALI_AS0 +
++			    JT_MALI_AS_FAULTADDR_HI) << 32) |
++			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_FAULTADDR_LO);
++			uint64_t page = jt_pt_lookup(bad & ~(uint64_t)(PAGE_SIZE - 1));
++			/* AS_FAULTSTATUS: bits 0-3 say what went wrong, bits
++			 * 9:8 the access (0 atomic, 1 read, 2 write, 3
++			 * execute), bits 23:16 the unit that faulted. */
++			static const char *const acc[] = {
++				"atomic", "read", "write", "execute"
++			};
++
++			/* The faulting page against the same tables jt_map_page
++			 * fills.  An address the walk could not find means our
++			 * mapping does not cover what the job touched; an entry
++			 * that is there says the tables disagree with what the
++			 * GPU read (geometry or permission bits), which is a
++			 * different bug in a different place. */
++			printf("JACKPOTLTE MALI: fault %#llx (%s%s%s%s, %s), "
++			    "source %u, page %#llx %s, chain %#llx %s\n",
++			    (unsigned long long)bad,
++			    (fs & 1u) ? "translation " : "",
++			    (fs & 2u) ? "permission " : "",
++			    (fs & 4u) ? "transtab-bus " : "",
++			    (fs & 8u) ? "access-flag " : "",
++			    acc[(fs >> 8) & 3u],
++			    (fs >> 16) & 0xffu,
++			    (unsigned long long)page, page ? "mapped" : "NOT MAPPED",
++			    (unsigned long long)chain,
++			    jt_pt_lookup(chain) ? "mapped" : "NOT MAPPED");
++			/* What address space 0 is set up as *now*: a
++			 * transcfg of 0 or a status that is not active
++			 * means the table the job walked is not the one
++			 * jt_map_page filled. */
++			printf("JACKPOTLTE MALI: as0 transtab %#llx cfg %#x "
++			    "status %#x\n",
++			    (unsigned long long)(((uint64_t)jt_rd(jt_gpu,
++			    JT_MALI_AS0 + JT_MALI_AS_TRANSTAB_HI) << 32) |
++			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_TRANSTAB_LO)),
++			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_TRANSCFG_LO),
++			    jt_rd(jt_gpu, JT_MALI_AS0 + JT_MALI_AS_STATUS));
++		}
+ 		jt_wr(jt_gpu, JT_MALI_GPU_INT_CLEAR, 0xffffffffu);
+ 		jt_wr(jt_gpu, JT_MALI_GPU_CMD, 1u);
+ 		(void)jt_wait_reg(JT_MALI_GPU_INT_RAWSTAT,

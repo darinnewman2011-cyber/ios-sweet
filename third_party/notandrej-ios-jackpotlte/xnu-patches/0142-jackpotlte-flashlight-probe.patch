@@ -1,0 +1,189 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 051083d..35353f8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
+ bsd/dev/a5xelte_wifi.c			standard
++bsd/dev/a5xelte_flashlight.c		standard
+ bsd/dev/jackpotlte_pmic.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/a5xelte_flashlight.c b/bsd/dev/a5xelte_flashlight.c
+new file mode 100644
+index 0000000..006a25e
+--- /dev/null
++++ b/bsd/dev/a5xelte_flashlight.c
+@@ -0,0 +1,148 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) camera flash / torch LED:
++ * probe of the KTD2692 single-wire control line.
++ *
++ * The board's flash LED controller is a Kinetic KTD2692 (compatible "ktd2692",
++ * exynos7885-jackpotlte_common.dtsi:1537-1552).  It is NOT on I2C and has no
++ * ID or status register: it is a write-only single-wire (S-Wire) part driven by
++ * one GPIO, flash_control = <&gpg1 2 0x1> (exynos7885-jackpotlte_common.dtsi:1539).
++ * Samsung's driver toggles that GPIO with microsecond timing to send 8-bit
++ * frames (details in the comment block at the bottom; Eureka-Kernel
++ * drivers/leds/leds-ktd2692.c, include/linux/leds-ktd2692.h).
++ *
++ * Because the part cannot be read, the only state observable from software is
++ * the pin controller's view of the line: gpg1 is a TOP pin-controller bank
++ * (pinctrl@139B0000, exynos7885.dtsi:631-633) at pctl_offset 0x140 with
++ * bank_type_6 register offsets CON 0x00 / DAT 0x04 / PUD 0x08
++ * (drivers/pinctrl/samsung/pinctrl-exynos.c:1742, :72-75).  This file reads
++ * and prints those three registers and the pin-2 fields inside them.
++ *
++ * SAFETY: this probe is READ-ONLY and OFF BY DEFAULT.  It maps only the
++ * always-on TOP pin-controller window (the same window 0133 already reads) and
++ * performs no write.  It never drives the S-Wire line, so it cannot light the
++ * LED; the LED-enable path is documented but not executed (see below).  The
++ * whole body runs only with the "a8torch=1" boot argument; a default boot does
++ * not even map the window, so a default boot behaves exactly as before.
++ *
++ * This file is compiled for the A5XELTE machine config and emits code only for
++ * JACKPOTLTE, matching the other A8 device files (e.g. bsd/dev/a5xelte_scsc.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++void a5xelte_flashlight_probe(void);
++
++/* Pin-controller TOP, exynos7885.dtsi:631-633 (pinctrl@139B0000). */
++#define A5FL_TOP_BASE		0x139b0000UL
++#define A5FL_TOP_SIZE		0x1000UL
++/* gpg1 bank: pctl_offset 0x140 (pinctrl-exynos.c:1742); bank_type_6 CON/DAT/PUD
++ * are 0x00/0x04/0x08 (pinctrl-exynos.c:72-75). */
++#define A5FL_GPG1		0x140U
++#define A5FL_CON		0x00U
++#define A5FL_DAT		0x04U
++#define A5FL_PUD		0x08U
++
++/* flash_control = <&gpg1 2 0x1>: pin 2, flag 0x1 (GPIO_ACTIVE_LOW,
++ * include/dt-bindings/gpio/gpio.h:14).  The vendor driver drives the pin with
++ * raw __gpio_set_value(), so the flag is informational (leds-ktd2692.c:33-40). */
++#define A5FL_PIN		2U
++/* bank_type_6 CON is a 4-bit function field per pin; FUNC_OUTPUT = 0x1
++ * (pinctrl-samsung.h).  The DT "host" state muxes gpg1-2 as output
++ * (exynos7885-jackpotlte_common.dtsi:681-686) and "is" as input pull-down
++ * (:687-692). */
++#define A5FL_FUNC_MASK		0xfU
++#define A5FL_FUNC_SHIFT		(A5FL_PIN * 4U)
++
++static vm_offset_t a5fl_top;
++
++static uint32_t
++a5fl_read(uint32_t off)
++{
++	return *(volatile uint32_t *)(a5fl_top + off);
++}
++
++void
++a5xelte_flashlight_probe(void)
++{
++	int enabled = 0;
++	uint32_t con, dat, pud, func;
++
++	/* Default-inert: nothing is mapped or printed unless a8torch=1. */
++	(void)PE_parse_boot_argn("a8torch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++
++	a5fl_top = ml_io_map(A5FL_TOP_BASE, A5FL_TOP_SIZE);
++	if (a5fl_top == 0) {
++		printf("A5XELTE FLASH: TOP pinctrl map failed; skipping\n");
++		return;
++	}
++
++	con = a5fl_read(A5FL_GPG1 + A5FL_CON);
++	dat = a5fl_read(A5FL_GPG1 + A5FL_DAT);
++	pud = a5fl_read(A5FL_GPG1 + A5FL_PUD);
++	func = (con >> A5FL_FUNC_SHIFT) & A5FL_FUNC_MASK;
++
++	printf("A5XELTE FLASH: KTD2692 s-wire on gpg1-%u (single-wire, no I2C id "
++	    "register) con=%#x dat=%#x pud=%#x func=%#x line=%u\n",
++	    A5FL_PIN, con, dat, pud, func, (dat >> A5FL_PIN) & 1U);
++	printf("A5XELTE FLASH: probe only; the LED-enable path is documented in "
++	    "this file and NOT executed\n");
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * DOCUMENTED LED-ENABLE PATH (NOT EXECUTED HERE)
++ *
++ * Do not call this until the gpg1 line has been confirmed and a scope is
++ * available to check the S-Wire timing.  The protocol is from Samsung's own
++ * driver; every constant cites leds-ktd2692.c / leds-ktd2692.h in Eureka-Kernel.
++ *
++ * A frame is 8 bits, MSB first, sent by pulsing flash_control (gpg1-2):
++ *   Data Start: high for T_SOD (200 us)                        (leds-ktd2692.c:127-129)
++ *   bit '1' (high bit): low T_L_HB (5 us), high T_H_HB (80 us) (:77-98)
++ *   bit '0' (low  bit): low T_L_LB (80 us), high T_H_LB (5 us)(:42-63)
++ *   Data End:   low T_EOD_L (25 us), then high T_EOD_H (400 us)(:163-168)
++ *   (all four timings: include/linux/leds-ktd2692.h T_L_LB..T_EOD_H)
++ *
++ * Frame value = (register address) | (5-bit data):
++ *   LVP_SETTING             0x00  (leds-ktd2692.h KTD2692_ADDR_LVP_SETTING)
++ *   FLASH_TIMEOUT_SETTING   0x20
++ *   MIN_CURRENT_SETTING     0x40
++ *   MOVIE_CURRENT_SETTING   0x60
++ *   FLASH_CURRENT_SETTING   0x80
++ *   MOVIE_FLASHMODE_CONTROL 0xA0
++ *
++ * Mode words (mode_status | 0xA0; leds-ktd2692.c:295/322/352):
++ *   off   0x00 -> frame 0xA0
++ *   torch 0x01 -> frame 0xA1   (KTD2692_ENABLE_MOVIE_MODE)
++ *   flash 0x02 -> frame 0xA2   (KTD2692_ENABLE_FLASH_MODE)
++ *
++ * Torch on  (ktd2692_led_mode_ctrl state 3, leds-ktd2692.c:330-359):
++ *   pinctrl "host" (gpg1-2 output, exynos7885-jackpotlte_common.dtsi:681-686),
++ *   write MOVIE_CURRENT (0x60 | current), then write 0xA1.
++ * Torch off (state 1, :285-304): write 0xA0, then drive the line low.
++ *
++ * Current values are computed by the vendor macros from the DT; with the
++ * common-node max_current 1500 the torch level is 0x01 and movie 0x05
++ * (KTD2692_MOVIE_CURRENT, leds-ktd2692.h).  eur_open_06 overrides max_current
++ * to 1360 (exynos7885-jackpotlte_eur_open_06.dts:147); which revision this unit
++ * is, is not asserted here.
++ * ---------------------------------------------------------------------------
++ */
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++void
++a5xelte_flashlight_probe(void)
++{
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index d4f573f..87b686d 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -75,6 +75,7 @@ extern void a5xelte_touch_probe(void);
+ extern void a5xelte_usb_probe(void);
+ extern void a5xelte_scsc_probe(void);
+ extern void a5xelte_wifi_probe(void);
++extern void a5xelte_flashlight_probe(void);
+ #if defined(JACKPOTLTE)
+ extern void jackpotlte_pmic_probe(void);
+ #endif
+@@ -795,6 +796,10 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	/* Galaxy A8 2018: Apple80211 glue (en0 + SIOCS/GA80211), off unless
+ 	 * "a8wifi" is 1 (bsd/dev/a5xelte_wifi.c). */
+ 	a5xelte_wifi_probe();
++	/* Galaxy A8 2018: KTD2692 flash/torch LED S-Wire line probe,
++	 * off unless "a8torch" is 1; it does not drive the LED
++	 * (bsd/dev/a5xelte_flashlight.c). */
++	a5xelte_flashlight_probe();
+ #endif
+ 	{
+ 	uint32_t emmcprobe = 0;

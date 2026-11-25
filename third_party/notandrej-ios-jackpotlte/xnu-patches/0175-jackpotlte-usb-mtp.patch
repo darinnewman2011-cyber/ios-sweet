@@ -1,0 +1,458 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -279,21 +279,34 @@ a5xelte_usb_probe(void)
+ #define A8_TRBCTL_DATA     (5u << 4)
+ #define A8_TRBCTL_NORMAL   (1u << 4)
+ 
+-/* ---- the gadget's DMA area (contiguous, 4 KiB) ---- */
++/* ---- the gadget's DMA area (contiguous, 20 KiB) ----
++ * Layout: the event ring, one TRB per transfer slot, the ep0 setup/data
++ * buffers, then one receive buffer per OUT endpoint and the MTP reply
++ * buffer.  Everything is physical and mapped by one kmem_alloc_contig. */
+ #define A8G_EVT        0x0000u
+ #define A8G_EVT_SIZE   0x1000u
+ #define A8G_TRB_OUT    0x1000u
+ #define A8G_TRB_IN     0x1010u
+ #define A8G_TRB_RX     0x1020u
+-#define A8G_SETUP_BUF  0x1040u
+-#define A8G_DATA_BUF   0x1100u
++#define A8G_TRB_MRX    0x1030u
++#define A8G_TRB_TX     0x1040u
++#define A8G_SETUP_BUF  0x1050u
++#define A8G_DATA_BUF   0x1080u
+ #define A8G_RX         0x2000u
+ #define A8G_RX_MAX     0x800u
+-#define A8G_DMA_SIZE   0x4000u
+-
+-/* Physical endpoints: 2n = OUT, 2n+1 = IN (DWC3 numbering). */
++#define A8G_MRX        0x2800u
++#define A8G_MRX_MAX    0x1800u
++#define A8G_TX         0x4000u
++#define A8G_TX_MAX     0x1000u
++#define A8G_DMA_SIZE   0x5000u
++
++/* Physical endpoints: 2n = OUT, 2n+1 = IN (DWC3 numbering).
++ *   2/3  vendor interface bulk OUT/IN      (endpoint addresses 0x01/0x81)
++ *   4/5  MTP/PTP interface bulk OUT/IN     (endpoint addresses 0x02/0x82) */
+ #define A8G_EP_RX      2u
+ #define A8G_EP_TX      3u
++#define A8G_EP_MRX     4u
++#define A8G_EP_MTX     5u
+ 
+ /* ---- Samsung combo PHY v3.0.0 (phy-exynos-usb3p1-reg.h) ----
+  * The board sets is_not_vbus_pad = <1> (exynos7885.dtsi, dwc3 node), so the
+@@ -421,9 +434,15 @@ a8g_stall(void)
+ /*
+  * The identity: Apple's vendor ID and the iPhone 8/8 Plus/X product ID, with
+  * the strings a host shows.  lsusb prints the vendor's name from its own table
+- * and this product string, so it reads "Apple, Inc. iPhone".  Interface 0 is
+- * the vendor-specific one an iPhone exposes in normal mode (0xff/0xfe/0x02)
+- * with a bulk pair -- the interface libusb and usbmuxd look for.
++ * (05ac:12a8 is "Apple, Inc. iPhone 5/5C/5S/6/SE/7/8/X/XR") and `lsusb -v`
++ * shows this product string, so both read Apple iPhone.  Interface 0 is the
++ * vendor-specific one an iPhone exposes in normal mode (0xff/0xfe/0x02) with
++ * a bulk pair -- the interface libusb and usbmuxd look for.
++ *
++ * Interface 1 is the PTP still-image class (0x06/0x01/0x01) that MTP runs on,
++ * so the same device also shows up as a media/camera device with a writable
++ * store.  An iPhone does not expose that interface itself, but the host picks
++ * the function it recognises per interface, so both views coexist.
+  */
+ static const uint8_t a8g_dev_desc[18] = {
+ 	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+@@ -433,11 +452,14 @@ static const uint8_t a8g_dev_desc[18] = {
+ 	1, 2, 3,                /* manufacturer, product, serial strings */
+ 	1,
+ };
+-static const uint8_t a8g_cfg_desc[32] = {
+-	9, 2, 32, 0, 1, 1, 0, 0x80, 250,       /* config: 1 interface, 500 mA */
++static const uint8_t a8g_cfg_desc[55] = {
++	9, 2, 55, 0, 2, 1, 0, 0x80, 250,       /* config: 2 interfaces, 500 mA */
+ 	9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,    /* iface 0: vendor, 2 bulk eps */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,       /* ep 0x01 bulk OUT, 512 */
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,       /* ep 0x81 bulk IN, 512 */
++	9, 4, 1, 0, 2, 0x06, 0x01, 0x01, 0,    /* iface 1: PTP/MTP, 2 bulk eps */
++	7, 5, 0x02, 0x02, 0x00, 0x02, 0,       /* ep 0x02 bulk OUT, 512 */
++	7, 5, 0x82, 0x02, 0x00, 0x02, 0,       /* ep 0x82 bulk IN, 512 */
+ };
+ /* High-speed device qualifier: a high-speed-capable device answers it. */
+ static const uint8_t a8g_qual_desc[10] = {
+@@ -474,11 +496,13 @@ a8g_rx_arm(void)
+ 	a8g_start_trb(A8G_EP_RX, A8G_TRB_RX, A8G_RX, A8G_RX_MAX, A8_TRBCTL_NORMAL);
+ }
+ 
++static void
++mtp_rx_arm(void);
++
+ /*
+- * SET_CONFIGURATION(1): the vendor interface's bulk pair.  Nothing is expected
+- * on them yet, so OUT data is read and dropped; what matters here is that the
+- * endpoints exist, which is what lets the host finish configuring and the
+- * device stay enumerated.
++ * SET_CONFIGURATION(1): both interfaces' bulk pairs.  Interface 0 has nothing
++ * listening, so its OUT data is read and dropped; interface 1 is the MTP
++ * responder, whose OUT endpoint is armed for a command container.
+  */
+ static void
+ a8g_configure(void)
+@@ -494,14 +518,35 @@ a8g_configure(void)
+ 	    (2u << 1) | (512u << 3) | (1u << 17),
+ 	    (1u << 8) | ((uint32_t)A8G_EP_TX << 25), 0) ||
+ 	    a8g_epcmd(A8G_EP_TX, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("A5XELTE USB: data endpoints setup failed\n");
++		printf("A5XELTE USB: vendor endpoints setup failed\n");
+ 		return;
+ 	}
+ 	a8_dwc_wr(A8_DALEPENA, a8_usb_rd(a8g.dwc, A8_DALEPENA) |
+ 	    (1u << A8G_EP_RX) | (1u << A8G_EP_TX));
+ 	a8g.configured = true;
+ 	a8g_rx_arm();
+-	printf("A5XELTE USB: configured, bulk 0x01/0x81 armed\n");
++	printf("A5XELTE USB: configured, vendor 0x01/0x81 armed\n");
++
++	/*
++	 * The PTP pair is best effort: if this core has fewer endpoints than
++	 * the numbering assumes, the interface stays in the descriptor and the
++	 * device still enumerates with its identity, so a failure here is a
++	 * log line rather than a dead gadget.
++	 */
++	if (a8g_epcmd(A8G_EP_MRX, A8_DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3),
++	    (1u << 8) | ((uint32_t)A8G_EP_MRX << 25), 0) ||
++	    a8g_epcmd(A8G_EP_MRX, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    a8g_epcmd(A8G_EP_MTX, A8_DEPCMD_SETEPCONFIG,
++	    (2u << 1) | (512u << 3) | (1u << 17),
++	    (1u << 8) | ((uint32_t)A8G_EP_MTX << 25), 0) ||
++	    a8g_epcmd(A8G_EP_MTX, A8_DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("A5XELTE USB: MTP endpoints not available on this core\n");
++		return;
++	}
++	a8_dwc_wr(A8_DALEPENA, a8_usb_rd(a8g.dwc, A8_DALEPENA) |
++	    (1u << A8G_EP_MRX) | (1u << A8G_EP_MTX));
++	mtp_rx_arm();
++	printf("A5XELTE USB: MTP 0x02/0x82 armed\n");
+ }
+ 
+ static void
+@@ -588,6 +633,299 @@ a8g_setup(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * MTP / PTP responder (interface 1, bulk 0x02/0x82)
++ * ---------------------------------------------------------------------------
++ *
++ * Interface 1 is the PTP still-image class (0x06/0x01/0x01); MTP is PTP plus
++ * Microsoft's vendor extension (VendorExtensionID 6).  The host sends command
++ * containers on bulk OUT and reads zero, one or two containers on bulk IN:
++ *
++ *   u32 length of the whole container, u16 type, u16 code, u32 transaction id,
++ *   then up to five u32 parameters, or the data set.
++ *
++ * Types: 1 command, 2 data, 3 response, 4 event.  A data reply is a type-2
++ * container carrying the command's own code, followed by a type-3 response
++ * with 0x2001 (OK); both go out in one bulk transfer, which is legal because
++ * PTP over USB is a byte stream and the host reads each container by its own
++ * length field.
++ *
++ * Only what a host needs to see the device and its store is answered: device
++ * info, the one storage, and empty object listings.  Everything else gets a
++ * PTP error response (never a stall), so the host keeps its bulk pipes and
++ * names the refusal instead of dropping the device.
++ */
++
++#define MTP_STORAGE_ID          0x00010001u
++
++#define PTP_OC_GET_DEVICE_INFO  0x1001u
++#define PTP_OC_OPEN_SESSION     0x1002u
++#define PTP_OC_CLOSE_SESSION    0x1003u
++#define PTP_OC_GET_STORAGE_IDS  0x1004u
++#define PTP_OC_GET_STORAGE_INFO 0x1005u
++#define PTP_OC_GET_NUM_OBJECTS  0x1006u
++#define PTP_OC_GET_OBJ_HANDLES  0x1007u
++#define PTP_OC_GET_OBJECT_INFO  0x1008u
++#define PTP_OC_DELETE_OBJECT    0x100bu
++
++#define PTP_RC_OK               0x2001u
++#define PTP_RC_GENERAL_ERROR    0x2002u
++#define PTP_RC_SESSION_NOT_OPEN 0x2003u
++#define PTP_RC_INVALID_TID      0x2004u
++#define PTP_RC_NOT_SUPPORTED    0x2005u
++#define PTP_RC_INVALID_HANDLE   0x2009u
++#define PTP_RC_INVALID_STORAGE  0x200cu
++
++static bool mtp_open;
++
++static uint32_t
++mtp_le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t
++mtp_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint8_t *
++mtp_put16(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	return p + 2;
++}
++
++static uint8_t *
++mtp_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++	return p + 4;
++}
++
++static uint8_t *
++mtp_put64(uint8_t *p, uint64_t v)
++{
++	p = mtp_put32(p, (uint32_t)v);
++	return mtp_put32(p, (uint32_t)(v >> 32));
++}
++
++/* PTP string: u8 character count including the terminator, then UTF-16LE. */
++static uint8_t *
++mtp_putstr(uint8_t *p, const char *s)
++{
++	uint8_t *lenp = p++;
++	uint32_t n = 0;
++
++	while (*s && n < 254) {
++		*p++ = (uint8_t)*s++;
++		*p++ = 0;
++		n++;
++	}
++	*p++ = 0;
++	*p++ = 0;
++	*lenp = (uint8_t)(n + 1);
++	return p;
++}
++
++static uint8_t *
++mtp_hdr(uint8_t *p, uint32_t type, uint32_t code, uint32_t tid)
++{
++	p = mtp_put32(p, 0);            /* length, filled in by the caller */
++	p = mtp_put16(p, type);
++	p = mtp_put16(p, code);
++	return mtp_put32(p, tid);
++}
++
++static void
++mtp_send(uint8_t *end)
++{
++	uint8_t *buf = (uint8_t *)(a8g.dma + A8G_TX);
++	uint32_t len = (uint32_t)(end - buf);
++
++	if (len > A8G_TX_MAX) {
++		return;
++	}
++	a8g_start_trb(A8G_EP_MTX, A8G_TRB_TX, A8G_TX, len, A8_TRBCTL_NORMAL);
++}
++
++static void
++mtp_response(uint32_t tid, uint32_t code, uint32_t np, const uint32_t *params)
++{
++	uint8_t *buf = (uint8_t *)(a8g.dma + A8G_TX);
++	uint8_t *p = mtp_hdr(buf, 3, code, tid);
++	uint32_t i;
++
++	for (i = 0; i < np; i++) {
++		p = mtp_put32(p, params[i]);
++	}
++	mtp_put32(buf, (uint32_t)(p - buf));
++	mtp_send(p);
++}
++
++static void
++mtp_response1(uint32_t tid, uint32_t code, uint32_t param)
++{
++	mtp_response(tid, code, 1, &param);
++}
++
++/* Start a data container at the head of the reply buffer. */
++static uint8_t *
++mtp_data(uint32_t tid, uint32_t code)
++{
++	return mtp_hdr((uint8_t *)(a8g.dma + A8G_TX), 2, code, tid);
++}
++
++/* Close the data container `start`, append an OK response, send both. */
++static void
++mtp_data_done(uint8_t *start, uint8_t *p, uint32_t tid)
++{
++	uint8_t *r = p;
++
++	mtp_put32(start, (uint32_t)(p - start));
++	p = mtp_hdr(r, 3, PTP_RC_OK, tid);
++	mtp_put32(r, (uint32_t)(p - r));
++	mtp_send(p);
++}
++
++static void
++mtp_handle(const uint8_t *in, uint32_t inlen)
++{
++	uint32_t len = mtp_le32(in);
++	uint32_t type = mtp_le16(in + 4);
++	uint32_t code = mtp_le16(in + 6);
++	uint32_t tid = mtp_le32(in + 8);
++	uint8_t *d;
++
++	printf("A5XELTE MTP: %s %04x tid %u len %u\n",
++	    type == 1 ? "cmd" : type == 2 ? "data" : "?", code, tid, len);
++	if (type != 1) {
++		/* Data for an operation that was already refused: no reply. */
++		return;
++	}
++	if (len < 12 || len > inlen) {
++		mtp_response(tid, PTP_RC_GENERAL_ERROR, 0, NULL);
++		return;
++	}
++	if (!mtp_open && code != PTP_OC_OPEN_SESSION &&
++	    code != PTP_OC_GET_DEVICE_INFO) {
++		mtp_response(tid, PTP_RC_SESSION_NOT_OPEN, 0, NULL);
++		return;
++	}
++
++	switch (code) {
++	case PTP_OC_OPEN_SESSION:
++		mtp_open = true;
++		mtp_response(tid, PTP_RC_OK, 0, NULL);
++		break;
++
++	case PTP_OC_CLOSE_SESSION:
++		mtp_open = false;
++		mtp_response(tid, PTP_RC_OK, 0, NULL);
++		break;
++
++	case PTP_OC_GET_DEVICE_INFO:
++		d = mtp_data(tid, code);
++		d = mtp_put16(d, 100);          /* standard version 1.00 */
++		d = mtp_put32(d, 6);            /* Microsoft vendor extension */
++		d = mtp_put16(d, 100);
++		d = mtp_putstr(d, "microsoft.com: 1.0");
++		d = mtp_put16(d, 0);            /* functional mode: standard */
++		/* operations supported, 0-terminated */
++		d = mtp_put16(d, PTP_OC_GET_DEVICE_INFO);
++		d = mtp_put16(d, PTP_OC_OPEN_SESSION);
++		d = mtp_put16(d, PTP_OC_CLOSE_SESSION);
++		d = mtp_put16(d, PTP_OC_GET_STORAGE_IDS);
++		d = mtp_put16(d, PTP_OC_GET_STORAGE_INFO);
++		d = mtp_put16(d, PTP_OC_GET_NUM_OBJECTS);
++		d = mtp_put16(d, PTP_OC_GET_OBJ_HANDLES);
++		d = mtp_put16(d, 0);
++		d = mtp_put16(d, 0);            /* events: none */
++		d = mtp_put16(d, 0);            /* device properties: none */
++		d = mtp_put16(d, 0x3801);       /* capture format: EXIF/JPEG */
++		d = mtp_put16(d, 0);
++		d = mtp_put16(d, 0x3801);       /* image format: EXIF/JPEG */
++		d = mtp_put16(d, 0);
++		d = mtp_putstr(d, "A5XELTE");
++		d = mtp_putstr(d, "iPhone");
++		d = mtp_putstr(d, "16.7.16");
++		d = mtp_putstr(d, "D22AP0000001");
++		mtp_data_done((uint8_t *)(a8g.dma + A8G_TX), d, tid);
++		break;
++
++	case PTP_OC_GET_STORAGE_IDS:
++		d = mtp_data(tid, code);
++		d = mtp_put32(d, 1);
++		d = mtp_put32(d, MTP_STORAGE_ID);
++		mtp_data_done((uint8_t *)(a8g.dma + A8G_TX), d, tid);
++		break;
++
++	case PTP_OC_GET_STORAGE_INFO:
++		if (len < 16 || mtp_le32(in + 12) != MTP_STORAGE_ID) {
++			mtp_response(tid, PTP_RC_INVALID_STORAGE, 0, NULL);
++			break;
++		}
++		d = mtp_data(tid, code);
++		d = mtp_put16(d, 4);            /* storage type: fixed RAM */
++		d = mtp_put16(d, 2);            /* filesystem: generic hierarchy */
++		d = mtp_put16(d, 0);            /* access: read-write */
++		d = mtp_put64(d, 32ull << 30);  /* capacity */
++		d = mtp_put64(d, 8ull << 30);   /* free space in bytes */
++		d = mtp_put32(d, 0);            /* free space in objects unknown */
++		d = mtp_putstr(d, "iOS");
++		d = mtp_putstr(d, "");
++		mtp_data_done((uint8_t *)(a8g.dma + A8G_TX), d, tid);
++		break;
++
++	case PTP_OC_GET_NUM_OBJECTS:
++		mtp_response1(tid, PTP_RC_OK, 0);
++		break;
++
++	case PTP_OC_GET_OBJ_HANDLES:
++		d = mtp_data(tid, code);
++		d = mtp_put32(d, 0);            /* no objects yet */
++		mtp_data_done((uint8_t *)(a8g.dma + A8G_TX), d, tid);
++		break;
++
++	case PTP_OC_GET_OBJECT_INFO:
++	case PTP_OC_DELETE_OBJECT:
++		mtp_response(tid, PTP_RC_INVALID_HANDLE, 0, NULL);
++		break;
++
++	default:
++		mtp_response(tid, PTP_RC_NOT_SUPPORTED, 0, NULL);
++		break;
++	}
++}
++
++static void
++mtp_rx_arm(void)
++{
++	a8g_start_trb(A8G_EP_MRX, A8G_TRB_MRX, A8G_MRX, A8G_MRX_MAX,
++	    A8_TRBCTL_NORMAL);
++}
++
++static void
++mtp_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(a8g.dma + A8G_TRB_MRX);
++	uint32_t len;
++
++	a8g_sync(A8G_TRB_MRX, 16);
++	len = A8G_MRX_MAX - (t[2] & 0xffffffu);
++	a8g_sync(A8G_MRX, A8G_MRX_MAX);
++	if (len >= 12) {
++		mtp_handle((const uint8_t *)(a8g.dma + A8G_MRX), len);
++	}
++	mtp_rx_arm();
++}
++
+ static void
+ a8g_event(uint32_t ev)
+ {
+@@ -598,6 +936,7 @@ a8g_event(uint32_t ev)
+ 			a8_dwc_wr(A8_DCFG,
+ 			    a8_usb_rd(a8g.dwc, A8_DCFG) & ~(0x7fu << 3));
+ 			a8g.configured = false;
++			mtp_open = false;
+ 			printf("A5XELTE USB: bus reset\n");
+ 		} else if (type == 2) {         /* connect done */
+ 			uint32_t speed = a8_usb_rd(a8g.dwc, A8_DSTS) & 7;
+@@ -622,9 +961,13 @@ a8g_event(uint32_t ev)
+ 		a8g_rx_arm();           /* drop whatever the host sent */
+ 		return;
+ 	}
+-	if (ep == A8G_EP_TX && type == 1) {
++	if (ep == A8G_EP_MRX && type == 1) {
++		mtp_rx_done();
+ 		return;
+ 	}
++	if ((ep == A8G_EP_TX || ep == A8G_EP_MTX) && type == 1) {
++		return;                 /* bulk IN finished */
++	}
+ 	if (ep > 1) {
+ 		return;
+ 	}

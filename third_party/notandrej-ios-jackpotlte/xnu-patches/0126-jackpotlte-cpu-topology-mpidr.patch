@@ -1,0 +1,38 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -85,14 +85,32 @@
+ 		return false;
+ 	}
+ #if defined(A5XELTE)
+-	/* Linux's Exynos7580 DT: logical 0..3 = MPIDR 0..3;
+-	 * logical 4..7 = MPIDR 0x100..0x103. */
+ #if defined(DREAMLTE)
+ 	/* Exynos 8895: logical 0..3 = A53 MPIDR 0x100..0x103 (boot cluster);
+ 	 * logical 4..7 = Mongoose M2 MPIDR 0..3. */
+ 	uint32_t expected_mpidr = cpu->cpu_id < 4 ? 0x100U + cpu->cpu_id :
+ 	    cpu->cpu_id - 4;
++#elif defined(JACKPOTLTE)
++	/*
++	 * Samsung's exynos7885.dtsi (Eureka-Kernel): cpu0-3 = A53 MPIDR
++	 * 0x100-0x103, cpu4-5 = A53 MPIDR 0x200-0x201, cpu6-7 = A73 MPIDR
++	 * 0x0-0x1. tools/mkadt_jackpotlte.py emits the ADT cpu nodes in this
++	 * same order, and ml_parse_cpu_topology() numbers them by
++	 * enumeration, so the logical cpu_id indexes this table. The 0128
++	 * boot panic was cpu=0 mpidr=0x100 count=1 against the Exynos7580
++	 * default below, which expects cpu0 at MPIDR 0.
++	 */
++	uint32_t expected_mpidr;
++	if (cpu->cpu_id < 4) {
++		expected_mpidr = 0x100U + cpu->cpu_id;
++	} else if (cpu->cpu_id < 6) {
++		expected_mpidr = 0x200U + (cpu->cpu_id - 4);
++	} else {
++		expected_mpidr = cpu->cpu_id - 6;
++	}
+ #else
++	/* Linux's Exynos7580 DT: logical 0..3 = MPIDR 0..3;
++	 * logical 4..7 = MPIDR 0x100..0x103. */
+ 	uint32_t expected_mpidr = cpu->cpu_id < 4 ? cpu->cpu_id :
+ 	    0x100U + cpu->cpu_id - 4;
+ #endif

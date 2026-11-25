@@ -1,0 +1,749 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4f42612..0ca919b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/jackpotlte_mali.c		standard
+ bsd/dev/a5xelte_usb.c			standard
+ bsd/dev/a5xelte_scsc.c			standard
++bsd/dev/a5xelte_bt.c			standard
+ bsd/dev/a5xelte_sensors.c		standard
+ bsd/dev/a5xelte_wifi.c			standard
+ bsd/dev/a5xelte_flashlight.c		standard
+diff --git a/bsd/dev/a5xelte_bt.c b/bsd/dev/a5xelte_bt.c
+new file mode 100644
+index 0000000..a595da6
+--- /dev/null
++++ b/bsd/dev/a5xelte_bt.c
+@@ -0,0 +1,528 @@
++/*
++ * Galaxy A8 2018 (SM-A530F, jackpotlte, Exynos7885) Bluetooth endpoint over
++ * the Samsung SCSC / Maxwell (MX140) shared-memory protocol.
++ *
++ * The BT controller is a service of the same R4 that the WiFi transport in
++ * bsd/dev/a5xelte_scsc.c starts.  The transport patch (0181/0182) owns the
++ * firmware, the mailbox, the MIF window and the mxmgmt stream; this file adds
++ * the Bluetooth service on top of it:
++ *
++ *   - allocates the BHCS (Bluetooth Host Configuration Structure, bhcs.h:39-50)
++ *     and the BSMHCP_PROTOCOL block (bsmhcp.h:274-321) in MIF shared DRAM;
++ *   - allocates the three interrupt bits the vendor BT driver uses, in its
++ *     order (bg_to_ap to-host, then ap_to_bg and ap_to_fg from-host), and
++ *     publishes them in the BSMHCP header;
++ *   - asks the service manager to start service id 2 with an
++ *     SM_MSG_START_REQ carrying the BHCS offset, and waits for
++ *     SM_MSG_START_CFM (servman_messages.h:14-33, scsc_service.c:146-168);
++ *   - writes one HCI command into the command transfer ring and reads the
++ *     HCI event transfer ring.  The packet inside the rings is the HCI packet
++ *     without the H4 type byte: commands are [opcode lo, opcode hi, plen,
++ *     params...] and events are [event code, plen, params...].  The boot-time
++ *     proof is an HCI Reset (opcode 0x0c03, no parameters) followed by its
++ *     Command Complete (event 0x0e);
++ *   - has a single-packet ACL TX path (one buffer, no fragmentation) that no
++ *     caller uses yet, because there is no HCI device node.
++ *
++ * Everything runs in thread context: the mailbox is polled by the SCSC
++ * transport thread, which calls this file's interrupt-bit handler
++ * (a5scsc_bt_evt) for the bg_to_ap bit.  Nothing here runs in an ISR.
++ *
++ * NOT implemented, on purpose, and listed as stubs in PORT-START.md:
++ *   - no HCI character device or Bluetooth stack interface, so there is no
++ *     path for a host stack to open the controller yet, and therefore no user
++ *     of a5scsc_bt_acl_send();
++ *   - ACL RX, AVDTP detection, timing packets, IQ reports, the BT log rings and
++ *     the A-box audio window (the jackpotlte DT's btabox node carries no reg,
++ *     so the vendor driver maps that window as zero too);
++ *   - the Bluetooth device address is left 0 (vendor default: it comes from
++ *     the SoC unique id or a stack-supplied value, neither available here);
++ *   - the BSMHCP configuration blob (mx140 *.hcf) is not loaded;
++ *   - no stop/restart path.
++ *
++ * Gate: the whole endpoint runs only with the "a8bt" boot argument set to 1,
++ * independently of "a8wifi".  Without it the probe returns immediately.
++ */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && defined(JACKPOTLTE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++#include "a5xelte_scsc.h"
++#include "a5xelte_bt.h"
++
++void a5xelte_bt_probe(void);
++
++/* ---- device state --------------------------------------------------------- */
++
++struct a5bt_softc {
++	uint32_t          bhcs_ref;      /* MIF offset of struct BHCS       */
++	uint32_t          proto_ref;     /* MIF offset of BSMHCP_PROTOCOL   */
++	volatile uint8_t *proto;         /* its MIF VA                      */
++
++	int               bit_tohost;    /* bg_to_ap_int_src                */
++	int               bit_from_bg;   /* ap_to_bg_int_src                */
++	int               bit_from_fg;   /* ap_to_fg_int_src                */
++
++	/* Written by the poll thread, read by the bring-up thread. */
++	volatile bool     start_cfm;
++	volatile bool     reset_cc;
++	volatile uint32_t events;
++	volatile uint32_t last_cc_opcode;
++	volatile bool     panic_seen;
++	volatile uint32_t unknown_sm;
++
++	/* ACL TX buffers.  The vendor keeps a bitmap and learns about released
++	 * buffers from the acl_tx_free ring (scsc_shm.c:1082-1150,
++	 * 425-470).  Only 30 of the 32 ring entries own a data buffer. */
++	uint8_t           acl_busy[A5BT_ACL_BUFFERS];
++	uint32_t          acl_last;
++	uint32_t          acl_count;    /* buffers currently owned by a packet */
++	uint32_t          acl_free_seen;
++};
++
++static struct a5bt_softc a5bt;
++
++/* ---- shared-memory accessors ----------------------------------------------
++ * Same 32-bit little-endian accesses as the transport, on a MIF offset.
++ * The BSMHCP block is MIF DRAM (non-cacheable), so unaligned access is fine;
++ * keep it word-based anyway to match the vendor driver's plain C accesses.
++ */
++
++static inline uint32_t
++a5bt_rd32(volatile uint8_t *base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++a5bt_wr32(volatile uint8_t *base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static inline uint16_t
++a5bt_rd16(volatile uint8_t *base, uint32_t off)
++{
++	return *(volatile uint16_t *)(base + off);
++}
++
++static inline void
++a5bt_wr16(volatile uint8_t *base, uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(base + off) = v;
++}
++
++static inline void
++a5bt_mb(void)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++}
++
++/* ---- HCI command transfer ring -------------------------------------------
++ * struct BSMHCP_TD_CONTROL { u16 length; u8 data[258]; }, eight entries, one
++ * slot always free (bsmhcp.h:107-111, 278-281; scsc_shm.c:212-256).
++ * `data` is the HCI command packet without the H4 type byte, and `length` is
++ * 3 + parameter length: the vendor strips the type before the ring
++ * (scsc_shm.c:1482, 213-215).
++ */
++static bool
++a5bt_hci_cmd(const uint8_t *cmd, uint32_t len)
++{
++	uint32_t w, r;
++	volatile uint8_t *td;
++
++	if (!a5bt.proto || cmd == NULL || len == 0 ||
++	    len > A5BT_HCI_DATA_MAX) {
++		return false;
++	}
++	w = a5bt_rd32(a5bt.proto, A5BT_H_CMD_WRITE);
++	r = a5bt_rd32(a5bt.proto, A5BT_H_CMD_READ);
++	if (w >= A5BT_HCI_CMD_SLOTS || r >= A5BT_HCI_CMD_SLOTS) {
++		return false;
++	}
++	if (((w + 1) % A5BT_HCI_CMD_SLOTS) == r) {
++		return false;           /* ring full (BSMHCP_HAS_ROOM) */
++	}
++	td = a5bt.proto + A5BT_HCI_CMD_RING + w * A5BT_HCI_CMD_ENTRY;
++	memcpy((void *)(td + A5BT_HCI_DATA_OFF), cmd, len);
++	a5bt_wr16(td, 0, (uint16_t)len);
++	a5bt_mb();
++	a5bt_wr32(a5bt.proto, A5BT_H_CMD_WRITE,
++	    (w + 1) % A5BT_HCI_CMD_SLOTS);
++	a5bt_mb();
++	/* Wake the firmware's Bluetooth side (scsc_shm.c:255-258). */
++	a5scsc_irq_bit_set(a5bt.bit_from_bg, A5SCSC_MIF_TARGET_R4);
++	return true;
++}
++
++/* ---- ACL TX (single packet, no fragmentation) -----------------------------
++ * The firmware returns used data buffers through the acl_tx_free ring
++ * (struct BSMHCP_TD_ACL_TX_FREE { u8 buffer_index; u8 reserved; u16 handle; },
++ * bsmhcp.h:150-154).  Reap them before allocating, like
++ * scsc_shm.c:425-470 does.
++ */
++static void
++a5bt_acl_reap(void)
++{
++	uint32_t r, w, n = 0;
++	uint8_t idx;
++
++	if (!a5bt.proto) {
++		return;
++	}
++	r = a5bt_rd32(a5bt.proto, A5BT_H_ACL_FREE_READ);
++	w = a5bt_rd32(a5bt.proto, A5BT_H_ACL_FREE_WRITE);
++	while (r != w && n < A5BT_ACL_FREE_SLOTS && r < A5BT_ACL_FREE_SLOTS) {
++		idx = *(a5bt.proto + A5BT_ACL_FREE_RING +
++		    r * A5BT_ACL_FREE_ENTRY);
++		if (idx < A5BT_ACL_BUFFERS && a5bt.acl_busy[idx]) {
++			a5bt.acl_busy[idx] = 0;
++			a5bt.acl_count--;
++			a5bt.acl_free_seen++;
++		}
++		r = (r + 1) % A5BT_ACL_FREE_SLOTS;
++		a5bt_mb();
++		a5bt_wr32(a5bt.proto, A5BT_H_ACL_FREE_READ, r);
++		w = a5bt_rd32(a5bt.proto, A5BT_H_ACL_FREE_WRITE);
++		n++;
++	}
++}
++
++/* Hands one ACL packet (L2CAP payload, no H4 header) to the firmware.
++ * `flags` are the HCI PB/BC bits already shifted into place, and
++ * `l2cap_cid`/`handle` come from the caller's packet header.  Fragmentation
++ * (PB = continuation) is not supported: one call is one whole packet, which
++ * is what BSMHCP_TD_ACL_TX_DATA describes.  No caller exists yet; see the file
++ * comment.
++ */
++int
++a5scsc_bt_acl_send(uint16_t handle, uint8_t flags, uint16_t l2cap_cid,
++    const void *payload, uint32_t len)
++{
++	uint32_t w, r, i, idx = A5BT_ACL_BUFFERS;
++	volatile uint8_t *td;
++
++	if (a5bt.proto == NULL || payload == NULL || len == 0 ||
++	    len > A5BT_ACL_BUF_STRIDE) {
++		return EINVAL;
++	}
++	w = a5bt_rd32(a5bt.proto, A5BT_H_ACL_TX_WRITE);
++	r = a5bt_rd32(a5bt.proto, A5BT_H_ACL_TX_READ);
++	if (w >= A5BT_ACL_TX_SLOTS || r >= A5BT_ACL_TX_SLOTS) {
++		return EIO;
++	}
++	if (((w + 1) % A5BT_ACL_TX_SLOTS) == r) {
++		return EAGAIN;          /* transfer ring full */
++	}
++	for (i = 0; i < A5BT_ACL_BUFFERS; i++) {
++		/* same probe order as scsc_shm.c:245-252 */
++		if (++a5bt.acl_last == A5BT_ACL_BUFFERS) {
++			a5bt.acl_last = 0;
++		}
++		if (a5bt.acl_busy[a5bt.acl_last] == 0) {
++			a5bt.acl_busy[a5bt.acl_last] = 1;
++			idx = a5bt.acl_last;
++			a5bt.acl_count++;
++			break;
++		}
++	}
++	if (idx == A5BT_ACL_BUFFERS) {
++		return EAGAIN;          /* no free data buffer */
++	}
++	memcpy((void *)(a5bt.proto + A5BT_ACL_TX_BUFFER +
++	    idx * A5BT_ACL_BUF_STRIDE), payload, len);
++	td = a5bt.proto + A5BT_ACL_TX_RING + w * A5BT_ACL_TX_ENTRY;
++	a5bt_wr16(td, A5BT_ACL_TD_LENGTH, (uint16_t)len);
++	*(td + A5BT_ACL_TD_BUFFER) = (uint8_t)idx;
++	*(td + A5BT_ACL_TD_FLAGS) = flags;
++	a5bt_wr16(td, A5BT_ACL_TD_HANDLE, handle);
++	a5bt_wr16(td, A5BT_ACL_TD_CID, l2cap_cid);
++	a5bt_mb();
++	a5bt_wr32(a5bt.proto, A5BT_H_ACL_TX_WRITE,
++	    (w + 1) % A5BT_ACL_TX_SLOTS);
++	a5bt_mb();
++	/* ACL data wakes the foreground bit; commands use ap_to_bg
++	 * (scsc_shm.c:258 vs scsc_shm.c:429). */
++	a5scsc_irq_bit_set(a5bt.bit_from_fg, A5SCSC_MIF_TARGET_R4);
++	return 0;
++}
++
++/* ---- HCI event transfer ring ---------------------------------------------
++ * struct BSMHCP_TD_HCI_EVT { u16 length; u16 hci_connection_handle;
++ * u16 event_type; u8 data[258]; } (bsmhcp.h:112-117).  `data` starts with the
++ * HCI event code (the firmware strips the H4 type, scsc_shm.c:579-600), so
++ * data[0] == 0x0e is a Command Complete, data[1] is the parameter length and
++ * `length` is that parameter length + 2.
++ * The vendor consumer advances read index without waking the firmware
++ * (scsc_shm.c:914-985), which is what this does.
++ */
++static void
++a5bt_evt(int bit __unused, void *arg __unused)
++{
++	uint32_t r, w, n = 0;
++	volatile uint8_t *td;
++	uint16_t len;
++
++	if (!a5bt.proto) {
++		return;
++	}
++	a5bt_acl_reap();
++	r = a5bt_rd32(a5bt.proto, A5BT_H_EVT_READ);
++	w = a5bt_rd32(a5bt.proto, A5BT_H_EVT_WRITE);
++	while (r != w && n < A5BT_HCI_EVT_SLOTS && r < A5BT_HCI_EVT_SLOTS) {
++		td = a5bt.proto + A5BT_HCI_EVT_RING + r * A5BT_HCI_EVT_ENTRY;
++		len = a5bt_rd16(td, 0);
++		if (len != 0 && len <= A5BT_HCI_DATA_MAX) {
++			const volatile uint8_t *d = td + A5BT_HCI_EVT_DATA_OFF;
++
++			a5bt.events++;
++			if (len >= 6 && d[0] == 0x0e) {
++				/* Command Complete: event 0x0e, plen in d[1],
++				 * num_cmds in d[2], opcode in d[3..4] (LE),
++				 * status in d[5]. */
++				a5bt.last_cc_opcode =
++				    (uint32_t)d[3] | ((uint32_t)d[4] << 8);
++				if (a5bt.last_cc_opcode == A5BT_HCI_OP_RESET) {
++					a5bt.reset_cc = true;
++				}
++			}
++		}
++		r = (r + 1) % A5BT_HCI_EVT_SLOTS;
++		a5bt_mb();
++		a5bt_wr32(a5bt.proto, A5BT_H_EVT_READ, r);
++		/* Firmware may have added more while we were copying. */
++		w = a5bt_rd32(a5bt.proto, A5BT_H_EVT_WRITE);
++		n++;
++	}
++	if (a5bt_rd16(a5bt.proto, A5BT_H_PANIC) != 0) {
++		a5bt.panic_seen = true;
++	}
++}
++
++/* ---- service manager ------------------------------------------------------
++ * sm_msg_packet is { u8 service_id; u8 msg; u32 optional_data } packed
++ * (servman_messages.h:29-33).  Payload byte 0 is the service id, so the
++ * transport's "msg" slot carries it (see a5scsc_mxmgmt_send).
++ */
++static void
++a5bt_sm(const uint8_t *p, void *arg __unused)
++{
++	if (p[0] != A5SCSC_SERVICE_ID_BT) {
++		a5bt.unknown_sm++;
++		return;
++	}
++	switch (p[1]) {
++	case A5SCSC_SM_MSG_START_CFM:
++		a5bt.start_cfm = true;
++		break;
++	case A5SCSC_SM_MSG_STOP_CFM:
++		break;
++	default:
++		a5bt.unknown_sm++;
++		break;
++	}
++}
++
++/* ---- bring-up ------------------------------------------------------------ */
++
++static void
++a5bt_sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&a5bt.proto, THREAD_UNINT, ms,
++	    1000 * NSEC_PER_USEC);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Fills BHCS (bhcs.h:39-50, setup_bhcs() in scsc_bt_module.c:556-575).  The
++ * configuration blob and the device address are intentionally zero: the
++ * vendor leaves them zero when the config file is absent, and the address
++ * comes from a source this port does not have. */
++static void
++a5bt_fill_bhcs(uint8_t *bhcs)
++{
++	bzero(bhcs, A5BT_BHCS_SIZE);
++	a5bt_wr32(bhcs, A5BT_BHCS_VERSION, A5BT_BHCS_VERSION_EXPECT);
++	a5bt_wr32(bhcs, A5BT_BHCS_PROTO_OFF, a5bt.proto_ref);
++	a5bt_wr32(bhcs, A5BT_BHCS_PROTO_LEN, A5BT_BSMHCP_SIZE);
++	/* configuration_offset/length, bluetooth_address_* stay 0. */
++	a5bt_mb();
++}
++
++/* Allocates and publishes the three interrupt bits in the vendor's order
++ * (scsc_shm.c:95-131).  Called before the service is started, because the
++ * firmware reads them out of the BSMHCP header at start. */
++static int
++a5bt_bits(void)
++{
++	a5bt.bit_tohost = a5scsc_intrbit_alloc_tohost(a5bt_evt, NULL);
++	if (a5bt.bit_tohost < 0) {
++		return ENOSPC;
++	}
++	a5bt.bit_from_bg = a5scsc_intrbit_alloc_fromhost(
++	    A5SCSC_MIF_TARGET_R4, false);
++	if (a5bt.bit_from_bg < 0) {
++		return ENOSPC;
++	}
++	a5bt.bit_from_fg = a5scsc_intrbit_alloc_fromhost(
++	    A5SCSC_MIF_TARGET_R4, false);
++	if (a5bt.bit_from_fg < 0) {
++		return ENOSPC;
++	}
++	a5bt_wr16(a5bt.proto, A5BT_H_BG_TO_AP, (uint16_t)a5bt.bit_tohost);
++	a5bt_wr16(a5bt.proto, A5BT_H_AP_TO_BG, (uint16_t)a5bt.bit_from_bg);
++	a5bt_wr16(a5bt.proto, A5BT_H_AP_TO_FG, (uint16_t)a5bt.bit_from_fg);
++	a5bt_mb();
++	return 0;
++}
++
++/* Sends SM_MSG_START_REQ(service_id = BT, optional_data = bhcs_ref) and waits
++ * for the confirmation (scsc_service.c:146-168). */
++static bool
++a5bt_service_start(uint32_t *waited_ms)
++{
++	uint8_t body[5];                /* { msg, optional_data } */
++	uint32_t waited;
++	int err;
++
++	body[0] = A5SCSC_SM_MSG_START_REQ;
++	body[1] = (uint8_t)(a5bt.bhcs_ref & 0xff);
++	body[2] = (uint8_t)((a5bt.bhcs_ref >> 8) & 0xff);
++	body[3] = (uint8_t)((a5bt.bhcs_ref >> 16) & 0xff);
++	body[4] = (uint8_t)((a5bt.bhcs_ref >> 24) & 0xff);
++	a5scsc_mxmgmt_register(A5SCSC_MMTRANS_CHAN_SERVICE, a5bt_sm, NULL);
++	err = a5scsc_mxmgmt_send(A5SCSC_MMTRANS_CHAN_SERVICE,
++	    A5SCSC_SERVICE_ID_BT, body, sizeof(body));
++	if (err != 0) {
++		*waited_ms = 0;
++		return false;
++	}
++	for (waited = 0; waited < A5SCSC_SM_TIMEOUT_MS && !a5bt.start_cfm;
++	    waited += A5SCSC_POLL_INTERVAL_MS) {
++		a5bt_sleep_ms(A5SCSC_POLL_INTERVAL_MS);
++	}
++	*waited_ms = waited;
++	return a5bt.start_cfm;
++}
++
++/* Boot-time proof that the controller is alive: HCI Reset and its Command
++ * Complete.  The command is [opcode lo, opcode hi, plen, params...]; the H4
++ * type byte exists only on the host-side H4 stream and must not be written
++ * into the ring (scsc_shm.c:1482 passes &buf[1]). */
++static bool
++a5bt_hci_reset(uint32_t *waited_ms)
++{
++	static const uint8_t reset[] = { A5BT_HCI_OP_RESET & 0xff,
++	    (A5BT_HCI_OP_RESET >> 8) & 0xff, 0x00 };
++	uint32_t waited;
++
++	if (!a5bt_hci_cmd(reset, sizeof(reset))) {
++		*waited_ms = 0;
++		return false;
++	}
++	for (waited = 0; waited < A5SCSC_SM_TIMEOUT_MS && !a5bt.reset_cc;
++	    waited += A5SCSC_POLL_INTERVAL_MS) {
++		a5bt_sleep_ms(A5SCSC_POLL_INTERVAL_MS);
++	}
++	*waited_ms = waited;
++	return a5bt.reset_cc;
++}
++
++static void
++a5bt_bringup_thread(void *param __unused, wait_result_t wr __unused)
++{
++	uint8_t *bhcs;
++	uint32_t waited;
++	int attempt;
++
++	/* Wait for the shared transport; it loads the firmware and starts the
++	 * R4 on its first successful call. */
++	for (attempt = 0; attempt < 120; attempt++) {
++		if (a5scsc_transport_up()) {
++			break;
++		}
++		a5bt_sleep_ms(250);
++	}
++	if (attempt == 120) {
++		printf("A5XELTE BT: shared SCSC transport not up; BT port disabled\n");
++		return;
++	}
++	printf("A5XELTE BT: transport: shared R4 up, allocating BT blocks\n");
++
++	if (!a5scsc_mifram_alloc(A5BT_BHCS_SIZE, A5BT_ALIGN, &a5bt.bhcs_ref) ||
++	    !a5scsc_mifram_alloc(A5BT_BSMHCP_SIZE, A5BT_ALIGN,
++	    &a5bt.proto_ref)) {
++		printf("A5XELTE BT: MIF allocation failed; BT port disabled\n");
++		return;
++	}
++	a5bt.proto = a5scsc_mifram_ptr(a5bt.proto_ref);
++	bhcs = a5scsc_mifram_ptr(a5bt.bhcs_ref);
++	if (a5bt.proto == NULL || bhcs == NULL) {
++		printf("A5XELTE BT: MIF mapping failed; BT port disabled\n");
++		return;
++	}
++	memset((void *)a5bt.proto, 0, A5BT_BSMHCP_SIZE);
++	a5bt_wr32(a5bt.proto, A5BT_H_MAGIC, A5BT_BSMHCP_MAGIC);
++	a5bt_mb();
++
++	if (a5bt_bits() != 0) {
++		printf("A5XELTE BT: interrupt-bit allocation failed; BT port disabled\n");
++		return;
++	}
++	a5bt_fill_bhcs(bhcs);
++	printf("A5XELTE BT: config: bhcs 0x%x protocol 0x%x (%u bytes), bits tohost %d fromhost %d/%d\n",
++	    a5bt.bhcs_ref, a5bt.proto_ref, A5BT_BSMHCP_SIZE,
++	    a5bt.bit_tohost, a5bt.bit_from_bg, a5bt.bit_from_fg);
++
++	if (!a5bt_service_start(&waited)) {
++		printf("A5XELTE BT: service: no SM_MSG_START_CFM in %u ms; BT port disabled\n",
++		    (unsigned)A5SCSC_SM_TIMEOUT_MS);
++		return;
++	}
++	printf("A5XELTE BT: service: SM_MSG_START_CFM after %u ms\n",
++	    waited);
++
++	if (!a5bt_hci_reset(&waited)) {
++		printf("A5XELTE BT: hci: no Command Complete for HCI Reset in %u ms (events %u, last cc opcode 0x%04x)\n",
++		    (unsigned)A5SCSC_SM_TIMEOUT_MS, a5bt.events,
++		    a5bt.last_cc_opcode);
++		return;
++	}
++	printf("A5XELTE BT: hci: reset complete after %u ms (events %u)\n",
++	    waited, a5bt.events);
++	printf("A5XELTE BT: up: controller answered HCI Reset\n");
++}
++
++/* ---- public entry point --------------------------------------------------- */
++
++void
++a5xelte_bt_probe(void)
++{
++	int enabled = 0;
++	thread_t thread = THREAD_NULL;
++
++	(void)PE_parse_boot_argn("a8bt", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	if (kernel_thread_start((thread_continue_t)a5bt_bringup_thread, NULL,
++	    &thread) != KERN_SUCCESS) {
++		printf("A5XELTE BT: bring-up thread failed to start\n");
++		return;
++	}
++	thread_deallocate(thread);
++}
++
++#else   /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
++
++void
++a5xelte_bt_probe(void)
++{
++}
++
++#endif  /* ARM64_BOARD_CONFIG_A5XELTE && JACKPOTLTE */
+\ No newline at end of file
+diff --git a/bsd/dev/a5xelte_bt.h b/bsd/dev/a5xelte_bt.h
+new file mode 100644
+index 0000000..dc09331
+--- /dev/null
++++ b/bsd/dev/a5xelte_bt.h
+@@ -0,0 +1,113 @@
++/*
++ * Layout constants for the Galaxy A8 2018 (jackpotlte) Bluetooth endpoint:
++ * the BHCS structure and the BSMHCP shared-memory protocol, as defined by the
++ * Samsung vendor driver (Eureka-Kernel/include/scsc/api/bhcs.h and
++ * bsmhcp.h) and used by drivers/misc/samsung/scsc_bt/.
++ *
++ * The structures are not copied field by field; only the pieces this port
++ * touches are named, as byte offsets into the MIF block.  The offsets and the
++ * 0x165c0 total were checked against the vendor headers with the host C
++ * compiler (offsetof/sizeof), and the BSMHCP magic value is the vendor macro
++ * evaluated at build time on that host.
++ *
++ * "AP RW / R4 RO" regions are written by a5xelte_bt.c; the rest exists so the
++ * firmware sees the layout it expects.  Anything not named here is left zero,
++ * which is also what the vendor driver does for the fields it does not set
++ * (acl_buffer_size, cmd_evt_buffer_size, acl_tx_buffers, mailbox_offset,
++ * service_request: scsc_bt_module.c:555-575, scsc_shm.c:1574-1600).
++ */
++#ifndef _A5XELTE_BT_H_
++#define _A5XELTE_BT_H_
++
++/* struct BHCS, bhcs.h:39-50.  sizeof == 28, naturally aligned; the vendor
++ * allocates it with BSMHCP_ALIGNMENT (32). */
++#define A5BT_BHCS_SIZE          28u
++#define A5BT_BHCS_VERSION       0u      /* uint32_t version, == 2 */
++#define A5BT_BHCS_PROTO_OFF     4u      /* uint32_t bsmhcp_protocol_offset */
++#define A5BT_BHCS_PROTO_LEN     8u      /* uint32_t bsmhcp_protocol_length */
++#define A5BT_BHCS_CONF_OFF      12u     /* uint32_t configuration_offset    */
++#define A5BT_BHCS_CONF_LEN      16u     /* uint32_t configuration_length    */
++#define A5BT_BHCS_LAP           20u     /* uint32_t bluetooth_address_lap   */
++#define A5BT_BHCS_UAP           24u     /* uint8_t  bluetooth_address_uap   */
++#define A5BT_BHCS_NAP           26u     /* uint16_t bluetooth_address_nap   */
++#define A5BT_BHCS_VERSION_EXPECT 2u     /* BHCS_VERSION */
++
++#define A5BT_ALIGN              32u     /* BSMHCP_ALIGNMENT */
++
++/* struct BSMHCP_PROTOCOL, bsmhcp.h:274-321. */
++#define A5BT_BSMHCP_SIZE        0x165c0u
++#define A5BT_BSMHCP_MAGIC       0x155160c2u     /* BSMHCP_PROTOCOL_MAGICVALUE */
++
++/* struct BSMHCP_HEADER (bsmhcp.h:200-272): the fields this port reads/writes.
++ * Everything else (counters, btlog enables, timing/IQ fields) stays zero. */
++#define A5BT_H_MAGIC            0x00u   /* u32  magic_value                */
++#define A5BT_H_SERVICE_REQUEST  0x06u   /* u8   service_request  (left 0)  */
++#define A5BT_H_ACL_BUF_SIZE     0x08u   /* u32  acl_buffer_size   (left 0) */
++#define A5BT_H_CMD_EVT_BUF_SIZE 0x0cu   /* u32  cmd_evt_buffer_size(0)     */
++#define A5BT_H_ACL_TX_BUFFERS   0x10u   /* u32  acl_tx_buffers     (left 0) */
++#define A5BT_H_AP_TO_BG         0x14u   /* u16  ap_to_bg_int_src           */
++#define A5BT_H_AP_TO_FG         0x16u   /* u16  ap_to_fg_int_src           */
++#define A5BT_H_BG_TO_AP         0x18u   /* u16  bg_to_ap_int_src           */
++#define A5BT_H_MAILBOX_OFFSET   0x1cu   /* u32  mailbox_offset    (left 0) */
++#define A5BT_H_CMD_WRITE        0x24u   /* u32  mailbox_hci_cmd_write      */
++#define A5BT_H_EVT_READ         0x28u   /* u32  mailbox_hci_evt_read       */
++#define A5BT_H_ACL_TX_WRITE     0x2cu   /* u32  mailbox_acl_tx_write       */
++#define A5BT_H_ACL_FREE_READ    0x30u   /* u32  mailbox_acl_free_read      */
++#define A5BT_H_ACL_RX_READ      0x34u   /* u32  mailbox_acl_rx_read        */
++#define A5BT_H_ABOX_OFFSET      0x38u   /* u32  abox_offset                */
++#define A5BT_H_ABOX_LENGTH      0x3cu   /* u32  abox_length                */
++#define A5BT_H_PANIC            0x40u   /* u16  panic_deathbed_confession  */
++#define A5BT_H_CMD_READ         0x44u   /* u32  mailbox_hci_cmd_read       */
++#define A5BT_H_EVT_WRITE        0x48u   /* u32  mailbox_hci_evt_write      */
++#define A5BT_H_CONTROLLER_FLAGS 0x4cu   /* u32  controller_flags           */
++#define A5BT_H_FW_FEATURES      0x50u   /* u32  firmware_features          */
++#define A5BT_H_SERVICE_STATE    0x56u   /* u8   service_state              */
++#define A5BT_H_ACL_TX_READ      0x60u   /* u32  mailbox_acl_tx_read        */
++#define A5BT_H_ACL_FREE_WRITE   0x64u   /* u32  mailbox_acl_free_write     */
++
++/* Transfer rings (bsmhcp.h:278-321).  An entry is a length word followed by an
++ * inline data buffer; the data starts with the H4 packet type. */
++#define A5BT_HCI_CMD_RING       0x00100u
++#define A5BT_HCI_CMD_SLOTS      8u      /* BSMHCP_TRANSFER_RING_CMD_SIZE   */
++#define A5BT_HCI_CMD_ENTRY      260u    /* u16 length + u8 data[258]       */
++#define A5BT_HCI_EVT_RING       0x0a2c0u
++#define A5BT_HCI_EVT_SLOTS      32u     /* BSMHCP_TRANSFER_RING_EVT_SIZE   */
++#define A5BT_HCI_EVT_ENTRY      264u    /* u16 length, u16 handle,
++                                         * u16 event_type, u8 data[258]    */
++#define A5BT_HCI_EVT_DATA_OFF   6u
++#define A5BT_HCI_DATA_OFF       2u
++#define A5BT_HCI_DATA_MAX       258u    /* BSMHCP_CMD_EVT_BUFFER_SIZE      */
++
++/* ACL rings, bsmhcp.h:283-321.  The TX data path is implemented as a
++ * single-packet helper; RX, AVDTP, timing, IQ and the free ring's payload
++ * format are recorded here only as far as the code needs them. */
++#define A5BT_ACL_TX_RING        0x029a0u        /* 32 x 8 bytes            */
++#define A5BT_ACL_TX_SLOTS       32u     /* BSMHCP_TRANSFER_RING_ACL_SIZE   */
++#define A5BT_ACL_TX_ENTRY       8u      /* BSMHCP_TD_ACL_TX_DATA           */
++#define A5BT_ACL_TD_LENGTH      0u      /* u16 length                      */
++#define A5BT_ACL_TD_BUFFER      2u      /* u8  buffer_index                */
++#define A5BT_ACL_TD_FLAGS       3u      /* u8  flags (PB/BC bits)          */
++#define A5BT_ACL_TD_HANDLE      4u      /* u16 hci_connection_handle       */
++#define A5BT_ACL_TD_CID         6u      /* u16 l2cap_cid                   */
++#define A5BT_ACL_TX_BUFFER      0x02aa0u        /* 30 x 1024 bytes         */
++#define A5BT_ACL_BUFFERS        30u     /* BSMHCP_DATA_BUFFER_TX_ACL_SIZE  */
++#define A5BT_ACL_BUF_STRIDE     1024u   /* BSMHCP_ACL_BUFFER_SIZE          */
++#define A5BT_ACL_RX_RING        0x0e440u        /* 32 x 1032 bytes         */
++#define A5BT_ACL_FREE_RING      0x16540u        /* 32 x 4 bytes            */
++#define A5BT_ACL_FREE_SLOTS     32u
++#define A5BT_ACL_FREE_ENTRY     4u
++
++/* HCI opcode sent as the boot-time proof (HCI Reset). */
++#define A5BT_HCI_OP_RESET       0x0c03u
++
++/* ACL TX seam.  `payload` is the ACL data after the 4-byte HCI ACL header and
++ * `len` is its length, which is what the descriptor's `length` field wants
++ * (scsc_shm.c:314, 419).  `flags` carries the PB/BC bits from the
++ * caller's HCI header (0x30/0xC0 masks) and BSMHCP_ACL_L2CAP_FLAG_END (0x01)
++ * when the payload completes an L2CAP frame.  Single packet only: no
++ * fragmentation, so PB = continuation is not handled.  No caller yet (no HCI
++ * device node); see the file comment in a5xelte_bt.c. */
++int a5scsc_bt_acl_send(uint16_t handle, uint8_t flags, uint16_t l2cap_cid,
++    const void *payload, uint32_t len);
++
++#endif /* _A5XELTE_BT_H_ */
+\ No newline at end of file
+diff --git a/bsd/dev/a5xelte_scsc.c b/bsd/dev/a5xelte_scsc.c
+index cbdd94a..fd127c3 100644
+--- a/bsd/dev/a5xelte_scsc.c
++++ b/bsd/dev/a5xelte_scsc.c
+@@ -95,9 +95,6 @@ struct a5scsc_stream {
+ 	bool               ready;
+ };
+ 
+-/* Handler for one tohost bit: runs in the poll thread (mifintrbit.c:52-71). */
+-typedef void (*a5scsc_intr_fn)(int bit, void *arg);
+-
+ struct a5scsc_softc {
+ 	vm_offset_t mbox_r4;            /* R4 mailbox bank VA           */
+ 	vm_offset_t mbox_m4;            /* M4 mailbox bank VA           */
+@@ -255,7 +252,7 @@ a5scsc_irq_bit_unmask(int bit)
+ 
+ /* Generate an interrupt TO R4 (target 0) or M4 (target 1); MIF:788-829.
+  * The from-M4 direction uses the R1 offsets in the M4 bank on 7885. */
+-static void
++void
+ a5scsc_irq_bit_set(int bit, uint8_t target)
+ {
+ 	if (bit < 0 || bit >= (int)A5SCSC_INTRBIT_NUM) {
+@@ -294,7 +291,7 @@ a5scsc_intr_dispatch(void)
+ }
+ 
+ /* mifintrbit.c:105-121: mask, clear, register, unmask, then mark allocated. */
+-static int
++int
+ a5scsc_intrbit_alloc_tohost(a5scsc_intr_fn fn, void *arg)
+ {
+ 	int bit;
+@@ -318,7 +315,7 @@ a5scsc_intrbit_alloc_tohost(a5scsc_intr_fn fn, void *arg)
+ 
+ /* mifintrbit.c:150-170.  "reserved" picks the panic bit instead of allocating,
+  * which is what the gdb output streams do (mifstream.c:62-70). */
+-static int
++int
+ a5scsc_intrbit_alloc_fromhost(uint8_t target, bool reserved)
+ {
+ 	uint16_t *map = (target == A5SCSC_MIF_TARGET_M4) ?
+diff --git a/bsd/dev/a5xelte_scsc.h b/bsd/dev/a5xelte_scsc.h
+index f5193f8..a433503 100644
+--- a/bsd/dev/a5xelte_scsc.h
++++ b/bsd/dev/a5xelte_scsc.h
+@@ -311,6 +311,14 @@ int  a5scsc_mxmgmt_send(uint8_t channel, uint8_t msg, const void *payload,
+     uint32_t len);
+ int  a5scsc_read_file(const char *path, void *dst, size_t max, size_t *out_size);
+ 
++/* Interrupt-bit primitives, exported for a service that allocates bits after
++ * the transport has been set up (the BT endpoint does: scsc_shm.c:95-131).
++ * Bit numbers are 0..15; target is A5SCSC_MIF_TARGET_R4 / _M4. */
++typedef void (*a5scsc_intr_fn)(int bit, void *arg);
++int  a5scsc_intrbit_alloc_tohost(a5scsc_intr_fn fn, void *arg);
++int  a5scsc_intrbit_alloc_fromhost(uint8_t target, bool reserved);
++void a5scsc_irq_bit_set(int bit, uint8_t target);
++
+ /* mxmgmt channel handlers: the callback gets the 7-byte payload of an 8-byte
+  * packet, without the channel byte (mxmgmt_transport_format.h:15-23).  The
+  * WiFi service and the BT endpoint each register their own channel. */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 6f3eb89..97e2454 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -76,6 +76,7 @@ extern void jackpotlte_mali_probe(void);
+ extern void jackpotlte_mali_service_start(void);
+ extern void a5xelte_usb_probe(void);
+ extern void a5xelte_scsc_probe(void);
++extern void a5xelte_bt_probe(void);
+ extern void a5xelte_sensors_probe(void);
+ extern void a5xelte_wifi_probe(void);
+ extern void a5xelte_flashlight_probe(void);
+@@ -801,6 +802,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	 * default; full bring-up only with the "a8wifi" boot argument
+ 	 * (bsd/dev/a5xelte_scsc.c). */
+ 	a5xelte_scsc_probe();
++	/* Galaxy A8 2018: Bluetooth service on the same SCSC R4, off unless
++	 * "a8bt" is 1 (bsd/dev/a5xelte_bt.c). */
++	a5xelte_bt_probe();
+ 	/* Galaxy A8 2018: hall/grip/sensor-hub probe, off unless
+ 	 * "a8sensors" is 1 (bsd/dev/a5xelte_sensors.c). */
+ 	a5xelte_sensors_probe();

@@ -1,0 +1,100 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1716,7 +1716,15 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if dep_libdrm.found()
++if host_machine.system() == 'darwin' and with_gallium_panfrost
++  # No DRM on this system: panfrost's requests go to the kernel's GPU driver
++  # through the stand-in in src/jackpotlte-drm, put there by this port's
++  # tools/mesa-jackpotlte/mk-mesa-jackpotlte.sh.
++  dep_libdrm = declare_dependency(
++    include_directories : include_directories('src/jackpotlte-drm'),
++    link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
++  )
++elif dep_libdrm.found()
+   pre_args += '-DHAVE_LIBDRM'
+   if with_dri_platform == 'drm' and with_dri
+     with_gallium_drisw_kms = true
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -7,11 +7,22 @@
+   'panthor_kmod.c',
+ )
+ 
++# Darwin: the stand-in for libdrm (src/jackpotlte-drm, put there by
++# tools/mesa-jackpotlte/mk-mesa-jackpotlte.sh); its sources are built here,
++# beside the panfrost requests that carry them to our kernel's user client.
++pankmod_darwin_args = []
++if host_machine.system() == 'darwin'
++  libpankmod_lib_files += files('../../../jackpotlte-drm/jackpotlte_drm.c',
++                                '../../../jackpotlte-drm/jackpotlte_gpu.c',
++                                '../../../jackpotlte-drm/jackpotlte_iokit.c')
++  pankmod_darwin_args += ['-DJACKPOTLTE_DRM_IOS=1']
++endif
++
+ libpankmod_lib = static_library(
+   'pankmod_lib',
+   [libpankmod_lib_files],
+   include_directories : [inc_include, inc_src, inc_panfrost],
+-  c_args : [no_override_init_args],
++  c_args : [no_override_init_args, pankmod_darwin_args],
+   gnu_symbol_visibility : 'hidden',
+   dependencies: [dep_libdrm, idep_mesautil, idep_pan_packers],
+   build_by_default : false,
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -615,8 +615,18 @@
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++#ifdef __APPLE__
++   /* no mmap() on a device here: our kernel's driver maps the buffer, all of it
++    * (src/jackpotlte-drm) */
++   (void)prot;
++   (void)flags;
++   host_addr = jackpotlte_drm_map(bo->dev->fd, bo->handle, bo->size);
++   if (host_addr != MAP_FAILED)
++      host_addr = (char *)host_addr + bo_offset;
++#else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
++#endif
+    if (host_addr == MAP_FAILED) {
+       mesa_loge("mmap(..., size=%zu, prot=%d, flags=0x%x) failed: %s",
+                 size, prot, flags, strerror(errno));
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -176,7 +176,13 @@
+ 
+       p_atomic_inc(&bo->refcnt);
+    } else {
++#ifdef __APPLE__
++      /* (what comes in here is a SweetSurface, and the "file descriptor" its ID) */
++      struct jackpotlte_drm_surface surface = { .surface = (uint32_t)fd };
++      size_t size = jackpotlte_drm_surface(dev->fd, &surface) ? 0 : surface.size;
++#else
+       size_t size = lseek(fd, 0, SEEK_END);
++#endif
+       if (size == 0 || size == (size_t)-1) {
+          mesa_loge("invalid dmabuf size");
+          goto err_close_handle;
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -355,10 +355,15 @@
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifdef __APPLE__
++   jackpotlte_drm_unmap(bo->kmod_bo->dev->fd, bo->kmod_bo->handle,
++                        (void *)(uintptr_t)bo->ptr.cpu);
++#else
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
++#endif
+ 
+    bo->ptr.cpu = NULL;
+ }

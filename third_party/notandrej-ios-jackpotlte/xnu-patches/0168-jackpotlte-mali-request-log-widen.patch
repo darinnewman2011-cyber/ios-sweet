@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/JackpotlteMali.cpp b/iokit/Kernel/arm/JackpotlteMali.cpp
+--- a/iokit/Kernel/arm/JackpotlteMali.cpp
++++ b/iokit/Kernel/arm/JackpotlteMali.cpp
+@@ -498,7 +498,11 @@
+ 		return ret;
+ 	}
+ 	IOLockLock(gMaliLock);
+-	if (fRequests++ < 32) {
++	/* Bring-up aid: this log stopped after 32 requests, and one frame's
++	 * setup is longer than that, so what the client asked for just before
++	 * it died was never printed.  256 covers a whole frame's setup and
++	 * still leaves the crash report readable at the tail of the panel. */
++	if (fRequests++ < 256) {
+ 		IOLog("JackpotlteMali: request %#x, %zu bytes\n", selector, size);
+ 	}
+ 	switch (selector) {

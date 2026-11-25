@@ -1,0 +1,433 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -15,9 +15,11 @@
+  * the device controller, give it an event buffer in kernel DMA memory, arm
+  * endpoint 0, poll GEVNTCOUNT from a kernel thread, and answer control
+  * transfers from a small state machine modelled on Linux dwc3 ep0.c.  It
+- * writes the PHY's VBUS force bits (this board has no VBUS pad) and the DWC3
+- * device registers, and nothing else: no PMU or CMU writes yet, because
+- * those need the vendor's handshake sequences and the expected state here is
++ * brings the PHY up the way phy-exynos-usb3p1.c does for version 03.0.0
++ * (q-channel workaround, link reset, PHY reset, deep-sleep release, then the
++ * VBUS-force bits this board needs because it has no VBUS pad) and then
++ * writes the DWC3 device registers.  It still makes no PMU or CMU writes:
++ * those need the vendor's power-up handshake and the expected state here is
+  * "already on".
+  *
+  * The identity in the descriptors is Apple's (VID 0x05ac, the iPhone PID)
+@@ -98,9 +100,11 @@
+  * offsets the S8 probe uses in bsd/dev/sweet_usb.c / patch 0072) ---- */
+ #define A8_GCTL        0xc110u
+ #define A8_GSTS        0xc118u
++#define A8_GSTS_CSR_TIMEOUT (1u << 5)   /* vendor dwc3 core.h:209 */
+ #define A8_GSNPSID     0xc120u
+ #define A8_GHWPARAMS0  0xc140u
+-#define A8_GHWPARAMS3  0xc148u
++#define A8_GHWPARAMS2  0xc148u   /* 32-bit user ID: Synopsys's default 0x12345678 */
++#define A8_GHWPARAMS3  0xc14cu   /* SSPHY/HSPHY interface, endpoints [16:12] */
+ #define A8_GEVNTADRLO  0xc400u
+ #define A8_GEVNTADRHI  0xc404u
+ #define A8_GEVNTSIZ    0xc408u
+@@ -112,20 +116,63 @@
+ #define A8_DSTS        0xc70cu
+ #define A8_DALEPENA    0xc720u
+ 
+-/* ---- USB DRD PHY registers (phy-exynos-usbdrd.h:36-98; base = reg[0] of
+- * the phy@135D0000 node, i.e. 0x135D0000) ---- */
+-#define A8_PHY_LINKSYSTEM    0x04u
+-#define A8_PHY_PHYUTMI       0x08u
+-#define A8_PHY_PHYCLKRST     0x10u
+-#define A8_PHY_PHYREG0       0x14u
+-#define A8_PHY_PHYREG1       0x18u
+-#define A8_PHY_PHYPARAM0     0x1cu
+-#define A8_PHY_PHYTERM       0x24u
+-#define A8_PHY_PHYTEST       0x28u
+-#define A8_PHY_PHYADP        0x2cu
+-#define A8_PHY_PHYUTMICLKSEL 0x30u
+-#define A8_PHY_PHYRESUME     0x34u
+-#define A8_PHY_LINKPORT      0x44u
++/* ---- USB DRD PHY registers (Samsung USB3.1 combo PHY) ----
++ * The 7885 is served by phy-exynos-usbdrd3.c, whose PHY half is
++ * phy-exynos-usb3p1.c using the *USB3.1* register map of
++ * phy-exynos-usb3p1-reg.h (base = reg[0] of the phy@135D0000 node, i.e.
++ * 0x135D0000).  The older LINKSYSTEM/PHYUTMI/PHYCLKRST names from
++ * phy-exynos-usbdrd.h (phy-exynos5-usbdrd.c) address different registers and
++ * must not be used to read this PHY: offset 0x10 there is LINK_DEBUG_H here,
++ * not a clock/reset register.  Only the v3.1 offsets are used below. */
++#define A8_PHY_CTRL_VER  0x00u   /* EXYNOS_USBCON_CTRL_VER */
++#define A8_PHY_LINK_CTRL 0x04u   /* EXYNOS_USBCON_LINK_CTRL */
++#define A8_PHY_LINK_PORT 0x08u   /* EXYNOS_USBCON_LINK_PORT */
++#define A8_PHY_CLKRST    0x20u   /* EXYNOS_USBCON_CLKRST */
++#define A8_PHY_PWR       0x24u   /* EXYNOS_USBCON_PWR */
++#define A8_PHY_COMBO_PMA 0x48u   /* EXYNOS_USBCON_COMBO_PMA_CTRL */
++#define A8_PHY_UTMI      0x50u   /* EXYNOS_USBCON_UTMI */
++#define A8_PHY_HSP       0x54u   /* EXYNOS_USBCON_HSP */
++#define A8_PHY_HSP_TEST  0x5cu   /* EXYNOS_USBCON_HSP_TEST */
++
++/* The value this PHY expects in CTRL_VER.  The device tree sets
++ * phy_version = <0x300> for this board, i.e. the "03.0.0" (Lassen HS) map,
++ * whose enable path programs no PLL. */
++#define A8_PHY_VER_03_0_0 0x0300u
++
++/* LINK_CTRL (0x04) */
++#define A8_LINKCTRL_DIS_QACT_LINKGATE   (1u << 12)
++#define A8_LINKCTRL_DIS_QACT_ID0        (1u << 11)
++#define A8_LINKCTRL_DIS_QACT_VBUS_VALID (1u << 10)
++#define A8_LINKCTRL_DIS_QACT_BVALID     (1u << 9)
++#define A8_LINKCTRL_FORCE_QACT          (1u << 8)
++#define A8_LINKCTRL_BUS_FILTER_BYPASS   (0xfu << 4)
++
++/* CLKRST (0x20) */
++#define A8_CLKRST_PHY_SW_RST  (1u << 3)
++#define A8_CLKRST_PHY_RST_SEL (1u << 2)
++#define A8_CLKRST_PORT_RST    (1u << 1)
++#define A8_CLKRST_LINK_SW_RST (1u << 0)
++
++/* UTMI (0x50) */
++#define A8_UTMI_FORCE_VBUSVALID (1u << 5)
++#define A8_UTMI_FORCE_BVALID    (1u << 4)
++#define A8_UTMI_DP_PULLDOWN     (1u << 3)
++#define A8_UTMI_DM_PULLDOWN     (1u << 2)
++#define A8_UTMI_FORCE_SUSPEND   (1u << 1)
++#define A8_UTMI_FORCE_SLEEP     (1u << 0)
++
++/* HSP (0x54) */
++#define A8_HSP_VBUSVLDEXTSEL  (1u << 13)
++#define A8_HSP_VBUSVLDEXT     (1u << 12)
++#define A8_HSP_EN_UTMISUSPEND (1u << 9)
++#define A8_HSP_COMMONONN      (1u << 8)
++
++/* HSP_TEST (0x5c) */
++#define A8_HSP_TEST_SIDDQ (1u << 24)
++
++/* LINK_PORT (0x08) */
++#define A8_LINKPORT_HUB_PORT_SEL_OCD_U3 (1u << 3)
++#define A8_LINKPORT_HUB_PORT_SEL_OCD_U2 (1u << 2)
+ 
+ static uint32_t
+ a8_usb_rd(vm_offset_t base, uint32_t off)
+@@ -149,6 +196,7 @@
+ 	uint32_t fsys_pwr, phy_ctrl;
+ 	uint32_t qch_hsdrd, qch_usb20, qch_usb30_0, qch_usb30_1;
+ 	uint32_t cmu_gate;
++	uint32_t hwparams3;
+ 	bool powered, clocked;
+ 
+ 	/* a8usb=0 disables; 1 (the default) reports state only. */
+@@ -222,8 +270,19 @@
+ 	printf("A5XELTE USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    a8_usb_rd(dwc, A8_GSNPSID), a8_usb_rd(dwc, A8_GCTL), a8_usb_rd(dwc, A8_GSTS),
+ 	    a8_usb_rd(dwc, A8_GHWPARAMS0));
+-	printf("A5XELTE USB: DWC3 GHWPARAMS3 0x%08x (endpoint and fifo report)\n",
+-	    a8_usb_rd(dwc, A8_GHWPARAMS3));
++	/*
++	 * GHWPARAMS2 is a 32-bit user ID and reads Synopsys's default
++	 * 0x12345678 on this core -- the jt69 console printed that value
++	 * under a "GHWPARAMS3" label because the constant was 0xc148, which
++	 * is GHWPARAMS2.  The real GHWPARAMS3 is 0xc14c and is what says
++	 * which PHYs the core owns, so read and decode that one.
++	 */
++	hwparams3 = a8_usb_rd(dwc, A8_GHWPARAMS3);
++	printf("A5XELTE USB: DWC3 GHWPARAMS2 0x%08x GHWPARAMS3 0x%08x "
++	    "(ssphy ifc %u hspy ifc %u eps %u in-eps %u)\n",
++	    a8_usb_rd(dwc, A8_GHWPARAMS2), hwparams3,
++	    hwparams3 & 3u, (hwparams3 >> 2) & 3u,
++	    (hwparams3 >> 12) & 0x3fu, (hwparams3 >> 18) & 0x1fu);
+ 	printf("A5XELTE USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+ 	    a8_usb_rd(dwc, A8_DCFG), a8_usb_rd(dwc, A8_DCTL), a8_usb_rd(dwc, A8_DEVTEN),
+ 	    a8_usb_rd(dwc, A8_DSTS), a8_usb_rd(dwc, A8_DALEPENA));
+@@ -237,15 +296,13 @@
+ 		printf("A5XELTE USB: PHY map failed\n");
+ 		return;
+ 	}
+-	printf("A5XELTE USB: PHY LINKSYSTEM 0x%08x PHYUTMI 0x%08x PHYCLKRST 0x%08x PHYUTMICLKSEL 0x%08x\n",
+-	    a8_usb_rd(phy, A8_PHY_LINKSYSTEM), a8_usb_rd(phy, A8_PHY_PHYUTMI),
+-	    a8_usb_rd(phy, A8_PHY_PHYCLKRST), a8_usb_rd(phy, A8_PHY_PHYUTMICLKSEL));
+-	printf("A5XELTE USB: PHY PHYREG0 0x%08x PHYREG1 0x%08x PHYPARAM0 0x%08x PHYTERM 0x%08x\n",
+-	    a8_usb_rd(phy, A8_PHY_PHYREG0), a8_usb_rd(phy, A8_PHY_PHYREG1),
+-	    a8_usb_rd(phy, A8_PHY_PHYPARAM0), a8_usb_rd(phy, A8_PHY_PHYTERM));
+-	printf("A5XELTE USB: PHY PHYTEST 0x%08x PHYADP 0x%08x PHYRESUME 0x%08x LINKPORT 0x%08x\n",
+-	    a8_usb_rd(phy, A8_PHY_PHYTEST), a8_usb_rd(phy, A8_PHY_PHYADP),
+-	    a8_usb_rd(phy, A8_PHY_PHYRESUME), a8_usb_rd(phy, A8_PHY_LINKPORT));
++	printf("A5XELTE USB: PHY ver 0x%08x LINK_CTRL 0x%08x LINK_PORT 0x%08x CLKRST 0x%08x PWR 0x%08x\n",
++	    a8_usb_rd(phy, A8_PHY_CTRL_VER), a8_usb_rd(phy, A8_PHY_LINK_CTRL),
++	    a8_usb_rd(phy, A8_PHY_LINK_PORT), a8_usb_rd(phy, A8_PHY_CLKRST),
++	    a8_usb_rd(phy, A8_PHY_PWR));
++	printf("A5XELTE USB: PHY COMBO_PMA 0x%08x UTMI 0x%08x HSP 0x%08x HSP_TEST 0x%08x\n",
++	    a8_usb_rd(phy, A8_PHY_COMBO_PMA), a8_usb_rd(phy, A8_PHY_UTMI),
++	    a8_usb_rd(phy, A8_PHY_HSP), a8_usb_rd(phy, A8_PHY_HSP_TEST));
+ 
+ 	a8_usb_gadget_start(dwc, phy);
+ }
+@@ -322,26 +379,13 @@
+ #define A8G_EP_MRX     4u
+ #define A8G_EP_MTX     5u
+ 
+-/* ---- Samsung combo PHY v3.0.0 (phy-exynos-usb3p1-reg.h) ----
+- * The board sets is_not_vbus_pad = <1> (exynos7885.dtsi, dwc3 node), so the
+- * vendor driver *forces* BVALID/VBUSVALID and selects the external VBUS valid
+- * input on the PHY's HSP block instead of reading a VBUS pad
+- * (phy-exynos-usb3p1.c:315-330).  Those are the bits that let a device connect
+- * at all on this board. */
+-#define A8_PHY_LINK_CTRL   0x04u
+-#define A8_PHY_LINK_PORT   0x08u
+-#define A8_PHY_UTMI        0x50u
+-#define A8_PHY_HSP         0x54u
+-
+-#define A8_UTMI_FORCE_VBUSVALID (1u << 5)
+-#define A8_UTMI_FORCE_BVALID    (1u << 4)
+-#define A8_UTMI_DP_PULLDOWN     (1u << 3)
+-#define A8_UTMI_DM_PULLDOWN     (1u << 2)
+-#define A8_UTMI_FORCE_SUSPEND   (1u << 1)
+-#define A8_UTMI_FORCE_SLEEP     (1u << 0)
+-
+-#define A8_HSP_VBUSVLDEXTSEL    (1u << 13)
+-#define A8_HSP_VBUSVLDEXT       (1u << 12)
++/* The PHY registers and their bits are defined once, near the top of the
++ * file, from the USB3.1 map the 7885 driver actually uses
++ * (phy-exynos-usb3p1-reg.h).  The board sets is_not_vbus_pad = <1>
++ * (exynos7885.dtsi), so the vendor driver *forces* BVALID/VBUSVALID and
++ * selects the external VBUS valid input on the UTMI/HSP blocks instead of
++ * reading a pad (phy-exynos-usb3p1.c:315-330).  Those are the bits that let
++ * a device connect at all on this board. */
+ 
+ static struct {
+ 	vm_offset_t dwc;
+@@ -349,6 +393,7 @@
+ 	uint64_t    dma_pa;
+ 	uint32_t    evt_pos;
+ 	uint32_t    events;
++	uint32_t    cmd_dumps;
+ 	int         sleep_chan;
+ 	enum { A8G_SETUP, A8G_DATA, A8G_WAIT_STATUS2, A8G_WAIT_STATUS3,
+ 	    A8G_STATUS } state;
+@@ -382,25 +427,53 @@
+ static int
+ a8g_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
++	uint32_t latched;
++
+ 	a8_dwc_wr(A8_DEPCMDPAR0(ep), p0);
+ 	a8_dwc_wr(A8_DEPCMDPAR1(ep), p1);
+ 	a8_dwc_wr(A8_DEPCMDPAR2(ep), p2);
+ 	a8_dwc_wr(A8_DEPCMD(ep), cmd | A8_DEPCMD_CMDACT);
++	/*
++	 * Read DEPCMD back at once: if CMDACT is not there the write itself is
++	 * not landing (core not clocked or in reset), and no amount of waiting
++	 * will finish the command.  Linux has the same 500 us budget
++	 * (dwc3 gadget.c:396-424); 1000 ms is already 2000x that, so a timeout
++	 * is a real stall rather than an impatient poll.
++	 */
++	latched = a8_usb_rd(a8g.dwc, A8_DEPCMD(ep));
+ 	for (int i = 0; i < 1000; i++) {
+ 		uint32_t v = a8_usb_rd(a8g.dwc, A8_DEPCMD(ep));
+ 
+ 		if (!(v & A8_DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+ 			if (status) {
+-				printf("A5XELTE USB: ep%u cmd 0x%x status %u\n",
+-				    ep, cmd & 0xf, status);
++				printf("A5XELTE USB: ep%u cmd 0x%x status %u "
++				    "(DEPCMD 0x%08x)\n", ep, cmd & 0xf, status, v);
+ 				return -1;
+ 			}
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
+-	printf("A5XELTE USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	printf("A5XELTE USB: ep%u cmd 0x%08x p %08x %08x %08x timeout; "
++	    "write latched 0x%08x now 0x%08x\n", ep, cmd, p0, p1, p2, latched,
++	    a8_usb_rd(a8g.dwc, A8_DEPCMD(ep)));
++	if (a8g.cmd_dumps++ < 4) {
++		printf("A5XELTE USB: dump DCTL 0x%08x DCFG 0x%08x DSTS 0x%08x "
++		    "DEVTEN 0x%08x DALEPENA 0x%08x\n",
++		    a8_usb_rd(a8g.dwc, A8_DCTL), a8_usb_rd(a8g.dwc, A8_DCFG),
++		    a8_usb_rd(a8g.dwc, A8_DSTS), a8_usb_rd(a8g.dwc, A8_DEVTEN),
++		    a8_usb_rd(a8g.dwc, A8_DALEPENA));
++		printf("A5XELTE USB: dump GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG "
++		    "0x%08x GEVNTCOUNT 0x%08x\n",
++		    a8_usb_rd(a8g.dwc, A8_GCTL), a8_usb_rd(a8g.dwc, A8_GSTS),
++		    a8_usb_rd(a8g.dwc, A8_GUSB2PHYCFG),
++		    a8_usb_rd(a8g.dwc, A8_GEVNTCOUNT));
++		printf("A5XELTE USB: dump PAR0 0x%08x PAR1 0x%08x PAR2 0x%08x\n",
++		    a8_usb_rd(a8g.dwc, A8_DEPCMDPAR0(ep)),
++		    a8_usb_rd(a8g.dwc, A8_DEPCMDPAR1(ep)),
++		    a8_usb_rd(a8g.dwc, A8_DEPCMDPAR2(ep)));
++	}
+ 	return -1;
+ }
+ 
+@@ -1045,6 +1118,112 @@
+ }
+ 
+ /*
++ * Bring the combo PHY up the way the vendor driver does for version 03.0.0
++ * (phy-exynos-usb3p1.c phy_exynos_usb_v3p1_enable, 214-340, with
++ * not_used_vbus_pad and common_block_disable both set by the jackpotlte
++ * device tree).  By the time the kernel runs the bootloader has torn its own
++ * USB session down, and without this the DWC3 takes no endpoint command at
++ * all: the core is up, but its PHY-side clock is not, so every DEPCMD write
++ * leaves CMDACT set until the poll gives up.
++ *
++ * The order is the vendor's and it matters: q-channel workaround, link reset,
++ * assert PHY reset, release deep sleep, clear the 2.0 pulls, wait, release
++ * PHY reset, then force the VBUS/BVALID this board has no pad for.
++ */
++static void
++a8g_phy_bringup(vm_offset_t phy)
++{
++	uint32_t version = a8_usb_rd(phy, A8_PHY_CTRL_VER);
++	uint32_t v;
++
++	printf("A5XELTE USB: PHY ver 0x%08x before CLKRST 0x%08x UTMI 0x%08x "
++	    "HSP 0x%08x HSP_TEST 0x%08x\n", version,
++	    a8_usb_rd(phy, A8_PHY_CLKRST), a8_usb_rd(phy, A8_PHY_UTMI),
++	    a8_usb_rd(phy, A8_PHY_HSP), a8_usb_rd(phy, A8_PHY_HSP_TEST));
++
++	if ((version & 0xff00u) != A8_PHY_VER_03_0_0) {
++		printf("A5XELTE USB: PHY version 0x%08x is not the 03.0.0 map; "
++		    "sequence skipped\n", version);
++		return;
++	}
++
++	/* exynos_cal_usbphy_q_ch(regs_base, 1): stop the link's q-channel
++	 * activations, then force one. */
++	v = a8_usb_rd(phy, A8_PHY_LINK_CTRL);
++	v |= A8_LINKCTRL_DIS_QACT_ID0 | A8_LINKCTRL_DIS_QACT_VBUS_VALID |
++	    A8_LINKCTRL_DIS_QACT_BVALID | A8_LINKCTRL_DIS_QACT_LINKGATE;
++	v &= ~A8_LINKCTRL_FORCE_QACT;
++	a8_usb_wr(phy, A8_PHY_LINK_CTRL, v);
++	delay(500);
++	v = a8_usb_rd(phy, A8_PHY_LINK_CTRL);
++	v |= A8_LINKCTRL_FORCE_QACT;
++	delay(500);
++	a8_usb_wr(phy, A8_PHY_LINK_CTRL, v);
++	delay(500);
++
++	/* Link reset: pulse CLKRST.LINK_SW_RST. */
++	v = a8_usb_rd(phy, A8_PHY_CLKRST);
++	v |= A8_CLKRST_LINK_SW_RST;
++	a8_usb_wr(phy, A8_PHY_CLKRST, v);
++	delay(10);
++	v &= ~A8_CLKRST_LINK_SW_RST;
++	a8_usb_wr(phy, A8_PHY_CLKRST, v);
++
++	/* phy_sw_rst_high: hold the PHY in reset while its power comes up. */
++	v = a8_usb_rd(phy, A8_PHY_CLKRST);
++	v |= A8_CLKRST_PHY_SW_RST | A8_CLKRST_PHY_RST_SEL;
++	a8_usb_wr(phy, A8_PHY_CLKRST, v);
++
++	/* phy_power_en(info, 1): clear HSP_TEST.SIDDQ, the 2.0 PHY's deep
++	 * sleep.  This is the bit that lets the PHY produce its clocks. */
++	v = a8_usb_rd(phy, A8_PHY_HSP_TEST);
++	v &= ~A8_HSP_TEST_SIDDQ;
++	a8_usb_wr(phy, A8_PHY_HSP_TEST, v);
++
++	/* Not suspended, not sleeping, no bus pulls held down. */
++	v = a8_usb_rd(phy, A8_PHY_UTMI);
++	v &= ~(A8_UTMI_FORCE_SUSPEND | A8_UTMI_FORCE_SLEEP |
++	    A8_UTMI_DP_PULLDOWN | A8_UTMI_DM_PULLDOWN);
++	a8_usb_wr(phy, A8_PHY_UTMI, v);
++
++	/* jackpotlte sets common_block_disable = <1>, so the common block is
++	 * turned on and UTMI suspend is enabled. */
++	v = a8_usb_rd(phy, A8_PHY_HSP);
++	v |= A8_HSP_EN_UTMISUSPEND | A8_HSP_COMMONONN;
++	a8_usb_wr(phy, A8_PHY_HSP, v);
++
++	delay(100);
++
++	/* phy_sw_rst_low: release the PHY reset. */
++	v = a8_usb_rd(phy, A8_PHY_CLKRST);
++	v |= A8_CLKRST_PHY_RST_SEL;
++	v &= ~(A8_CLKRST_PHY_SW_RST | A8_CLKRST_PORT_RST);
++	a8_usb_wr(phy, A8_PHY_CLKRST, v);
++
++	/* No VBUS pad: bypass the bus filter and force the session bits. */
++	v = a8_usb_rd(phy, A8_PHY_LINK_CTRL);
++	v |= A8_LINKCTRL_BUS_FILTER_BYPASS;
++	a8_usb_wr(phy, A8_PHY_LINK_CTRL, v);
++	v = a8_usb_rd(phy, A8_PHY_UTMI);
++	v |= A8_UTMI_FORCE_BVALID | A8_UTMI_FORCE_VBUSVALID;
++	a8_usb_wr(phy, A8_PHY_UTMI, v);
++	v = a8_usb_rd(phy, A8_PHY_HSP);
++	v |= A8_HSP_VBUSVLDEXTSEL | A8_HSP_VBUSVLDEXT;
++	a8_usb_wr(phy, A8_PHY_HSP, v);
++
++	/* use_io_for_ovc = <0>: the over-current pins belong to the link. */
++	v = a8_usb_rd(phy, A8_PHY_LINK_PORT);
++	v |= A8_LINKPORT_HUB_PORT_SEL_OCD_U3 | A8_LINKPORT_HUB_PORT_SEL_OCD_U2;
++	a8_usb_wr(phy, A8_PHY_LINK_PORT, v);
++
++	printf("A5XELTE USB: PHY after bringup CLKRST 0x%08x UTMI 0x%08x "
++	    "HSP 0x%08x HSP_TEST 0x%08x LINK_CTRL 0x%08x\n",
++	    a8_usb_rd(phy, A8_PHY_CLKRST), a8_usb_rd(phy, A8_PHY_UTMI),
++	    a8_usb_rd(phy, A8_PHY_HSP), a8_usb_rd(phy, A8_PHY_HSP_TEST),
++	    a8_usb_rd(phy, A8_PHY_LINK_CTRL));
++}
++
++/*
+  * Restart the device controller in the state the bootloader left it, which is
+  * how the donor's SWEET port does it: S-Boot itself runs this controller in
+  * device mode for fastboot, so the core is powered, clocked and halted.
+@@ -1063,30 +1242,15 @@
+ 	}
+ 
+ 	/*
+-	 * PHY: this board has no VBUS pad (the dwc3 node sets
+-	 * is_not_vbus_pad = <1>), so the vendor PHY driver *forces*
+-	 * BVALID/VBUSVALID and selects the external VBUS valid input on the
+-	 * UTMI/HSP blocks instead of reading a pad (phy-exynos-usb3p1.c:315-330).
+-	 * Without those the PHY never reports a session.  The same function's
+-	 * COMMONONN handling is skipped on purpose: it only applies with the
+-	 * common_block_disable property, which this DTS does not set.
+-	 *
+-	 * The PHY's PMU isolate step is not reproduced: the 7885 PHY node has
+-	 * pmu_mask = <0x0> (exynos7885.dtsi:1970), so the vendor's
+-	 * phy_isol(inst, 0, 0) is a regmap_update_bits with mask 0 -- a no-op.
++	 * PHY first: the vendor brings it up before it touches the core
++	 * (Linux does phy_power_on/phy_init ahead of the DCTL reset,
++	 * dwc3 core.c:216-244), and without a running PHY the DWC3's endpoint
++	 * command handler never completes a command.  The PMU isolate step is
++	 * not reproduced: the 7885 PHY node has pmu_mask = <0x0>
++	 * (exynos7885.dtsi), so the vendor's phy_isol(inst, 0, 0) is a
++	 * regmap_update_bits with mask 0 -- a no-op.
+ 	 */
+-	v = a8_usb_rd(phy, A8_PHY_UTMI);
+-	printf("A5XELTE USB: PHY UTMI 0x%08x HSP 0x%08x LINKPORT 0x%08x\n",
+-	    v, a8_usb_rd(phy, A8_PHY_HSP), a8_usb_rd(phy, A8_PHY_LINK_PORT));
+-	v &= ~(A8_UTMI_FORCE_SUSPEND | A8_UTMI_FORCE_SLEEP |
+-	    A8_UTMI_DP_PULLDOWN | A8_UTMI_DM_PULLDOWN);
+-	v |= A8_UTMI_FORCE_BVALID | A8_UTMI_FORCE_VBUSVALID;
+-	a8_usb_wr(phy, A8_PHY_UTMI, v);
+-	v = a8_usb_rd(phy, A8_PHY_HSP);
+-	v |= A8_HSP_VBUSVLDEXTSEL | A8_HSP_VBUSVLDEXT;
+-	a8_usb_wr(phy, A8_PHY_HSP, v);
+-	printf("A5XELTE USB: PHY UTMI 0x%08x HSP 0x%08x after force\n",
+-	    a8_usb_rd(phy, A8_PHY_UTMI), a8_usb_rd(phy, A8_PHY_HSP));
++	a8g_phy_bringup(phy);
+ 
+ 	if (kmem_alloc_contig(kernel_map, &a8g.dma, A8G_DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
+@@ -1135,6 +1299,20 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * Prove the register interface answers, the way the vendor's
++	 * dwc3_core_soft_reset() does (core.c:265-281): write a magic value to
++	 * GEVNTADRLO and read it back.  If it does not stick, the core reports
++	 * a CSR timeout and every DEPCMD would hang, so say so before the
++	 * endpoint setup starts blaming endpoints.
++	 */
++	a8_dwc_wr(A8_GEVNTADRLO, 0x5a5a1234u);
++	v = a8_usb_rd(a8g.dwc, A8_GEVNTADRLO);
++	printf("A5XELTE USB: CSR check GEVNTADRLO 0x%08x (want 0x5a5a1234) "
++	    "GSTS 0x%08x%s\n", v, a8_usb_rd(a8g.dwc, A8_GSTS),
++	    (a8_usb_rd(a8g.dwc, A8_GSTS) & A8_GSTS_CSR_TIMEOUT) ?
++	    " CSR-TIMEOUT" : "");
++
+ 	a8_dwc_wr(A8_GEVNTADRLO, (uint32_t)(a8g.dma_pa + A8G_EVT));
+ 	a8_dwc_wr(A8_GEVNTADRHI, (uint32_t)((a8g.dma_pa + A8G_EVT) >> 32));
+ 	a8_dwc_wr(A8_GEVNTSIZ, (1u << 31) | A8G_EVT_SIZE);  /* polled */

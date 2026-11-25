@@ -1,0 +1,17 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -50,7 +50,12 @@
+     "     'IOProviderClass' = IOPlatformDevice;"
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-    "     'IONameMatch'     = 'arm,cortex-a53';"
++    /*
++     * Exynos7885 also has an A73 cluster (MPIDR Aff1 0 = ADT cpu6/cpu7).
++     * Without this match those nubs are never created and startAll()
++     * panics "CPU registration timeout" after cpu0..5 have registered.
++     */
++    "     'IONameMatch'     = ('arm,cortex-a53', 'arm,cortex-a73');"
+ #else
+     "     'IONameMatch'     = 'qcom,kryo470';"
+ #endif
+     "     'IOProbeScore'    = 10000:32;"

@@ -1,0 +1,48 @@
+--- a/bsd/dev/a5xelte_usb.c
++++ b/bsd/dev/a5xelte_usb.c
+@@ -88,6 +88,7 @@
+ #define A8_FSYS_QCH_USB30_0     0x303cu
+ #define A8_FSYS_QCH_USB30_1     0x3040u
+ #define A8_QCH_ENABLE           0x1u
++#define A8_QCH_CLOCK_REQ        0x2u
+ 
+ /* CMU: FSYS USB30DRD bus gate
+  * (CLK_CON_GAT_GATE_CLKCMU_FSYS_USB30DRD, cmucal-sfr.c:244). Diagnostic. */
+@@ -173,7 +174,18 @@
+ 	cmu_gate = a8_usb_rd(cmu, A8_CMU_GATE_USB30DRD);
+ 
+ 	powered = (fsys_pwr & A8_PMU_FSYS_ON) == A8_PMU_FSYS_ON;
+-	clocked = (qch_hsdrd & A8_QCH_ENABLE) != 0;
++	/*
++	 * Q-channel bit 0 (ENABLE) = 1 means "skip the handshake", i.e. the
++	 * clock is forced on (vendor cal-if/ra.c:480-483, "QH ENABLE 1 :
++	 * Skip, 0 : REQ(status) control").  Bit 0 = 0 is therefore the
++	 * normal running state, in which the clock is granted through bit 1
++	 * (CLOCK_REQ), which stays asserted while the block is up -- the jt68
++	 * console read 0x0b3f0002, i.e. REQ held, clock on.  Treat either bit
++	 * as proof of a clock, and never let a failed read (0xffffffff)
++	 * masquerade as gated.
++	 */
++	clocked = (qch_hsdrd & (A8_QCH_ENABLE | A8_QCH_CLOCK_REQ)) != 0 ||
++	    qch_hsdrd == 0xffffffffu;
+ 
+ 	printf("A5XELTE USB: PMU FSYS pwr 0x%08x (%s) PHY ctrl 0x%08x\n",
+ 	    fsys_pwr, powered ? "on" : "off", phy_ctrl);
+@@ -190,11 +202,13 @@
+ 	 * registers are only reported, not written: the vendor's power-up is
+ 	 * a PMU handshake (mask/value plus an ack bit) and its clock gates are
+ 	 * CMU fields this file does not implement, so a wrong write here would
+-	 * hang the SoC for no gain.  If the next console shows them off, that
+-	 * is the observation to implement against.
++	 * hang the SoC for no gain.  The FSYS power read is all-ones on this
++	 * board, which is a failed PMU access rather than an off switch, so a
++	 * readable Q-channel that says the clock is granted is what gates the
++	 * DWC3 access; the PMU value stays report-only.
+ 	 */
+-	if (!powered || !clocked) {
+-		printf("A5XELTE USB: controller unpowered or unclocked "
++	if (!clocked) {
++		printf("A5XELTE USB: controller unclocked "
+ 		    "(power %s, clock %s); DWC3 not read\n",
+ 		    powered ? "on" : "off", clocked ? "on" : "off");
+ 		return;

@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1666,17 +1666,16 @@
+ 	thread_t thread;
+ 	uint8_t st = 0;
+ 	uint8_t id[3] = {0};
+-	int enabled = 0;
+-	int power = 0;
++	int enabled = 1;
+ 
++	/* The contact path is on by default; a8touchlog=0 is the opt-out for a
++	 * boot that only wants the rest of the input stack. */
+ 	(void)PE_parse_boot_argn("a8touchlog", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	(void)PE_parse_boot_argn("a8touchpwr", &power, sizeof(power));
+-	jt_log("A8 TOUCH: contact path; status before power=%#x pwr=%d\n",
+-	    boot, power);
+-	if (power) {
++	jt_log("A8 TOUCH: contact path; status before power=%#x\n", boot);
++	{
+ 		const uint8_t func[3] = { JTTS_CMD_TOUCH_FUNCTION,
+ 					  JTTS_TOUCH_FUNCTION_TOUCH, 0x00u };
+ 		bool st_ok = false;
+@@ -1737,8 +1736,8 @@
+ }
+ 
+ /*
+- * Optional touch power bring-up, debug only (boot-arg a8touchpwr=1, default
+- * off).  S-Boot can leave the touch rail cold: tsp_ldo_en (gpg3-0, DTS
++ * Touch power bring-up, always on (it was the debug switch a8touchpwr=1).
++ * S-Boot can leave the touch rail cold: tsp_ldo_en (gpg3-0, DTS
+  * "regulator-fixed" 1.8 V, enable-active-high) reads low, so the sec_ts chip
+  * is unpowered and every I2C read NACKs.  This drives that pin high and, if
+  * the I2C4 block clock is gated, opens it (QCH_CON_LBLK_PERIC_QCH_I2C4 = PERI
+@@ -1757,12 +1756,11 @@
+ 	uint32_t dat;
+ 	uint32_t pud;
+ 	uint32_t qch;
+-	int on = 0;
+ 
+-	(void)PE_parse_boot_argn("a8touchpwr", &on, sizeof(on));
+-	if (!on) {
+-		return;
+-	}
++	/* The touch rail is always brought up: it is not a debug switch any
++	 * more.  S-Boot leaves tsp_ldo_en low often enough that a boot with
++	 * the rail cold has no touch at all, and a phone's touchscreen is a
++	 * core input device, not an experiment. */
+ 	pinctrl3 = ml_io_map(JTTS_PINCTRL3, 0x1000);
+ 	if (!pinctrl3) {
+ 		jt_log("A8 TOUCH PWR: pinctrl3 mapping failed\n");

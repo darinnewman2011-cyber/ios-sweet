@@ -1,0 +1,64 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -157,6 +157,53 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * The graphics accelerator.  There is none yet; the service is here because
++ * CoreAnimation waits for one of this class before it looks for a GPU at all
++ * (once per process), and an accelerator that does not name its Metal driver
++ * is passed over by Metal, which leaves CoreAnimation with the software
++ * renderer it draws the screen with today.
++ *
++ * Boot-arg jtmetal=1 names the plug-in (the first step of M4,
++ * docs/gpu-bringup.md): Metal reads MetalPluginName, opens
++ * /System/Library/Extensions/<name>.bundle and takes MetalPluginClassName out
++ * of it.  Never by default: a device that cannot draw yet makes a program that
++ * asks for Metal assert, and CoreAnimation would then pick Metal for the
++ * screen -- the plug-in arrives with the driver that can draw.
++ *
++ * The class and the two property names are the reference's (HakiOS,
++ * iokit/Kernel/MiniIOMobileFramebuffer.cpp:1934-1971).
++ */
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++sweet_accelerator_publish(IOService *provider)
++{
++	IOAcceleratorES *accelerator = OSTypeAlloc(IOAcceleratorES);
++	int metal = 0;
++
++	if (accelerator == NULL || !accelerator->init() ||
++	    !accelerator->attach(provider)) {
++		OSSafeReleaseNULL(accelerator);
++		return;
++	}
++	accelerator->setName("sgx");
++	if (PE_parse_boot_argn("jtmetal", &metal, sizeof(metal)) && metal != 0) {
++		accelerator->setProperty("MetalPluginName", "JackpotlteMetal");
++		accelerator->setProperty("MetalPluginClassName",
++		    "JackpotlteMetalDevice");
++		IOLog("SWEET FB: jtmetal=1: the accelerator names JackpotlteMetal "
++		    "as its Metal plug-in\n");
++	}
++	accelerator->registerService();
++	accelerator->release();
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -231,6 +278,7 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	sweet_accelerator_publish(provider);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;

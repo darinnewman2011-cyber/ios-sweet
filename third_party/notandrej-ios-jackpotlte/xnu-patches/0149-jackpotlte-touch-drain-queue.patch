@@ -1,0 +1,171 @@
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1013,6 +1013,11 @@
+ #define JTTS_EVENT_STATUS	0x01u
+ #define JTTS_EVENT_BUFF_SIZE	8u
+ #define JTTS_MAX_EVENT_COUNT	32u	/* sec_ts.c:936, IC event queue depth */
++/* Largest single transfer: the whole queue in one READ_ALL_EVENT, which is
++ * what the working S8 driver does (patch 0124, buf[8*32]).  A one-event cap
++ * here made the worker drain a full queue one event per poll, so the queue
++ * overflowed (left=35) and the release that ends a swipe was dropped. */
++#define JTTS_MAX_READ_BYTES	(8u * JTTS_MAX_EVENT_COUNT)
+ #define JTTS_STATUS_EVENT_ERR	1u	/* sec_ts.h:111 */
+ #define JTTS_STATUS_EVENT_INFO	2u	/* sec_ts.h:112 */
+ #define JTTS_ACK_BOOT_COMPLETE	0x00u
+@@ -1230,7 +1235,7 @@
+ {
+ 	bool ok = false;
+ 	int recovered = 0;
+-	if (!count || count > 16) {
++	if (!count || count > JTTS_MAX_READ_BYTES) {
+ 		return false;
+ 	}
+ retry:
+@@ -1311,6 +1316,10 @@
+ static unsigned jt_ts_moves;	/* coordinate move events decoded */
+ static unsigned jt_ts_retries;	/* I2C read retries taken */
+ static unsigned jt_ts_lost;	/* reads that failed every attempt */
++/* A8 TOUCH debug: raw event dump and per-poll read lines.  Off by default:
++ * two printf() per event to the framebuffer console is itself load on the
++ * drain path the swipe depends on.  a8touchverbose=1 turns it back on. */
++static bool jt_ts_verbose;
+ 
+ static void
+ jackpotlte_touch_wait(unsigned ms)
+@@ -1442,9 +1451,11 @@
+ 	unsigned x;
+ 	unsigned y;
+ 
+-	printf("A8 TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x eid=%u tid=%u act=%u\n",
+-	    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7],
+-	    eid, tid, action);
++	if (jt_ts_verbose) {
++		printf("A8 TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x eid=%u tid=%u act=%u\n",
++		    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7],
++		    eid, tid, action);
++	}
+ 	if (eid == JTTS_EVENT_STATUS) {
+ 		unsigned stype = (ev[0] >> 2) & 0xfu;
+ 		unsigned status_id = ev[1];
+@@ -1465,7 +1476,7 @@
+ 			printf("A8 TOUCH: IC event queue full, release all\n");
+ 			jackpotlte_touch_release_all();
+ 		}
+-		return;		/* status/other event: already logged raw */
++		return;		/* other status event: nothing to forward */
+ 	}
+ 	if (eid != JTTS_EVENT_COORDINATE || tid == 0 || tid > 5) {
+ 		return;
+@@ -1483,18 +1494,27 @@
+ 	if (y > 1919u) {
+ 		y = 1919u;
+ 	}
+-	printf("A8 TOUCH: %s id=%u raw=(%u,%u) panel=(%u,%u)\n",
+-	    action == 1u ? "press" : action == 2u ? "move" : "release",
+-	    tid, rx, ry, x, y);
+ 	if (action == 1u || action == 2u) {		/* press, move */
+ 		if (action == 2u) {
++			/* Movement is what a swipe is made of, and it can
++			 * arrive as a burst of up to the whole queue depth.
++			 * It is counted, not printed: a printf() per event
++			 * to the framebuffer console is itself load on the
++			 * drain the swipe depends on (the S8 driver prints
++			 * only press and release for the same reason).
++			 * a8touchverbose=1 restores the per-event dump. */
+ 			jt_ts_moves++;
++		} else if (!jt_ts_down[tid]) {
++			printf("A8 TOUCH: press id=%u raw=(%u,%u) panel=(%u,%u)\n",
++			    tid, rx, ry, x, y);
+ 		}
+ 		jt_ts_down[tid] = true;
+ 		jt_ts_x[tid] = (uint16_t)x;
+ 		jt_ts_y[tid] = (uint16_t)y;
+ 		sweet_hid_touch((int)tid, 1, (int)x, (int)y);
+ 	} else if (action == 3u && jt_ts_down[tid]) {	/* release */
++		printf("A8 TOUCH: release id=%u raw=(%u,%u) panel=(%u,%u)\n",
++		    tid, rx, ry, x, y);
+ 		jt_ts_down[tid] = false;
+ 		sweet_hid_touch((int)tid, 0, jt_ts_x[tid], jt_ts_y[tid]);
+ 	}
+@@ -1503,7 +1523,7 @@
+ static void
+ jackpotlte_touch_thread(void *arg, wait_result_t result)
+ {
+-	uint8_t buf[8 * 4];
++	uint8_t buf[8 * 32];
+ 	unsigned errors = 0;
+ 	unsigned idle = 0;
+ 	unsigned ticks = 0;
+@@ -1547,34 +1567,39 @@
+ 			jackpotlte_touch_wait(20);
+ 			continue;
+ 		}
+-		printf("A8 TOUCH: read %02x %02x %02x %02x %02x %02x %02x %02x left=%u\n",
+-		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
+-		    buf[7], buf[7] & 0x3fu);
++		if (jt_ts_verbose) {
++			printf("A8 TOUCH: read %02x %02x %02x %02x %02x %02x %02x %02x left=%u\n",
++			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
++			    buf[6], buf[7], buf[7] & 0x3fu);
++		}
+ 		if (!buf[0]) {
+ 			jackpotlte_touch_wait(4);	/* empty queue */
+ 			continue;
+ 		}
+ 		/* buf[7]&0x3f is the number of further events the IC still
+-		 * holds (sec_ts.h:604).  If it exceeds the IC's queue depth
+-		 * the event stream is corrupt; clear it like the native
+-		 * driver (sec_ts.c:995) instead of indexing past buf. */
++		 * holds (sec_ts.h:604).  Take them all in one READ_ALL_EVENT,
++		 * exactly like the working S8 driver (patch 0124).  Reading
++		 * one event per poll could not keep up: the queue reached
++		 * left=35, overflowed, and the release that ends the swipe
++		 * was thrown away, so iOS never saw the touch finish. */
+ 		unsigned left = buf[7] & 0x3fu;
+-		if (left > JTTS_MAX_EVENT_COUNT - 1u) {
+-			printf("A8 TOUCH: event queue overflow left=%u\n", left);
++		if (left >= JTTS_MAX_EVENT_COUNT) {
++			/* Impossible count: the event stream is corrupt.
++			 * Drop what we hold, release every finger we think is
++			 * down so iOS cannot be left stuck on a phantom
++			 * press, and clear the IC queue (sec_ts.c:995). */
++			printf("A8 TOUCH: event queue overflow left=%u, release all\n",
++			    left);
++			jackpotlte_touch_release_all();
+ 			(void)jtts_write_cmd(JTTS_CMD_CLEAR_EVENT_STACK);
+ 			jackpotlte_touch_wait(4);
+ 			continue;
+ 		}
+-		/* Drain the rest only when they fit in buf; jtts_read_reg
+-		 * caps a single read at 16 bytes (two events).  Any events
+-		 * left behind stay queued and are read one per poll next
+-		 * time the IRQ is low, so nothing is lost. */
+-		unsigned have = 0;
+-		if (left >= 1u && left <= 2u &&
+-		    jtts_read_retry(JTTS_READ_ALL_EVENT, buf + 8, left * 8)) {
+-			have = left;
++		if (left && !jtts_read_retry(JTTS_READ_ALL_EVENT, buf + 8,
++		    left * 8)) {
++			left = 0;	/* report what we have; rest re-queues */
+ 		}
+-		for (unsigned i = 0; i <= have; i++) {
++		for (unsigned i = 0; i <= left; i++) {
+ 			if (buf[i * 8]) {
+ 				jackpotlte_touch_report(buf + i * 8);
+ 			}
+@@ -1742,12 +1767,15 @@
+ 	uint8_t boot = 0;
+ 	uint8_t integrity = 0;
+ 	int enabled = 1;
++	int verbose = 0;
+ 	bool have_id;
+ 
+ 	(void)PE_parse_boot_argn("a8touch", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+ 	}
++	(void)PE_parse_boot_argn("a8touchverbose", &verbose, sizeof(verbose));
++	jt_ts_verbose = (verbose != 0);
+ 	jackpotlte_touch_power_log();
+ 	jackpotlte_touch_power_up();
+ 	jt_ts_bus = ml_io_map(JT_TS_I2C_PA, 0x1000);

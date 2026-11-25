@@ -1,0 +1,55 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -15,6 +15,7 @@
+  * with kIOReturnUnsupported.
+  */
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/pexpert.h>
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -68,6 +69,15 @@
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
+ 
++/*
++ * Every keystore selector used to be logged unconditionally, which on a real
++ * boot floods both the screen and the 4 MiB persistent ring (patch 0047) with
++ * one line per AKS call. Failures stay logged always, since those are the
++ * interesting ones; successful calls only appear with boot-arg
++ * sweetakslog=1.
++ */
++static bool sweet_aks_log_all = false;
++
+ bool
+ AppleKeyStore::start(IOService *provider)
+ {
+@@ -76,6 +86,10 @@
+ 	}
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
++	if (PE_parse_boot_argn("sweetakslog", &sweet_aks_log_all,
++	    sizeof(sweet_aks_log_all))) {
++		IOLog("SWEET AKS: per-selector logging enabled\n");
++	}
+ 	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
+ 	return true;
+ }
+@@ -232,10 +246,12 @@
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	if (sweet_aks_log_all || ret != kIOReturnSuccess) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
