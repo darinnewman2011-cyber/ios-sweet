@@ -60,7 +60,8 @@ if [ ! -x venv/bin/python3 ]; then
 fi
 export PATH=$B/venv/bin:$(brew --prefix bison)/bin:$PATH
 
-INC=$([ -n "$EXTRA" ] && echo ", '$EXTRA'")
+INC=""
+if [ -n "$EXTRA" ]; then INC=", '$EXTRA'"; fi
 cat > cross.ini <<INI
 [binaries]
 c = ['$CLANG', '-target', 'arm64-apple-ios$IOSMIN', '-isysroot', '$SDK'$INC]
