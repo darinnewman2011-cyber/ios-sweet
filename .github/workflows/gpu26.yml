@@ -1,0 +1,33 @@
+name: gpu-userland-ios26
+
+# Beryllium 11: the same GPU userland (gpu/build.sh: mali_test, Mesa panfrost "redwood" GL, "air" Metal) built against
+# Xcode's iOS 26 SDK for the iOS 26 root.
+on:
+  workflow_dispatch:
+  push:
+    branches: [jackpotlte-gpu26]
+    paths: ['gpu/**', '.github/workflows/gpu26.yml']
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          brew install bison
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: Build
+        run: SDK=xcode IOSMIN=26.0 bash gpu/build.sh
+      - name: Checksums
+        if: always()
+        run: shasum -a 256 gpu/out/* || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-userland-ios26
+          path: |
+            gpu/out
+            gpu/build/meson-setup.log

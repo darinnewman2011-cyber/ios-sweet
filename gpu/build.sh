@@ -18,13 +18,23 @@ cd "$(dirname "$0")"
 G=$(pwd)
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
-SDK=${SDK:-$G/sdks/iPhoneOS16.5.sdk}
+IOSMIN=${IOSMIN:-16.0}
+THEOS_SDK=$G/sdks/iPhoneOS16.5.sdk
+SDK=${SDK:-$THEOS_SDK}
+EXTRA=""
+if [ "$SDK" = xcode ]; then
+	# iOS 26 (Beryllium 11): Xcode's iPhoneOS SDK; IOKit headers (Apple leaves them out) come from the theos 16.5 SDK.
+	SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+	mkdir -p "$G/build/iokit-inc"
+	ln -sfn "$THEOS_SDK/System/Library/Frameworks/IOKit.framework/Headers" "$G/build/iokit-inc/IOKit"
+	EXTRA="-I$G/build/iokit-inc"
+fi
 CLANG=$(xcrun -f clang)
-TARGET="-target arm64-apple-ios16.0 -isysroot $SDK"
+TARGET="-target arm64-apple-ios$IOSMIN -isysroot $SDK $EXTRA"
 B=$G/build
 mkdir -p "$B" out
 
-if [ ! -d "$SDK" ]; then
+if [ ! -d "$THEOS_SDK" ]; then
 	git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks "$G/sdks"
 	git -C "$G/sdks" sparse-checkout set iPhoneOS16.5.sdk
 fi
@@ -50,11 +60,12 @@ if [ ! -x venv/bin/python3 ]; then
 fi
 export PATH=$B/venv/bin:$(brew --prefix bison)/bin:$PATH
 
+INC=$([ -n "$EXTRA" ] && echo ", '$EXTRA'")
 cat > cross.ini <<INI
 [binaries]
-c = ['$CLANG', '-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK']
-cpp = ['$CLANG++', '-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK', '-fuse-cxa-atexit']
-objc = ['$CLANG', '-target', 'arm64-apple-ios16.0', '-isysroot', '$SDK']
+c = ['$CLANG', '-target', 'arm64-apple-ios$IOSMIN', '-isysroot', '$SDK'$INC]
+cpp = ['$CLANG++', '-target', 'arm64-apple-ios$IOSMIN', '-isysroot', '$SDK', '-fuse-cxa-atexit'$INC]
+objc = ['$CLANG', '-target', 'arm64-apple-ios$IOSMIN', '-isysroot', '$SDK'$INC]
 ar = '$(xcrun -f ar)'
 ranlib = '$(xcrun -f ranlib)'
 strip = '$(xcrun -f strip)'
