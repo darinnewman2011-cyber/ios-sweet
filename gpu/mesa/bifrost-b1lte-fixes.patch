@@ -1,0 +1,119 @@
+diff -ruN a/src/gallium/drivers/panfrost/pan_nir_lower_sysvals.c b/src/gallium/drivers/panfrost/pan_nir_lower_sysvals.c
+--- a/src/gallium/drivers/panfrost/pan_nir_lower_sysvals.c	2026-11-26 11:27:40
++++ b/src/gallium/drivers/panfrost/pan_nir_lower_sysvals.c	2026-11-26 11:28:05
+@@ -181,6 +181,9 @@
+       nir_imm_int(b, ubo_offset), .align_mul = old->bit_size / 8,
+       .align_offset = 0, .range_base = offset, .range = old->bit_size / 8);
+    nir_def_rewrite_uses(old, val);
++   /* B1L-0090 (ios-b1lte, BSD-2): removed at once, not left for a DCE that may keep it -- a kept
++    * load_ssbo_address emits LEA_BUFFER, a Valhall instruction a Bifrost Mali cannot decode */
++   nir_instr_remove(instr);
+    return true;
+ }
+ 
+diff -ruN a/src/panfrost/compiler/bi_lower_swizzle.c b/src/panfrost/compiler/bi_lower_swizzle.c
+--- a/src/panfrost/compiler/bi_lower_swizzle.c	2026-11-26 11:27:40
++++ b/src/panfrost/compiler/bi_lower_swizzle.c	2026-11-26 11:28:05
+@@ -118,6 +118,15 @@
+    case BI_OPCODE_IADD_IMM_V4I8:
+       break;
+ 
++   case BI_OPCODE_IADD_V4S8:   /* B1L-0094b: no swizzle on src0, identity or a replicated byte on src1 */
++   case BI_OPCODE_IADD_V4U8:
++   case BI_OPCODE_ISUB_V4S8:
++   case BI_OPCODE_ISUB_V4U8:
++      if (src == 1 && (ins->src[src].swizzle == BI_SWIZZLE_H01 ||
++                       bi_swizzle_replicates_8(ins->src[src].swizzle)))
++         return;
++      break;
++
+    case BI_OPCODE_LSHIFT_AND_V4I8:
+    case BI_OPCODE_LSHIFT_OR_V4I8:
+    case BI_OPCODE_LSHIFT_XOR_V4I8:
+@@ -173,9 +182,9 @@
+    /* Lower it away */
+    bi_builder b = bi_init_builder(ctx, bi_before_instr(ins));
+ 
+-   bool is_8 = (bi_opcode_props[ins->op].size == BI_SIZE_8) ||
+-               (bi_opcode_props[ins->op].size == BI_SIZE_32 &&
+-                ins->src[src].swizzle >= BI_SWIZZLE_B0000);
++   /* B1L-0094 (ios-b1lte, BSD-2): the SWZ follows from the swizzle's kind -- a byte swizzle is SWZ.v4i8's, a
++    * halfword one SWZ.v2i16's; each cannot encode the other (garbage packed in backboardd's main shader A2Xghfc) */
++   bool is_8 = ins->src[src].swizzle >= BI_SWIZZLE_B0000;
+ 
+    bi_index orig = ins->src[src];
+    bi_index stripped = bi_replace_index(bi_null(), orig);
+diff -ruN a/src/panfrost/compiler/bifrost_compile.c b/src/panfrost/compiler/bifrost_compile.c
+--- a/src/panfrost/compiler/bifrost_compile.c	2026-11-26 11:27:40
++++ b/src/panfrost/compiler/bifrost_compile.c	2026-11-26 11:28:05
+@@ -2025,6 +2025,10 @@
+       bi_mov_i32_to(b, dst, bi_vertex_id(b));
+       break;
+ 
++   case nir_intrinsic_load_raw_vertex_offset_pan:   /* B1L-0090: left behind by the sysval lowering */
++      bi_mov_i32_to(b, dst, bi_imm_u32(0));
++      break;
++
+    case nir_intrinsic_load_instance_id:
+       bi_mov_i32_to(b, dst, bi_instance_id(b));
+       break;
+@@ -5314,6 +5318,24 @@
+       nir_metadata_control_flow, NULL);
+ }
+ 
++/* B1L-0090 (ios-b1lte, BSD-2): Bifrost before v9 stores vertex varyings in 32 bits only (bi_emit_store_vary:
++ * "T_size == 32 || (arch >= 9 && T_size == 16)"); Metal's _lph shaders store half. Widened here; the fragment side
++ * keeps reading half (LD_VAR converts). */
++static bool
++b1l_widen_vs_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   (void)data;
++   if (intr->intrinsic != nir_intrinsic_store_output || intr->src[0].ssa->bit_size != 16)
++      return false;
++   nir_alu_type t = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def *v = intr->src[0].ssa;
++   nir_def *w = t == nir_type_float ? nir_f2f32(b, v) : t == nir_type_int ? nir_i2i32(b, v) : nir_u2u32(b, v);
++   nir_src_rewrite(&intr->src[0], w);
++   nir_intrinsic_set_src_type(intr, t | 32);
++   return true;
++}
++
+ void
+ bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
+ {
+@@ -5383,6 +5405,9 @@
+       if (gpu_id >= 0x9000) {
+          NIR_PASS(_, nir, nir_lower_mediump_io, nir_var_shader_out,
+                   BITFIELD64_BIT(VARYING_SLOT_PSIZ), false);
++      } else {
++         NIR_PASS(_, nir, nir_shader_intrinsics_pass, b1l_widen_vs_output,
++                  nir_metadata_control_flow, NULL);   /* B1L-0090 */
+       }
+ 
+       NIR_PASS(_, nir, pan_nir_lower_store_component);
+diff -ruN a/src/panfrost/util/pan_lower_noperspective.c b/src/panfrost/util/pan_lower_noperspective.c
+--- a/src/panfrost/util/pan_lower_noperspective.c	2026-11-26 11:27:40
++++ b/src/panfrost/util/pan_lower_noperspective.c	2026-11-26 11:28:05
+@@ -182,7 +182,10 @@
+       is_noperspective_output(b, sem.location, state->noperspective_outputs);
+ 
+    nir_def *old_value = intrin->src[0].ssa;
+-   nir_def *noperspective_value = nir_fmul(b, old_value, state->pos_w);
++   /* B1L-0088 (ios-b1lte, BSD-2): w at the varying's own size; a half varying times a float w packed an invalid
++    * Bifrost instruction (INSTR_INVALID_ENC) */
++   nir_def *noperspective_value =
++      nir_fmul(b, old_value, nir_f2fN(b, state->pos_w, old_value->bit_size));
+    nir_def *new_value =
+       nir_bcsel(b, is_noperspective, noperspective_value, old_value);
+ 
+@@ -206,7 +209,8 @@
+    nir_def *bary = intrin->src[0].ssa;
+    nir_def *fragcoord_w = nir_load_frag_coord_zw_pan(b, bary, .component = 3);
+ 
+-   nir_def *new_value = nir_fmul(b, &intrin->def, fragcoord_w);
++   /* B1L-0088 (ios-b1lte, BSD-2): fragcoord.w at the varying's own size */
++   nir_def *new_value = nir_fmul(b, &intrin->def, nir_f2fN(b, fragcoord_w, intrin->def.bit_size));
+    nir_def_rewrite_uses_after(&intrin->def, new_value, new_value->parent_instr);
+ 
+    return true;
