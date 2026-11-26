@@ -20,6 +20,11 @@
 #include <string.h>
 #include "m2m.h"
 
+/* NSInvocation can call a given implementation (Foundation has it; the SDK header does not declare it) */
+@interface NSInvocation (RWTInvokeIMP)
+- (void)invokeUsingIMP:(IMP)imp;
+@end
+
 #define RWT_PREFIX      "rwtrace_"
 static unsigned rwt_first = 2;  /* calls of one selector logged as they happen (AegirPoster: 6, it builds and drops renderers) */
 #define RWT_SELECTORS   1024
@@ -110,8 +115,21 @@ rwt_forward(id self, SEL _cmd, NSInvocation *invocation)
 
 	(void)_cmd;
 	if (!class_respondsToSelector(cls, alias)) {
-		rwt_say("%s: -%s is not a method here (forwarded and unknown)", class_getName(cls), sel_getName(sel));
-		[self doesNotRecognizeSelector:sel];
+		/* r26-m11: iOS 26's -setResponsibleTaskIDs:count: arrived here with no alias and the unrecognized-selector
+		 * exception aborted backboardd. A method the tracer cannot find is answered by the superclass's own
+		 * implementation when there is one, and otherwise ignored (with a zero return) -- never an abort. */
+		rwt_say("%s: -%s is not a method here (forwarded and unknown); passed on", class_getName(cls),
+		    sel_getName(sel));
+		Class super = class_getSuperclass(cls);
+		IMP imp = super != Nil ? class_getMethodImplementation(super, sel) : NULL;
+		if (imp != NULL && imp != (IMP)_objc_msgForward && class_respondsToSelector(super, sel)) {
+			[invocation invokeUsingIMP:imp];
+		} else if ([[invocation methodSignature] methodReturnLength] > 0) {
+			char zero[64] = { 0 };
+			if ([[invocation methodSignature] methodReturnLength] <= sizeof(zero)) {
+				[invocation setReturnValue:zero];
+			}
+		}
 		return;
 	}
 	unsigned n = rwt_count(cls, sel);
@@ -292,8 +310,9 @@ rwt_start(void)
 	pthread_t thread;
 
 	/* AegirPoster too (G9 run 34): with ASTC textures served it makes its queues and then no command buffer */
+	/* opt-in since r26-m11 (it aborted backboardd on iOS 26): RWA_CALLTRACE=1 in the process's environment */
 	if ((strcmp(getprogname(), "backboardd") != 0 && strcmp(getprogname(), "AegirPoster") != 0) ||
-	    (off != NULL && off[0] == '0')) {
+	    off == NULL || off[0] != '1') {
 		return;
 	}
 	if (strcmp(getprogname(), "backboardd") != 0) {
