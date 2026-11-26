@@ -6257,6 +6257,7 @@ apply_function_constants(struct air_constant_value *module, unsigned count,
                         : given[g].index >= 0 && (unsigned)given[g].index == module[i].index;
          if (same) {
             module[i].bits = given[g].bits;
+            memcpy(module[i].hi, given[g].hi, sizeof(module[i].hi));
             module[i].undefined = false;
             matched++;
             break;

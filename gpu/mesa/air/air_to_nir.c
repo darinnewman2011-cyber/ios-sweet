@@ -554,15 +554,21 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
        * first thing that would tell a wrong packing from a right one is a
        * pipeline that sets one of these two constants.
        */
-      if (comps * bits > 64)
+      /* up to 256 bits: air_constant_value carries bits (0..63) and hi[] (64..255), so a float4 or a
+       * long2 fits (RenderBox has 23 such pipelines). Component i sits at bit i*width, little-endian. */
+      if (comps * bits > 256)
          return air_error(c, "interface: a function constant of %u components of %u bits, "
-                             "which does not fit the one word air_constant_value carries",
+                             "wider than the 256 bits air_constant_value carries",
                           comps, bits), NULL;
+      const uint64_t words[4] = { v->bits, v->hi[0], v->hi[1], v->hi[2] };
       nir_def *fields[NIR_MAX_VEC_COMPONENTS];
       for (unsigned i = 0; i < comps; i++) {
+         unsigned at = i * bits;
          uint64_t mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
-         fields[i] = nir_imm_intN_t(&c->b, (v->bits >> (i * bits)) & mask,
-                                    as_bool ? 8 : bits);
+         uint64_t w = words[at / 64] >> (at % 64);
+         if (at % 64 && at % 64 + bits > 64)
+            w |= words[at / 64 + 1] << (64 - at % 64);
+         fields[i] = nir_imm_intN_t(&c->b, w & mask, as_bool ? 8 : bits);
       }
       res = nir_vec(&c->b, fields, comps);
       break;
@@ -1632,6 +1638,35 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
    return air_val_ptr(c, p);
 }
 
+static int function_constant_index(struct air_ctx *c, const struct air_global *g);
+static bool is_agg_type(const struct air_type *t);
+
+/* An argument that only EXISTS when a function constant is true (`[[color(0), function_constant(blend)]]`): the
+ * input node carries !"air.function_constant", !{ptr @fc, !"bool", !"name"}. With the constant false (or not given)
+ * Metal drops the argument, so it is undef here and nothing about it is declared -- RenderBox's accumulator and path
+ * fragment shaders read the framebuffer only when blending is on (19 refusals before this). Returns 1 when the
+ * argument is absent, 0 when present, -1 when the predicate cannot be read. */
+static int
+input_absent_by_constant(struct air_ctx *c, const struct air_md *node)
+{
+   const struct air_md *fc = md_key_node(node, "air.function_constant");
+   if (!fc)
+      return 0;
+   /* the predicate's own name (operand 2), matched against the values the pipeline gave; the global (operand 0)
+    * when it resolves to an !air.function_constants index */
+   const char *name = md_str(fc, 2);
+   int idx = -1;
+   if (fc->num_ops && fc->ops[0] && fc->ops[0]->kind == AIR_MD_VALUE && fc->ops[0]->value &&
+       fc->ops[0]->value->kind == AIR_VALUE_GLOBAL)
+      idx = function_constant_index(c, (const struct air_global *)fc->ops[0]->value);
+   for (unsigned i = 0; c->options && i < c->options->num_constants; i++) {
+      const struct air_constant_value *v = &c->options->constants[i];
+      if ((idx >= 0 && (int)v->index == idx) || (name && v->name && !strcmp(name, v->name)))
+         return v->undefined || !(v->bits & 1);
+   }
+   return 0;   /* not found: keep the argument (the old behaviour) */
+}
+
 static bool
 translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_varying)
 {
@@ -1642,6 +1677,21 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       return air_error(c, "interface: input for parameter %u of %u", (unsigned)param,
                        c->fn->num_args);
    const struct air_type *t = c->fn->args[param].type;
+
+   int absent = input_absent_by_constant(c, node);
+   if (absent < 0)
+      return air_error(c, "interface: an input whose air.function_constant predicate cannot be read");
+   if (absent) {
+      if (t->kind == AIR_TYPE_POINTER) {
+         struct air_ptr p = { .class = AIR_PTR_NONE, .pointee = t->elem };
+         c->params[param] = air_val_ptr(c, p);
+      } else if (is_agg_type(t)) {
+         c->params[param] = air_val_agg(c, t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count);
+      } else {
+         c->params[param] = air_val_ssa(c, nir_undef(&c->b, air_nir_components(t), air_nir_bit_size(c, t)));
+      }
+      return true;
+   }
 
    /* resources */
    if (md_key(node, "air.buffer") >= 0) {
@@ -1832,8 +1882,21 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          return true;
       }
       uint64_t n = 0;
-      if (!md_int(node, rt_in + 1, &n))
-         return air_error(c, "interface: an air.render_target input without a target");
+      if (!md_int(node, rt_in + 1, &n)) {
+         /* AIR v28 (iOS 26): the attachment index may be a CONSTANT GLOBAL -- a function constant, or one derived
+          * from one in llvm.global_ctors (RenderBox: `[[color(dest_index)]]`-style). A plain function constant
+          * gives its value; a derived one is not evaluated here, and RenderBox draws into one attachment, so it is
+          * attachment 0 -- noted, not refused (19 RenderBox fragment shaders stopped here). */
+         const struct air_md *vm = rt_in + 1 < (int)node->num_ops ? node->ops[rt_in + 1] : NULL;
+         const struct air_value *gv = vm && vm->kind == AIR_MD_VALUE ? vm->value : NULL;
+         if (!gv || gv->kind != AIR_VALUE_GLOBAL)
+            return air_error(c, "interface: an air.render_target input without a target");
+         n = 0;
+         int idx = function_constant_index(c, (const struct air_global *)gv);
+         for (unsigned i = 0; idx >= 0 && c->options && i < c->options->num_constants; i++)
+            if ((int)c->options->constants[i].index == idx)
+               n = c->options->constants[i].bits;
+      }
       if (n >= MAX_DRAW_BUFFERS)
          return air_error(c, "interface: air.render_target input %u", (unsigned)n);
       /* Only a float target. The lowering hands back floats converted from the
@@ -2362,26 +2425,36 @@ translate_cmp(struct air_ctx *c, const struct air_inst *in)
    return true;
 }
 
-/* an aggregate value's field, by the index path of extract/insertvalue */
+/* an aggregate value's field, by the index path of extract/insertvalue. `t` is the aggregate's type, walked
+ * alongside: a member that is itself an aggregate but was never built (an undef struct insertvalue fills one inner
+ * field at a time -- RenderBox's path and gradient vertex shaders, 19 of them) is CREATED, empty, when `create`
+ * (insertvalue), and read as "unset" -- a NULL slot -- when not (extractvalue), instead of being refused. */
 static struct air_val **
-agg_slot(struct air_ctx *c, struct air_val *agg, const uint32_t *idx, unsigned n)
+agg_slot(struct air_ctx *c, struct air_val *agg, const struct air_type *t, const uint32_t *idx, unsigned n,
+         bool create)
 {
-   /* extractvalue and insertvalue always carry at least one index. Without this
-    * the loop below never runs and the function returns the address of its own
-    * parameter -- which gcc points out (-Wreturn-local-addr) and which would be
-    * a write through a dead stack slot if anything ever took the path.
-    */
+   static struct air_val *unset;
    if (!n) {
       air_error(c, "instruction: an aggregate access with no index");
       return NULL;
    }
    struct air_val **slot = &agg;
    for (unsigned i = 0; i < n; i++) {
+      if (!*slot && t && (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY)) {
+         if (!create) {
+            unset = NULL;
+            return &unset;
+         }
+         *slot = air_val_agg(c, t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count);
+      }
       if (!*slot || (*slot)->kind != AIR_VAL_AGG || idx[i] >= (*slot)->num_elems) {
          air_error(c, "instruction: an aggregate index out of its value");
          return NULL;
       }
       slot = &(*slot)->elems[idx[i]];
+      if (t)
+         t = t->kind == AIR_TYPE_STRUCT ? (idx[i] < t->num_members ? t->members[idx[i]] : NULL)
+           : t->kind == AIR_TYPE_ARRAY ? t->elem : NULL;
    }
    return slot;
 }
@@ -2591,9 +2664,16 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *agg = air_get(c, in->operands[0]);
       if (!agg)
          return false;
-      struct air_val **slot = agg_slot(c, agg, in->indices, in->num_indices);
+      struct air_val **slot = agg_slot(c, agg, in->operands[0]->type, in->indices, in->num_indices, false);
       if (!slot)
          return false;
+      if (!*slot && (in->base.type->kind == AIR_TYPE_STRUCT || in->base.type->kind == AIR_TYPE_ARRAY)) {
+         /* an unset aggregate member of an undef aggregate: itself an empty aggregate */
+         air_set(c, &in->base, air_val_agg(c, in->base.type->kind == AIR_TYPE_STRUCT
+                                                 ? in->base.type->num_members
+                                                 : (unsigned)in->base.type->count));
+         return true;
+      }
       if (!*slot) {
          /* a field of an undef aggregate */
          air_set(c, &in->base,
@@ -2610,7 +2690,7 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       if (!agg || !val)
          return false;
       struct air_val *copy = clone_val(c, agg);
-      struct air_val **slot = agg_slot(c, copy, in->indices, in->num_indices);
+      struct air_val **slot = agg_slot(c, copy, in->operands[0]->type, in->indices, in->num_indices, true);
       if (!slot)
          return false;
       *slot = val;
@@ -2879,6 +2959,87 @@ val_holds_ptr(const struct air_val *v)
  * phis are all keyed on this function's own objects, and leaving the caller's
  * entries in place would let a callee resolve a value it cannot see.
  */
+/* A struct or array ARGUMENT passed by value: one NIR parameter per number in it, in member order, and the callee
+ * rebuilds the aggregate from them -- a NIR parameter carries one value, and an aggregate is a tree of values here.
+ * RenderBox, the poster extensions and CoreImage pass small structs (vertex state, colours, matrices as arrays of
+ * vectors) to helper functions by value; before this the callee's first extractvalue of the parameter failed with
+ * "an array/struct where a number belongs" (41 functions in the UI libraries). */
+static bool
+is_agg_type(const struct air_type *t)
+{
+   return t && (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY);
+}
+
+static int
+agg_leaf_count(const struct air_type *t)
+{
+   if (!is_agg_type(t))
+      return t && t->kind == AIR_TYPE_POINTER ? -1 : 1;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+   if (t->kind == AIR_TYPE_ARRAY && t->count > 64)
+      return -1;
+   int sum = 0;
+   for (unsigned i = 0; i < n; i++) {
+      int k = agg_leaf_count(t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+      if (k < 0)
+         return -1;
+      sum += k;
+   }
+   return sum;
+}
+
+static void
+agg_params_add(struct air_ctx *c, nir_function *fn, unsigned *idx, const struct air_type *t)
+{
+   if (!is_agg_type(t)) {
+      fn->params[(*idx)++] = (nir_parameter){
+         .num_components = (uint8_t)air_nir_components(t),
+         .bit_size = (uint8_t)air_nir_bit_size(c, t),
+      };
+      return;
+   }
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+   for (unsigned i = 0; i < n; i++)
+      agg_params_add(c, fn, idx, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+}
+
+static struct air_val *
+agg_params_load(struct air_ctx *c, unsigned *pidx, const struct air_type *t)
+{
+   if (!is_agg_type(t))
+      return air_val_ssa(c, nir_load_param(&c->b, (*pidx)++));
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+   struct air_val *v = air_val_agg(c, n);
+   for (unsigned i = 0; i < n; i++)
+      v->elems[i] = agg_params_load(c, pidx, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+   return v;
+}
+
+static bool
+agg_params_pass(struct air_ctx *c, nir_call_instr *call, unsigned *idx, const struct air_type *t,
+                const struct air_val *v)
+{
+   if (!is_agg_type(t)) {
+      nir_def *d;
+      if (!v || v->kind == AIR_VAL_NONE)
+         d = nir_undef(&c->b, air_nir_components(t), air_nir_bit_size(c, t));
+      else if (v->kind == AIR_VAL_SSA)
+         d = v->def;
+      else
+         return air_error(c, "intrinsic: an aggregate argument whose member is not a number");
+      call->params[(*idx)++] = nir_src_for_ssa(d);
+      return true;
+   }
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+   if (v && v->kind != AIR_VAL_AGG && v->kind != AIR_VAL_NONE)
+      return air_error(c, "intrinsic: an aggregate argument that is not an aggregate");
+   for (unsigned i = 0; i < n; i++)
+      if (!agg_params_pass(c, call, idx, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem,
+                           v && v->kind == AIR_VAL_AGG && i < v->num_elems ? v->elems[i] : NULL))
+         return false;
+   return true;
+}
+
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
                  struct air_val **argv, bool *is_param, bool *offset_param)
@@ -2953,6 +3114,16 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       nret = 1;
    }
    unsigned nparams = f->num_args + nret;
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (is_param[i] && !offset_param[i] && is_agg_type(f->args[i].type)) {
+         int k = agg_leaf_count(f->args[i].type);
+         if (k < 0) {
+            air_error(c, "intrinsic: an aggregate argument holding a pointer or a large array");
+            return NULL;
+         }
+         nparams += (unsigned)k;
+      }
+   }
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -2988,6 +3159,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       if (!is_param[i])
          continue;
       const struct air_type *at = f->args[i].type;
+      if (is_agg_type(at)) {
+         agg_params_add(c, fn, &idx, at);
+         continue;
+      }
       fn->params[idx++] = (nir_parameter){
          .num_components = (uint8_t)air_nir_components(at),
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
@@ -3068,6 +3243,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       }
       if (!is_param[i]) {
          air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
+         continue;
+      }
+      if (is_agg_type(f->args[i].type)) {
+         air_set(c, &f->args[i], agg_params_load(c, &pidx, f->args[i].type));
          continue;
       }
       air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
@@ -3168,6 +3347,11 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
       }
       if (!is_param[i])
          continue;
+      if (is_agg_type(f->args[i].type)) {
+         if (!agg_params_pass(c, call, &idx, f->args[i].type, argv[i]))
+            return false;
+         continue;
+      }
       nir_def *a = air_get_ssa(c, in->operands[i + 1]);
       if (!a)
          return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
@@ -3378,6 +3562,68 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
    return true;
 }
 
+/* A phi of an AGGREGATE (struct or array): a tree of registers, one per number in it -- the "one phi per member"
+ * form -- because a struct is a tree of values here and never one NIR value. Loaded as a tree where the phi stands,
+ * stored member by member at the end of every predecessor. RenderBox's uber shader (SpringBoard's SwiftUI renderer)
+ * carries its whole fragment state across a branch this way once its function constants are applied (r26-m9). A
+ * pointer member has no bits for a register and is refused; a member the incoming value leaves unset (an undef
+ * aggregate that insertvalue never filled) stores nothing, as LLVM's undef allows. */
+struct air_phi_slot {
+   nir_def *reg;            /* a phi of a number; for a pointer phi, its 32-bit byte offset */
+   struct air_val *tree;    /* a phi of an aggregate: AIR_VAL_AGG nodes, AIR_VAL_SSA leaves whose def is a register */
+   bool is_ptr;             /* a pointer phi whose operands share a resource and differ only in offset */
+   struct air_ptr base;     /* ... that resource */
+};
+
+static struct air_val *
+phi_tree_decl(struct air_ctx *c, nir_builder *b, const struct air_type *t)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      if (t->kind == AIR_TYPE_ARRAY && t->count > 256)
+         return air_error(c, "instruction: a phi of an array of %llu elements", (unsigned long long)t->count), NULL;
+      struct air_val *v = air_val_agg(c, n);
+      for (unsigned i = 0; i < n; i++)
+         if (!(v->elems[i] = phi_tree_decl(c, b, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem)))
+            return NULL;
+      return v;
+   }
+   if (t->kind == AIR_TYPE_POINTER)
+      return air_error(c, "instruction: a phi of an aggregate that holds a pointer"), NULL;
+   return air_val_ssa(c, nir_decl_reg(b, air_nir_components(t), air_nir_bit_size(c, t), 0));
+}
+
+static struct air_val *
+phi_tree_load(struct air_ctx *c, const struct air_val *tree)
+{
+   if (tree->kind == AIR_VAL_AGG) {
+      struct air_val *v = air_val_agg(c, tree->num_elems);
+      for (unsigned i = 0; i < tree->num_elems; i++)
+         v->elems[i] = phi_tree_load(c, tree->elems[i]);
+      return v;
+   }
+   return air_val_ssa(c, nir_load_reg(&c->b, tree->def));
+}
+
+static bool
+phi_tree_store(struct air_ctx *c, const struct air_val *tree, const struct air_val *val)
+{
+   if (!val || val->kind == AIR_VAL_NONE)
+      return true;
+   if (tree->kind == AIR_VAL_AGG) {
+      if (val->kind != AIR_VAL_AGG || val->num_elems != tree->num_elems)
+         return air_error(c, "instruction: a phi of an aggregate whose operand has another shape");
+      for (unsigned i = 0; i < tree->num_elems; i++)
+         if (!phi_tree_store(c, tree->elems[i], val->elems[i]))
+            return false;
+      return true;
+   }
+   if (val->kind != AIR_VAL_SSA)
+      return air_error(c, "instruction: a phi of an aggregate whose member is not a number");
+   nir_store_reg(&c->b, val->def, tree->def);
+   return true;
+}
+
 /* A phi of POINTERS, resolved rather than carried in a register.
  *
  * A pointer here is *(which resource, which byte offset)* decided while
@@ -3403,14 +3649,15 @@ static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
    struct air_val *first = NULL;
+   bool carried = false;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e)
-         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
-                             "a loop edge, so which resource it is depends on the "
-                             "iteration");
+      if (!e) {
+         carried = true;   /* over a loop edge: decided below, checked when the edge is stored */
+         continue;
+      }
       struct air_val *v = e->data;
       if (!v || v->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a phi of pointers one of whose operands is "
@@ -3419,13 +3666,36 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                                       : "not a resolved pointer");
       if (!first)
          first = v;
-      else if (!same_ptr(&first->ptr, &v->ptr))
-         return air_error(c, "instruction: a phi between pointers that name different "
-                             "places, which would have to be chosen at run time");
+      else if (!same_ptr(&first->ptr, &v->ptr)) {
+         if (first->ptr.class != v->ptr.class || first->ptr.binding != v->ptr.binding ||
+             first->ptr.is_image != v->ptr.is_image)
+            return air_error(c, "instruction: a phi between pointers that name different "
+                                "places, which would have to be chosen at run time");
+         carried = true;   /* same resource, another offset */
+      }
    }
    if (!first)
       return air_error(c, "instruction: a phi of pointers with no reachable operand");
-   air_set(c, &in->base, first);
+   if (!carried) {
+      air_set(c, &in->base, first);
+      return true;
+   }
+   /* One resource, an offset that changes (a pointer walked through a buffer in a loop: RenderBox's path_distance /
+    * path_exterior, r26-m9). The resource is fixed at translation; the offset becomes a register, stored at the end
+    * of every predecessor like any phi -- and an operand that turns out to name another resource is refused there. */
+   if (first->ptr.class == AIR_PTR_TEXTURE || first->ptr.class == AIR_PTR_SAMPLER ||
+       first->ptr.class == AIR_PTR_ARGBUF || first->ptr.class == AIR_PTR_NONE)
+      return air_error(c, "instruction: a phi of %s pointers whose offset changes",
+                       first->ptr.class == AIR_PTR_ARGBUF ? "argument-buffer" : "handle");
+   nir_builder e = nir_builder_at(nir_before_impl(c->b.impl));
+   struct air_phi_slot *slot = rzalloc(c->mem_ctx, struct air_phi_slot);
+   slot->is_ptr = true;
+   slot->base = first->ptr;
+   slot->reg = nir_decl_reg(&e, 1, 32, 0);
+   _mesa_hash_table_insert(c->phi_regs, in, slot);
+   struct air_ptr p = first->ptr;
+   p.offset = nir_load_reg(&c->b, slot->reg);
+   air_set(c, &in->base, air_val_ptr(c, p));
    return true;
 }
 
@@ -3457,14 +3727,16 @@ translate_body(struct air_ctx *c)
           * "a returned struct that was never built" -- true of the module, and
           * not what is wrong with it.
           */
+         struct air_phi_slot *slot = rzalloc(c->mem_ctx, struct air_phi_slot);
          if (in->base.type->kind == AIR_TYPE_STRUCT ||
-             in->base.type->kind == AIR_TYPE_ARRAY)
-            return air_error(c, "instruction: a phi of %s, which NIR has no register for",
-                             in->base.type->kind == AIR_TYPE_STRUCT ? "a struct"
-                                                                    : "an array");
-         nir_def *reg = nir_decl_reg(&entry, air_nir_components(in->base.type),
+             in->base.type->kind == AIR_TYPE_ARRAY) {
+            if (!(slot->tree = phi_tree_decl(c, &entry, in->base.type)))
+               return false;
+         } else {
+            slot->reg = nir_decl_reg(&entry, air_nir_components(in->base.type),
                                      air_nir_bit_size(c, in->base.type), 0);
-         _mesa_hash_table_insert(c->phi_regs, in, reg);
+         }
+         _mesa_hash_table_insert(c->phi_regs, in, slot);
       }
    }
 
@@ -3496,8 +3768,9 @@ translate_body(struct air_ctx *c)
             continue;
          }
          struct hash_entry *e = _mesa_hash_table_search(c->phi_regs, in);
-         air_set(c, &in->base,
-                 air_val_ssa(c, nir_load_reg(&c->b, e->data)));
+         const struct air_phi_slot *slot = e->data;
+         air_set(c, &in->base, slot->tree ? phi_tree_load(c, slot->tree)
+                                          : air_val_ssa(c, nir_load_reg(&c->b, slot->reg)));
       }
 
       for (unsigned i = 0; i < blk->num_insts; i++) {
@@ -3621,10 +3894,26 @@ translate_body(struct air_ctx *c)
             if (!ce)
                continue; /* an edge from a block the entry cannot reach */
             c->b.cursor = *(nir_cursor *)ce->data;
-            nir_def *val = air_get_ssa(c, in->operands[k]);
-            if (!val)
-               return false;
-            nir_store_reg(&c->b, val, re->data);
+            const struct air_phi_slot *slot = re->data;
+            if (slot->is_ptr) {
+               struct air_val *pv = air_get(c, in->operands[k]);
+               if (!pv)
+                  return false;
+               if (pv->kind != AIR_VAL_PTR || pv->ptr.class != slot->base.class ||
+                   pv->ptr.binding != slot->base.binding || pv->ptr.is_image != slot->base.is_image)
+                  return air_error(c, "instruction: a phi of pointers whose loop-carried operand "
+                                      "names another resource");
+               nir_store_reg(&c->b, pv->ptr.offset ? pv->ptr.offset : nir_imm_int(&c->b, 0), slot->reg);
+            } else if (slot->tree) {
+               struct air_val *agg = air_get(c, in->operands[k]);
+               if (!agg || !phi_tree_store(c, slot->tree, agg))
+                  return false;
+            } else {
+               nir_def *val = air_get_ssa(c, in->operands[k]);
+               if (!val)
+                  return false;
+               nir_store_reg(&c->b, val, slot->reg);
+            }
             /* later stores into the same block go after this one */
             *(nir_cursor *)ce->data = c->b.cursor;
          }

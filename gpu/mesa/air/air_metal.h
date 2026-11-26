@@ -871,6 +871,7 @@ struct rwa_function_constant {
 	int index;
 	const char *name;
 	uint64_t bits;
+	uint64_t hi[3];	/* bits 64..255 of a vector constant (float4...) */
 };
 
 struct rwa_render_shape {

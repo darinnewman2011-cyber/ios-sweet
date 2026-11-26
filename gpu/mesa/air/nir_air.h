@@ -339,7 +339,8 @@ struct air_sampler_state air_decode_sampler_state(uint64_t word);
 
 struct air_constant_value {
    unsigned index;     /* the function constant's index */
-   uint64_t bits;      /* its value, as the bits of its type */
+   uint64_t bits;      /* its value, as the bits of its type (the first 64 of them) */
+   uint64_t hi[3];     /* bits 64..255 of a wider (vector) constant, e.g. a float4: zero otherwise */
    const char *name;   /* its name in the module (air.function_constants), or NULL */
    /* The pipeline gave no value for it: air.is_function_constant_defined answers false, and
     * a load still reads `bits` (0), because what Metal leaves in an undefined constant is

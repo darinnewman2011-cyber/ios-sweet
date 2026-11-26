@@ -215,6 +215,7 @@ struct rwa_function_constant {
 	int index;
 	const char *name;
 	uint64_t bits;
+	uint64_t hi[3];	/* bits 64..255 of a vector constant (float4...) */
 };
 struct rwa_render_shape {
 	unsigned color_format[8];
@@ -2447,7 +2448,9 @@ rw_fc_from_storage(id values, struct rwa_function_constant *out, unsigned max, N
 			if (bytes == NULL) {
 				continue;
 			}
-			memcpy(&bits, bytes, MIN(rw_mtl_data_type_size(type), sizeof(bits)));
+			uint64_t words[4] = { 0 };
+			memcpy(words, bytes, MIN(rw_mtl_data_type_size(type), sizeof(words)));
+			bits = words[0];
 			if (s == 0) {
 				NSString *name = ((id (*)(id, SEL))objc_msgSend)(v, name_sel);
 
@@ -2463,6 +2466,7 @@ rw_fc_from_storage(id values, struct rwa_function_constant *out, unsigned max, N
 				out[n].name = NULL;
 			}
 			out[n].bits = bits;
+			memcpy(out[n].hi, words + 1, sizeof(out[n].hi));
 			n++;
 		}
 		[a release];
@@ -2484,7 +2488,9 @@ rw_fc_from_record(id values, struct rwa_function_constant *out, unsigned max, NS
 		if (n >= max) {
 			break;
 		}
-		memcpy(&bits, [bytes bytes], MIN([bytes length], sizeof(bits)));
+		uint64_t words[4] = { 0 };
+		memcpy(words, [bytes bytes], MIN([bytes length], sizeof(words)));
+		bits = words[0];
 		if ([key isKindOfClass:[NSNumber class]]) {
 			out[n].index = [key intValue];
 			out[n].name = NULL;
@@ -2494,6 +2500,7 @@ rw_fc_from_record(id values, struct rwa_function_constant *out, unsigned max, NS
 			out[n].name = [key UTF8String];
 		}
 		out[n].bits = bits;
+		memcpy(out[n].hi, words + 1, sizeof(out[n].hi));
 		n++;
 	}
 	return n;
