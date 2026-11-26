@@ -5954,6 +5954,47 @@ redwood_clear_semaphore_debt(id commandBuffer)
 	}
 }
 
+/*
+ * iOS 26 sends new messages to a command queue, command buffer and encoders that this driver's classes do not answer
+ * -- -setResponsibleTaskIDs:count: on every command buffer aborted backboardd with an unrecognized-selector
+ * exception (r26-m11, r26-m12). A SETTER the class does not have (a selector starting with "set" that takes
+ * arguments and returns nothing) is answered with a no-op, added on first use and logged once; anything else still
+ * goes to the usual unrecognized-selector path.
+ */
+static void
+rw_noop_setter(id self, SEL _cmd, ...)
+{
+	(void)self;
+	(void)_cmd;
+}
+
+static BOOL
+rw_resolve_setter(Class cls, SEL sel)
+{
+	const char *name = sel_getName(sel);
+	unsigned args = 0;
+	char types[64] = "v@:";
+
+	if (strncmp(name, "set", 3) != 0) {
+		return NO;
+	}
+	for (const char *p = name; *p != 0; p++) {
+		args += *p == ':';
+	}
+	if (args == 0 || args > 8) {
+		return NO;
+	}
+	for (unsigned i = 0; i < args; i++) {
+		strlcat(types, "^v", sizeof(types));
+	}
+	if (!class_addMethod(cls, sel, (IMP)rw_noop_setter, types)) {
+		return NO;
+	}
+	m2m_log('W', "DEV", "%s answers -%s with a no-op (a setter iOS sends that this driver has no method for)\n",
+	    class_getName(cls), name);
+	return YES;
+}
+
 @implementation RedwoodMetalCommandQueue {
 	RedwoodMetalDevice *_owner;
 	NSUInteger _outstanding;        /* buffers of this queue that still hold a slot */
@@ -5967,6 +6008,11 @@ redwood_clear_semaphore_debt(id commandBuffer)
 	 * caller named no completion queue (redwoodAsyncComplete) */
 	dispatch_queue_t _fenceQueue;
 	volatile uint32_t _pendingCompletions;   /* on _fenceQueue now (the slow-completion record says how many were ahead) */
+}
+
++ (BOOL)resolveInstanceMethod:(SEL)sel
+{
+	return rw_resolve_setter(self, sel) || [super resolveInstanceMethod:sel];
 }
 
 - (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device descriptor:(id)descriptor
@@ -6267,6 +6313,18 @@ rw_mps_facts(id commandBuffer, id device)
 	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
 	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
 	dispatch_group_t _inflight;     /* entered at an asynchronous -commit, left once its fence is paid */
+}
+
++ (BOOL)resolveInstanceMethod:(SEL)sel
+{
+	return rw_resolve_setter(self, sel) || [super resolveInstanceMethod:sel];
+}
+
+/* iOS 26: which tasks a command buffer's GPU time is charged to; nothing here keeps per-task GPU accounting */
+- (void)setResponsibleTaskIDs:(const unsigned int *)ids count:(NSUInteger)count
+{
+	(void)ids;
+	(void)count;
 }
 
 /*
@@ -7724,6 +7782,11 @@ rw_hex(char *out, size_t size, const void *bytes, size_t n)
 	unsigned _vertexBufferCount, _fragmentBufferCount;
 	unsigned _fragmentTextureCount, _fragmentSamplerCount;
 	BOOL _complained;
+}
+
++ (BOOL)resolveInstanceMethod:(SEL)sel
+{
+	return rw_resolve_setter(self, sel) || [super resolveInstanceMethod:sel];
 }
 
 - (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer
@@ -9215,6 +9278,11 @@ controlPointIndexBufferOffset:(NSUInteger)controlPointOffset
 	RedwoodMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
 }
 
++ (BOOL)resolveInstanceMethod:(SEL)sel
+{
+	return rw_resolve_setter(self, sel) || [super resolveInstanceMethod:sel];
+}
+
 - (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer
 {
 	self = [super initWithCommandBuffer:commandBuffer];
@@ -9458,6 +9526,11 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(NSUIntege
 	unsigned _highest, _highestTexture, _highestSampler;
 	unsigned _threadgroupLength;
 	BOOL _complained;
+}
+
++ (BOOL)resolveInstanceMethod:(SEL)sel
+{
+	return rw_resolve_setter(self, sel) || [super resolveInstanceMethod:sel];
 }
 
 - (instancetype)initWithRedwoodCommandBuffer:(RedwoodMetalCommandBuffer *)commandBuffer
