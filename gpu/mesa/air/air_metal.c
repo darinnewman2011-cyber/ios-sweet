@@ -71,7 +71,7 @@
 #include "util/set.h"
 
 /* the Metal driver keeps its own copy of this struct (userland/src/redwoodmetal.m) */
-_Static_assert(sizeof(struct rwa_draw) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
+_Static_assert(sizeof(struct rwa_draw) == 336 && offsetof(struct rwa_draw, blend_color) == 328 && offsetof(struct rwa_draw, viewport) == 296 &&
                offsetof(struct rwa_draw, color_level) == 304 && offsetof(struct rwa_draw, depth_level) == 320,
                "struct rwa_draw must match userland/src/redwoodmetal.m");
 
@@ -116,7 +116,7 @@ rwa_unlock(int *guard)
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
- * of the boot, so every later dispatch would be vacuous too (docs/air.md section 5).
+ * of the boot, so every later dispatch would be vacuous too (docs/dev/air.md section 5).
  */
 #define RWA_FENCE_TIMEOUT_NS 2000000000ull
 
@@ -124,7 +124,7 @@ rwa_unlock(int *guard)
  * is where air_run stops, by name, and that refusal is what keeps freedreno's own
  * view_seqno[16] out of reach of its textures[32] -- a fragility a peer session found
  * in fd6_texture_state and which this path must not become the one to reach
- * (docs/air.md section 5). No kernel of the corpus binds a tenth texture, let alone a
+ * (docs/dev/air.md section 5). No kernel of the corpus binds a tenth texture, let alone a
  * seventeenth.
  */
 #define RWA_MAX_TEXTURES 16
@@ -194,7 +194,7 @@ struct rwa_device {
  * Metal's encoder writes an 8-byte handle per member into the destination buffer; this
  * library binds by index and the frontend has already resolved every member to one, so
  * there is nothing to write and the handles would say nothing if there were (air_metal.h,
- * docs/air.md 8.2). So a -setTexture:atIndex: lands here: one slot per Metal `[[id(n)]]`,
+ * docs/dev/air.md 8.2). So a -setTexture:atIndex: lands here: one slot per Metal `[[id(n)]]`,
  * in one encoding, in the DESTINATION BUFFER -- because Metal's object model allows one
  * buffer to hold several encodings at several offsets and to reuse each across many
  * draws, so neither the encoder nor the pipeline is a place a record could live.
@@ -795,6 +795,14 @@ rwa_device_open(char *why, size_t why_size)
       compute_cap(device->screen, PIPE_COMPUTE_CAP_MAX_THREADS_PER_BLOCK, &v) ? v : 0;
    device->thread_execution_width =
       compute_cap(device->screen, PIPE_COMPUTE_CAP_SUBGROUP_SIZES, &v) ? v : 1;
+   /* Never below Apple's 32: Apple's own kernels size their threadgroups and their
+    * threadgroup reductions from it (MPS's statistics kernels read slots 16..31 of a
+    * buffer filled by one thread per slot), and the Mali's 16 made CoreImage launch 16
+    * threads there. A simdgroup_barrier at the top of a kernel is a threadgroup barrier
+    * (air_intrinsics.c barrier_op), which is what makes the wider group correct.
+    */
+   if (device->thread_execution_width < 32)
+      device->thread_execution_width = 32;
 
    /* And what a bound buffer's offset has to be a multiple of, which an argument
     * buffer's member is the only thing here to have one. Taken from the screen and not
@@ -930,7 +938,7 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
    if (!buffer->res) {
       say(why, why_size, "the GPU driver would not allocate %zu bytes. After a few dozen "
                          "allocations in one boot this driver starts refusing outright "
-                         "(docs/air.md section 4)", size);
+                         "(docs/dev/air.md section 4)", size);
       free(buffer);
       return NULL;
    }
@@ -1036,10 +1044,12 @@ texture_type_name(unsigned type)
  * so the translation is the identity on memory and there is nothing in it to get subtly
  * wrong.
  *
- * What is deliberately absent is everything packed into a 32-bit word -- RGB10A2Unorm,
+ * RGB10A2Unorm (90) is supported using Apple's specified low-to-high R/G/B/A
+ * layout and Gallium R10G10B10A2_UNORM; see the GPU clear/readback test.
+ * Other packed 32-bit formats remain declined --
  * RG11B10Float, RGB9E5, the XR formats. Those names order their channels by one
  * convention and Gallium's by another, and a mistake there does not fail: it shifts a
- * channel by two bits in a texture that still looks like a texture. docs/air.md has
+ * channel by two bits in a texture that still looks like a texture. docs/dev/air.md has
  * both shapes of that already -- zero printed as clamp_to_border by one of Apple's own
  * binaries while it means clamp_to_zero (3.3), and three shaders that "passed" against
  * a 2D texture bound where they sample a 3D one (5). A declined format is one sentence;
@@ -1092,6 +1102,36 @@ struct rwa_pixel_format {
 };
 
 static const struct rwa_pixel_format rwa_pixel_formats[] = {
+   /* ASTC, which the Mali decodes itself (asset-catalog images: PosterBoard's wallpaper
+    * snapshots came out without them). Uploads are in blocks: caller_stride. */
+   { 204, "MTLPixelFormatASTC_4x4_LDR", PIPE_FORMAT_ASTC_4x4 },
+   { 186, "MTLPixelFormatASTC_4x4_sRGB", PIPE_FORMAT_ASTC_4x4_SRGB },
+   { 205, "MTLPixelFormatASTC_5x4_LDR", PIPE_FORMAT_ASTC_5x4 },
+   { 187, "MTLPixelFormatASTC_5x4_sRGB", PIPE_FORMAT_ASTC_5x4_SRGB },
+   { 206, "MTLPixelFormatASTC_5x5_LDR", PIPE_FORMAT_ASTC_5x5 },
+   { 188, "MTLPixelFormatASTC_5x5_sRGB", PIPE_FORMAT_ASTC_5x5_SRGB },
+   { 207, "MTLPixelFormatASTC_6x5_LDR", PIPE_FORMAT_ASTC_6x5 },
+   { 189, "MTLPixelFormatASTC_6x5_sRGB", PIPE_FORMAT_ASTC_6x5_SRGB },
+   { 208, "MTLPixelFormatASTC_6x6_LDR", PIPE_FORMAT_ASTC_6x6 },
+   { 190, "MTLPixelFormatASTC_6x6_sRGB", PIPE_FORMAT_ASTC_6x6_SRGB },
+   { 210, "MTLPixelFormatASTC_8x5_LDR", PIPE_FORMAT_ASTC_8x5 },
+   { 192, "MTLPixelFormatASTC_8x5_sRGB", PIPE_FORMAT_ASTC_8x5_SRGB },
+   { 211, "MTLPixelFormatASTC_8x6_LDR", PIPE_FORMAT_ASTC_8x6 },
+   { 193, "MTLPixelFormatASTC_8x6_sRGB", PIPE_FORMAT_ASTC_8x6_SRGB },
+   { 212, "MTLPixelFormatASTC_8x8_LDR", PIPE_FORMAT_ASTC_8x8 },
+   { 194, "MTLPixelFormatASTC_8x8_sRGB", PIPE_FORMAT_ASTC_8x8_SRGB },
+   { 213, "MTLPixelFormatASTC_10x5_LDR", PIPE_FORMAT_ASTC_10x5 },
+   { 195, "MTLPixelFormatASTC_10x5_sRGB", PIPE_FORMAT_ASTC_10x5_SRGB },
+   { 214, "MTLPixelFormatASTC_10x6_LDR", PIPE_FORMAT_ASTC_10x6 },
+   { 196, "MTLPixelFormatASTC_10x6_sRGB", PIPE_FORMAT_ASTC_10x6_SRGB },
+   { 215, "MTLPixelFormatASTC_10x8_LDR", PIPE_FORMAT_ASTC_10x8 },
+   { 197, "MTLPixelFormatASTC_10x8_sRGB", PIPE_FORMAT_ASTC_10x8_SRGB },
+   { 216, "MTLPixelFormatASTC_10x10_LDR", PIPE_FORMAT_ASTC_10x10 },
+   { 198, "MTLPixelFormatASTC_10x10_sRGB", PIPE_FORMAT_ASTC_10x10_SRGB },
+   { 217, "MTLPixelFormatASTC_12x10_LDR", PIPE_FORMAT_ASTC_12x10 },
+   { 199, "MTLPixelFormatASTC_12x10_sRGB", PIPE_FORMAT_ASTC_12x10_SRGB },
+   { 218, "MTLPixelFormatASTC_12x12_LDR", PIPE_FORMAT_ASTC_12x12 },
+   { 200, "MTLPixelFormatASTC_12x12_sRGB", PIPE_FORMAT_ASTC_12x12_SRGB },
    {   1, "MTLPixelFormatA8Unorm",         PIPE_FORMAT_A8_UNORM },
    {  10, "MTLPixelFormatR8Unorm",         PIPE_FORMAT_R8_UNORM },
    {  11, "MTLPixelFormatR8Unorm_sRGB",    PIPE_FORMAT_R8_SRGB },
@@ -1132,6 +1172,8 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    {  74, "MTLPixelFormatRGBA8Sint",       PIPE_FORMAT_R8G8B8A8_SINT },
    {  80, "MTLPixelFormatBGRA8Unorm",      PIPE_FORMAT_B8G8R8A8_UNORM },
    {  81, "MTLPixelFormatBGRA8Unorm_sRGB", PIPE_FORMAT_B8G8R8A8_SRGB },
+   {  90, "MTLPixelFormatRGB10A2Unorm",    PIPE_FORMAT_R10G10B10A2_UNORM },
+   {  92, "MTLPixelFormatRG11B10Float",     PIPE_FORMAT_R11G11B10_FLOAT },
    { 103, "MTLPixelFormatRG32Uint",        PIPE_FORMAT_R32G32_UINT },
    { 104, "MTLPixelFormatRG32Sint",        PIPE_FORMAT_R32G32_SINT },
    { 105, "MTLPixelFormatRG32Float",       PIPE_FORMAT_R32G32_FLOAT },
@@ -1350,7 +1392,7 @@ pixel_format_refusal(unsigned f)
       return "MTLPixelFormatBGRA4Unorm, which Metal.framework's own enumeration carries at "
              "44 and this device's MTLPixelFormat.h does not declare at all: a format no "
              "public header names is one whose layout nothing here can read";
-   if (f >= 90 && f <= 94)
+   if (f == 91 || f == 93 || f == 94)
       return "one of Metal's formats packed into a 32-bit word (RGB10A2, RG11B10, RGB9E5, "
              "BGR10A2), whose field order and bias this library will not guess: an error of "
              "two bits in a channel is a picture, not a failure";
@@ -1549,7 +1591,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       array_size = shape->type == RWA_TYPE_2D_MULTISAMPLE ? 1 : layers;
       break;
    case RWA_TYPE_TEXTURE_BUFFER:
-      /* The frontend refuses a texture buffer by name as well (docs/air.md section 5);
+      /* The frontend refuses a texture buffer by name as well (docs/dev/air.md section 5);
        * it is a buffer with a texture's interface, and rwa_buffer_create is where one
        * comes from.
        */
@@ -1678,7 +1720,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
 
    unsigned bind = (read ? PIPE_BIND_SAMPLER_VIEW : 0) |
                    (write ? PIPE_BIND_SHADER_IMAGE : 0) |
-                   ((shape->usage & RWA_USAGE_RENDER_TARGET) || (depth_stencil && !shape->usage)
+                   ((shape->usage & RWA_USAGE_RENDER_TARGET) || !shape->usage
                        ? (depth_stencil ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET)
                        : 0);
    if (!bind) {
@@ -1877,7 +1919,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    if (!texture->res) {
       say(why, why_size, "the GPU driver would not allocate a %ux%ux%u %s of %s. After a few "
                          "dozen allocations in one boot this driver starts refusing outright "
-                         "(docs/air.md section 4)", width, height, depth, type_name,
+                         "(docs/dev/air.md section 4)", width, height, depth, type_name,
           fmt->name);
       free(texture);
       return NULL;
@@ -2283,18 +2325,10 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
       say(why, why_size, "no bytes to write into a texture");
       return -1;
    }
-   /* A depth or stencil texture is refused here and read through rwa_depth_read, and
-    * the two go together on purpose: a texel of Depth32Float_Stencil8 holds two values
-    * of two kinds, so a call whose only argument is "bytes" cannot say which of them
-    * the caller means. Nothing in this path needs to write one -- a depth attachment is
-    * filled by the pass's clear and by the draw -- so this declines rather than
-    * inventing an aspect argument no caller has asked for.
-    */
-   if (format_is_depth_stencil(texture->res->format)) {
-      say(why, why_size, "writing texels into a %s texture: a depth or stencil texel has "
-                         "an aspect and this call has nowhere to name it. A depth "
-                         "attachment is filled by the render pass's clearDepth and by what "
-                         "the draw writes", texture->format_name);
+   /* A single depth/stencil aspect has an unambiguous raw layout. Combined
+    * depth+stencil formats still require an aspect-specific transfer. */
+   if (format_has_depth(texture->res->format) && format_has_stencil(texture->res->format)) {
+      say(why, why_size, "combined depth/stencil upload needs an explicit aspect");
       return -1;
    }
    /*
@@ -2516,7 +2550,7 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
 /* MTLCompareFunction as PIPE_FUNC_x. It lives with the depth/stencil state further
  * down, because a depth test is where a compare function was first needed; the sampler
  * needs the same translation now that the shader's own `constexpr sampler` word carries
- * one, and the whole argument of docs/air.md 3.3 is that the two paths speak ONE
+ * one, and the whole argument of docs/dev/air.md 3.3 is that the two paths speak ONE
  * vocabulary. So it is declared here rather than copied.
  */
 static bool compare_function_from_metal(unsigned f, unsigned *out, const char *what,
@@ -2527,7 +2561,7 @@ static bool compare_function_from_metal(unsigned f, unsigned *out, const char *w
  * reaches this library: the API's (MTLSamplerDescriptor, through rwa_sampler_state) and
  * the shader's own `constexpr sampler` word, which sampler_state_from_air turns into
  * the first. Keeping one mapping is what makes the two comparable, which is the whole
- * argument of air_metal.h's comment on rwa_sampler_state and of docs/air.md 3.3's 15
+ * argument of air_metal.h's comment on rwa_sampler_state and of docs/dev/air.md 3.3's 15
  * cases.
  *
  * Metal's clamp_to_zero is a wrap mode and not a border colour: outside the texture it
@@ -2535,7 +2569,7 @@ static bool compare_function_from_metal(unsigned f, unsigned *out, const char *w
  * not configurable for it. Gallium has no such mode, so it becomes CLAMP_TO_BORDER with
  * a zero border -- which is the same thing and is worth writing down, because the
  * obvious reading of that enum value is clamp_to_border with a default border, and one
- * of Apple's own binaries prints it that way (nir_air.h, docs/air.md 3.3).
+ * of Apple's own binaries prints it that way (nir_air.h, docs/dev/air.md 3.3).
  *
  * rwa_sampler_state carries no border colour, so clamp_to_border gets Metal's own
  * default, MTLSamplerBorderColorTransparentBlack -- the same thing clamp_to_zero reads.
@@ -2639,7 +2673,7 @@ sampler_state_from_metal(const struct rwa_sampler_state *st, struct pipe_sampler
     * are undefined" -- and this library does not enforce that, on purpose: one of
     * Apple's own shaders in the corpus is sampler(coord::pixel, filter::linear,
     * address::clamp_to_zero), and sampcheck.py measured what that must return against
-    * Apple's rules, 15 cases exact (docs/air.md 3.3). Refusing it here would refuse a
+    * Apple's rules, 15 cases exact (docs/dev/air.md 3.3). Refusing it here would refuse a
     * shader that has been checked.
     */
    return true;
@@ -2649,10 +2683,10 @@ sampler_state_from_metal(const struct rwa_sampler_state *st, struct pipe_sampler
  *
  * The two enumerations are not the same, and that is the whole reason this goes through
  * rwa_sampler_state instead of mapping the word straight to Gallium: in the 64-bit word
- * a shader carries, 0 is clamp_to_zero and 1 clamp_to_edge (nir_air.h, docs/air.md
+ * a shader carries, 0 is clamp_to_zero and 1 clamp_to_edge (nir_air.h, docs/dev/air.md
  * 3.3); in MTLSamplerAddressMode 0 is clampToEdge and 4 clampToZero. One table indexed
  * by "the address mode" would be right for one of them and silently wrong for the other
- * -- the commonest field in the corpus, and the same trap docs/air.md 3.3 records about
+ * -- the commonest field in the corpus, and the same trap docs/dev/air.md 3.3 records about
  * Apple's own printer.
  */
 static bool
@@ -2677,7 +2711,7 @@ sampler_state_from_air(const struct air_sampler_state *a, unsigned index,
       /* The word has a border colour and this contract has not, so a border that is
        * not Metal's default has nowhere to go. Refused rather than sampled as
        * transparent black: no module of the corpus attests clamp_to_border at all
-       * (docs/air.md 3.3 lists it among the decoded and unexercised fields), so this
+       * (docs/dev/air.md 3.3 lists it among the decoded and unexercised fields), so this
        * is a shader nobody has seen asking for a colour nobody can bind.
        */
       if (a->address[i] == AIR_SAMPLER_CLAMP_TO_BORDER && a->border_color != 0) {
@@ -2692,7 +2726,7 @@ sampler_state_from_air(const struct air_sampler_state *a, unsigned index,
    /* Bicubic is a Metal filter with no MTLSamplerMinMagFilter and no Gallium
     * equivalent. air_run samples it as linear and says so in its own line; a library
     * hands a driver a result, so it refuses instead. No module of the corpus carries
-    * it (docs/air.md 3.3).
+    * it (docs/dev/air.md 3.3).
     */
    if (a->mag_filter == AIR_SAMPLER_BICUBIC || a->min_filter == AIR_SAMPLER_BICUBIC) {
       say(why, why_size, "the shader's own sampler at index %u asks for filter::bicubic, "
@@ -2807,7 +2841,7 @@ sampler_state_from_air(const struct air_sampler_state *a, unsigned index,
       .normalized_coordinates = !a->pixel_coord,
       /* halves, as their bits, which is how the word carries them: the corpus's
        * samplers all come out as [0, 65504], and that range is two separate 16-bit
-       * fields a wrong layout would not land on (docs/air.md 3.3).
+       * fields a wrong layout would not land on (docs/dev/air.md 3.3).
        */
       .lod_min = _mesa_half_to_float(a->lod_min),
       .lod_max = _mesa_half_to_float(a->lod_max),
@@ -3688,8 +3722,8 @@ rwa_compute_destroy(struct rwa_compute *compute)
  * The size is baked in rather than left variable, and that is not optional: softpipe
  * reads the block size from TGSI_PROPERTY_CS_FIXED_BLOCK_*, and with a variable size
  * those are zero, so it runs ZERO threads and the output buffer comes back exactly as
- * it went in. That looked like a kernel that did nothing (docs/air.md section 7.4). It
- * is also the only path with evidence behind it: every number in docs/air.md was
+ * it went in. That looked like a kernel that did nothing (docs/dev/air.md section 7.4). It
+ * is also the only path with evidence behind it: every number in docs/dev/air.md was
  * measured through a fixed size, so this does what has been measured and not what the
  * hardware might also accept.
  *
@@ -3725,6 +3759,9 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
 
    finalize_for_gallium(cs, device->screen);
    ubo_read_extents(cs, compute->ubo_extent);
+   /* RWA_PRINT_NIR=1: a kernel too, as it is handed to the driver, on stderr */
+   if (getenv("RWA_PRINT_NIR"))
+      nir_print_shader(cs, stderr);
 
    void *cso = device->pipe->create_compute_state(device->pipe,
       &(struct pipe_compute_state){
@@ -3774,7 +3811,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
  * every dispatch for the rest of that boot was accepted, returned, and did nothing.
  * air_run did not wait on a fence, so it printed the buffer it had filled itself as
  * though the GPU had answered: 21 of the 47 kernels of one run were vacuous that way
- * before anyone noticed (docs/air.md section 5). A driver that returned such a buffer
+ * before anyone noticed (docs/dev/air.md section 5). A driver that returned such a buffer
  * to an application would be worse off than air_run, because nobody is reading the
  * numbers.
  *
@@ -3808,7 +3845,7 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
                          "kernel whose buffers carry counts, indices or sentinels, "
                          "given values it was never written for, loops on a condition "
                          "that never comes -- both kernels measured this way turned out "
-                         "to be exactly that (docs/air.md section 5). And one timeout "
+                         "to be exactly that (docs/dev/air.md section 5). And one timeout "
                          "wedges this GPU for the rest of the boot, so every later "
                          "dispatch in it is vacuous too", what);
       return -1;
@@ -3925,7 +3962,7 @@ slot_element(const struct rwa_slot *s, nir_alu_type *type, const char **word,
  *
  * Metal checks this itself: a texture2d<float> parameter takes neither a 3D texture nor
  * an integer format, and a driver that let either through would be the lenient one. The
- * reason to check rather than trust is in docs/air.md section 5 -- with a 2D texture
+ * reason to check rather than trust is in docs/dev/air.md section 5 -- with a 2D texture
  * bound where three shaders sample a 3D one, all three "passed", and only a real 4x4x4
  * texture turned their answers into evidence. A shape that is almost right is the
  * failure that reads like a result.
@@ -4081,7 +4118,7 @@ argbuf_mask_of(const struct air_shader_info *info, const char *name, unsigned *m
  *
  * A stage dispatched with nothing in a slot it reads does not fail: it reads whatever
  * the slot holds and writes a plausible answer, which is the one outcome worse than an
- * error (docs/air.md section 4). The buffer sizes are checked against air.buffer_size,
+ * error (docs/dev/air.md section 4). The buffer sizes are checked against air.buffer_size,
  * which Apple's own metadata carries for most arguments -- a shader handed a buffer
  * shorter than it declares writes past the end of it, and on this GPU that is not a
  * fault but another shader's memory.
@@ -4166,10 +4203,19 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
             /* is_null_texture asks about this slot: empty is an answer, not an error */
             if (info->null_query_textures & (1u << r->index))
                break;
-            say(why, why_size, "%s %s texture %u and %u texture%s bound", name,
-                stored ? "writes" : "reads", r->index, bindings->texture_count,
-                bindings->texture_count == 1 ? " was" : "s were");
-            return -1;
+            /* Metal itself does not refuse this: CoreImage declares texture arguments a
+             * given dispatch never touches and leaves them empty. A slot left empty gets
+             * the zero placeholder (bind_stage), noted once per process.
+             */
+            static bool told_texture;
+            if (!told_texture) {
+               told_texture = true;
+               fprintf(stderr, "rwa: %s %s texture %u and %u texture%s bound; a zero "
+                       "placeholder stands in (noted once)\n", name,
+                       stored ? "writes" : "reads", r->index, bindings->texture_count,
+                       bindings->texture_count == 1 ? " was" : "s were");
+            }
+            break;
          }
          const struct rwa_texture *t = member ? mtexture : bindings->textures[r->index];
          /* MTLTextureUsage, honoured rather than noted: Metal refuses to bind a
@@ -4183,9 +4229,14 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
             return -1;
          }
          if (!stored && !t->shader_read) {
-            say(why, why_size, "%s samples texture %u and that texture was made without "
-                               "MTLTextureUsageShaderRead", name, r->index);
-            return -1;
+            /* Apple's GPUs sample such a texture anyway and CoreImage relies on it
+             * (PhotoImaging's tiles): noted once, served. */
+            static bool told_read;
+            if (!told_read) {
+               told_read = true;
+               fprintf(stderr, "rwa: %s samples texture %u made without "
+                       "MTLTextureUsageShaderRead; served (noted once)\n", name, r->index);
+            }
          }
          if (!texture_fits(t, &slots[r->index], name, r->index, why, why_size))
             return -1;
@@ -4210,10 +4261,17 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
          if (member)
             break;
          if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
-            say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",
-                name, r->index, bindings->sampler_count,
-                bindings->sampler_count == 1 ? " was" : "s were");
-            return -1;
+            /* As for a texture: Metal leaves this undefined rather than refusing it, and
+             * CoreImage does it. The default sampler stands in (bind_stage).
+             */
+            static bool told_sampler;
+            if (!told_sampler) {
+               told_sampler = true;
+               fprintf(stderr, "rwa: %s takes sampler %u from the API and %u sampler%s "
+                       "bound; the default sampler stands in (noted once)\n",
+                       name, r->index, bindings->sampler_count,
+                       bindings->sampler_count == 1 ? " was" : "s were");
+            }
          }
          break;
 
@@ -4399,10 +4457,10 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             break;
          case AIR_RESOURCE_TEXTURE:
          case AIR_RESOURCE_IMAGE:
-            t = bindings->textures[r->index];
+            t = r->index < bindings->texture_count ? bindings->textures[r->index] : NULL;
             break;
          case AIR_RESOURCE_SAMPLER:
-            if (!r->inline_sampler)
+            if (!r->inline_sampler && r->index < bindings->sampler_count)
                sm = bindings->samplers[r->index];
             break;
          default:
@@ -4619,7 +4677,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             /* The shader's own word, built once and kept with the pipeline. It goes
              * through Metal's vocabulary on the way (sampler_state_from_air), which is
              * what makes this sampler and one a driver creates from
-             * MTLSamplerDescriptor the same object -- the argument of docs/air.md 3.3
+             * MTLSamplerDescriptor the same object -- the argument of docs/dev/air.md 3.3
              * and of air_metal.h.
              */
             bool compares = compare_sampler && compare_sampler[r->index];
@@ -4664,6 +4722,15 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             /* Metal's sampler, and the instruction's choice of which of its two state
              * objects: struct rwa_sampler.
              */
+            if (!sm) {
+               /* left empty by the caller (check_bindings lets that through) */
+               samplers[r->index] = default_sampler(device);
+               if (!samplers[r->index]) {
+                  say(why, why_size, "%s would not make a sampler at all",
+                      rwa_device_name(device));
+                  return -1;
+               }
+            } else
             samplers[r->index] = (compare_sampler && compare_sampler[r->index])
                                     ? sm->cso_compare : sm->cso;
          }
@@ -4679,6 +4746,20 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
     * for it or not: see default_sampler() -- softpipe dereferences the state of every
     * unit the shader touches, so a slot left empty is a crash rather than a default.
     */
+   /* And always one at sampler 0 when anything is sampled: Panfrost compiles a texel
+    * fetch (Metal's read()) against sampler 0 whatever its texture's slot
+    * (pan_nir_lower_res_indices.c, "by ABI ... a valid sampler bound at index 0 for
+    * txf"), so a kernel whose only texture is at [[texture(1)]] read zeros
+    * (MPS's compute_intermediate_mean_float_statistics: CIAreaAverage gave 0,0,0,0).
+    */
+   if (num_views > 0 && !samplers[0]) {
+      samplers[0] = default_sampler(device);
+      if (!samplers[0]) {
+         say(why, why_size, "%s would not make a sampler at all", rwa_device_name(device));
+         return -1;
+      }
+      num_samplers = MAX2(num_samplers, 1);
+   }
    for (unsigned i = 0; i < num_views; i++) {
       if (!views[i] || samplers[i])
          continue;
@@ -4729,7 +4810,11 @@ unbind_stage(struct rwa_device *device, enum pipe_shader_type stage,
    if (bound->num_views)
       pipe->set_sampler_views(pipe, stage, 0, 0, bound->num_views, false, NULL);
    if (bound->num_images)
-      pipe->set_shader_images(pipe, stage, 0, 0, bound->num_images, NULL);
+      /* as `count` and not as trailing slots: Panfrost's unbind with NULL views clears
+       * its image mask only over `count`, so trailing slots kept their bits with no
+       * resource and the next dispatch with fewer images read one (far 0x4c in
+       * util_image_to_sampler_view: CoreImage's compute_final_mean_float_statistics) */
+      pipe->set_shader_images(pipe, stage, 0, bound->num_images, 0, NULL);
    if (bound->num_samplers) {
       void *none[RWA_MAX_TEXTURES] = { 0 };
       pipe->bind_sampler_states(pipe, stage, 0, bound->num_samplers, none);
@@ -4755,6 +4840,16 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
                      const struct rwa_buffer_bind *table, unsigned table_count,
                      const unsigned groups[3], const unsigned group_size[3],
                      char *why, size_t why_size)
+{
+   return rwa_dispatch_tg(compute, bindings, table, table_count, groups, group_size, 0,
+                          why, why_size);
+}
+
+int
+rwa_dispatch_tg(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                const struct rwa_buffer_bind *table, unsigned table_count,
+                const unsigned groups[3], const unsigned group_size[3],
+                unsigned threadgroup_length, char *why, size_t why_size)
 {
    RWA_GUARD();
    struct rwa_device *device = compute->device;
@@ -4792,10 +4887,10 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       return -1;
    }
 
-   if (compute->dynamic_threadgroup) {
+   if (compute->dynamic_threadgroup && threadgroup_length == 0) {
       say(why, why_size, "%s takes a threadgroup buffer whose size only the dispatch can "
-                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and this "
-                         "call has no argument for it", name);
+                         "give (Metal's -setThreadgroupMemoryLength:atIndex:), and none "
+                         "was given", name);
       return -1;
    }
 
@@ -4827,6 +4922,9 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       .work_dim = 3,
       .block = { group_size[0], group_size[1], group_size[2] },
       .grid = { groups[0], groups[1], groups[2] },
+      /* the threadgroup argument, placed after the static arrays (air_to_nir.c) */
+      .variable_shared_mem = compute->dynamic_threadgroup
+                                ? ALIGN_POT(threadgroup_length, 16) : 0,
    };
    pipe->launch_grid(pipe, &grid);
 
@@ -4884,7 +4982,7 @@ rwa_fence_wait(struct rwa_device *device, void *handle, char *why, size_t why_si
  * Drawing.
  *
  * air_run draws every fragment shader of the corpus and 255 of them have been compared
- * pixel by pixel (docs/air.md): a quad vertex shader built by hand in NIR plus the real
+ * pixel by pixel (docs/dev/air.md): a quad vertex shader built by hand in NIR plus the real
  * fragment shader, a framebuffer of plain textures, clear, draw_vbo of a TRIANGLE_STRIP
  * of four, and the pixel read back. This is that path as the three contract calls, and
  * the code and its WHY comments are lifted from air_run.c because each is a mistake
@@ -5250,7 +5348,7 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
  * `encoded_length` is 8 bytes per member the set DECLARES, used by this shader or not,
  * and that is Apple's number rather than a convenience of ours: `air.arg_type_size` on
  * the set's own node says 8 x members in every one of Resident Evil 4's 7 857 sets, and
- * `air.arg_type_align_size` says 8 in all of them (docs/air.md 8.2.1). The frontend
+ * `air.arg_type_align_size` says 8 in all of them (docs/dev/air.md 8.2.1). The frontend
  * keeps every member in the resource list for exactly this reason -- a numbering that
  * skipped the unread ones would differ between two shaders sharing one set, and an
  * application that allocated from the shorter number would overlap its own encodings.
@@ -5373,19 +5471,14 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
    for (unsigned k = 0; k < n; k++) {
       struct rwa_argbuf_layout *l = &out[k];
 
-      /* The ids have to be 0..member_count-1 with nothing missing and nothing twice,
-       * because that is what makes `8 x members` the length Metal would have answered.
-       * A set that is not dense is refused by name: the alternative is an application
-       * allocating its buffer too short and encoding one member over another.
-       */
+      /* IDs may be sparse. Validate uniqueness/range and reserve the span through
+       * the highest ID, including holes, so later encodings cannot overlap. */
       uint64_t seen = 0;
       for (unsigned i = 0; i < l->member_count; i++) {
-         if (l->members[i].id >= l->member_count) {
+         if (l->members[i].id >= 64) {
             say(why, why_size, "the argument buffer %s declares at Metal buffer index %u "
-                               "has %u members and one of them (`%s`) is id %u: Metal's "
-                               "encodedLength is over the highest id, so this library "
-                               "will not answer a length for a set whose ids have a gap "
-                               "in them", name, l->metal_index, l->member_count,
+                               "has %u members and one of them (`%s`) is id %u: this exceeds "
+                               "the supported argument ID range", name, l->metal_index, l->member_count,
                 l->members[i].name, l->members[i].id);
             ralloc_free(mem_ctx);
             return -1;
@@ -5399,7 +5492,9 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
          }
          seen |= 1ull << l->members[i].id;
       }
-      l->encoded_length = 8 * l->member_count;
+      l->encoded_length = 0;
+      for (unsigned i = 0; i < l->member_count; i++)
+         l->encoded_length = MAX2(l->encoded_length, 8 * (l->members[i].id + 1));
    }
 
    if (count)
@@ -5641,7 +5736,7 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
  * at Half (53): FloatRG11B10 and FloatRGB9E5 are iOS 17's, and nothing on this device
  * can name them.
  *
- * The mapping is one rule, as docs/air.md 3.1 says: Char/Short/Int and their unsigned
+ * The mapping is one rule, as docs/dev/air.md 3.1 says: Char/Short/Int and their unsigned
  * forms are R8/R16/R32 _SINT/_UINT of the same channel count, `...Normalized` is
  * _SNORM/_UNORM instead, Half is _FLOAT at 16 bits and Float at 32, and
  * UChar4Normalized_BGRA is B8G8R8A8_UNORM -- whose channel order rides in
@@ -5649,10 +5744,9 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
  *
  * `delivers` is what the shader's register holds afterwards, and it is here because that
  * is what has to match the member's declared type: a _UINT format delivers an integer,
- * a _UNORM one delivers a float in [0, 1]. Gallium's _USCALED/_SSCALED -- an integer in
- * memory widened to a float without normalising -- has no Metal counterpart and is
- * deliberately absent; Metal's plain integer formats feed an integer member, which is
- * what this check is for.
+ * a _UNORM one delivers a float in [0, 1]. When Metal's shader declares a float
+ * for an unnormalized integer attribute, _USCALED/_SSCALED implement the numeric
+ * conversion. Integer shader inputs retain the integer format.
  *
  * `bytes` is one element's size in memory, which no pipe_format query gives for a
  * three-component vertex format the way the fetch sees it (util_format_get_blocksize of
@@ -5719,6 +5813,23 @@ static const struct rwa_vertex_format rwa_vertex_formats[] = {
    { 52, "MTLVertexFormatShortNormalized", PIPE_FORMAT_R16_SNORM, AIR_ATTRIB_FLOAT, 2 },
    { 53, "MTLVertexFormatHalf", PIPE_FORMAT_R16_FLOAT, AIR_ATTRIB_FLOAT, 2 },
 };
+
+/* Metal converts unnormalized integer vertex data numerically when stage_in
+ * declares floating point. Scaled Gallium formats express that conversion;
+ * normalized formats and integer shader inputs retain their existing mapping. */
+static enum pipe_format vertex_float_fetch(enum pipe_format format)
+{
+#define SCALE_CHANNELS(bits, channels) \
+ case PIPE_FORMAT_##channels##_SINT: return PIPE_FORMAT_##channels##_SSCALED; \
+ case PIPE_FORMAT_##channels##_UINT: return PIPE_FORMAT_##channels##_USCALED;
+ switch(format){
+ SCALE_CHANNELS(8,R8) SCALE_CHANNELS(8,R8G8) SCALE_CHANNELS(8,R8G8B8) SCALE_CHANNELS(8,R8G8B8A8)
+ SCALE_CHANNELS(16,R16) SCALE_CHANNELS(16,R16G16) SCALE_CHANNELS(16,R16G16B16) SCALE_CHANNELS(16,R16G16B16A16)
+ SCALE_CHANNELS(32,R32) SCALE_CHANNELS(32,R32G32) SCALE_CHANNELS(32,R32G32B32) SCALE_CHANNELS(32,R32G32B32A32)
+ default:return format;
+ }
+#undef SCALE_CHANNELS
+}
 
 static const struct rwa_vertex_format *
 vertex_format(unsigned mtl)
@@ -5867,7 +5978,7 @@ build_vertex_state(const struct air_shader_info *vinfo,
       if (d->format == 0) {
          /* Not configured. Legal only for an attribute the module gates with a
           * function-constant predicate, whose value is the pipeline's and not this
-          * library's to know (docs/air.md 3.1): the parameter exists either way, so the
+          * library's to know (docs/dev/air.md 3.1): the parameter exists either way, so the
           * attribute is in vertex_attributes_read either way, and a pipeline whose
           * constants make the predicate false may configure nothing here.
           */
@@ -5894,7 +6005,11 @@ build_vertex_state(const struct air_shader_info *vinfo,
              d->format, vertex_format_refusal(d->format));
          return false;
       }
-      if (f->delivers != a->base_type) {
+      enum pipe_format fetch_format=f->pipe;
+      bool convert_to_float=a->base_type==AIR_ATTRIB_FLOAT &&
+          (f->delivers==AIR_ATTRIB_INT || f->delivers==AIR_ATTRIB_UINT);
+      if(convert_to_float)fetch_format=vertex_float_fetch(f->pipe);
+      if (f->delivers != a->base_type && !convert_to_float) {
          say(why, why_size, "vertex attribute %u of %s is %s, which wants %s components, "
                             "and %s delivers %s ones", a->index, vname,
              a->type_name ? a->type_name : (a->name ? a->name : "unnamed"),
@@ -5908,10 +6023,10 @@ build_vertex_state(const struct air_shader_info *vinfo,
        * maps but that hardware cannot fetch is a sentence here instead of an assertion
        * there.
        */
-      if (!screen->is_format_supported(screen, f->pipe, PIPE_BUFFER, 0, 0,
+      if (!screen->is_format_supported(screen, fetch_format, PIPE_BUFFER, 0, 0,
                                        PIPE_BIND_VERTEX_BUFFER)) {
          say(why, why_size, "%s cannot fetch %s (%s) as a vertex attribute",
-             screen->get_name(screen), f->name, util_format_short_name(f->pipe));
+             screen->get_name(screen), f->name, util_format_short_name(fetch_format));
          return false;
       }
       if (d->buffer_index >= RWA_MAX_VERTEX_BUFFERS) {
@@ -5971,7 +6086,7 @@ build_vertex_state(const struct air_shader_info *vinfo,
          /* The offset's twelve bits are in this tree's own register header; the stride's
           * width is not -- fd6_context.cc writes VFD_FETCH_STRIDE as a whole word with
           * no mask and no assert in Mesa 25.0.7, and Gallium's own src_stride is
-          * "technically only uint16_t". So 4095 here is the hardware field docs/air.md
+          * "technically only uint16_t". So 4095 here is the hardware field docs/dev/air.md
           * 3.1 read, taken conservatively: a refusal can be lifted by a measurement on
           * the phone, and a stride truncated in the ringbuffer cannot be seen at all.
           */
@@ -5996,7 +6111,7 @@ build_vertex_state(const struct air_shader_info *vinfo,
       }
 
       out->element[loc] = (struct pipe_vertex_element){
-         .src_format = f->pipe,
+         .src_format = fetch_format,
          .src_offset = (uint16_t)d->offset,
          .src_stride = stride,
          .vertex_buffer_index = d->buffer_index,
@@ -6017,12 +6132,13 @@ build_vertex_state(const struct air_shader_info *vinfo,
       const struct air_resource *r = &vinfo->resources[i];
       if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER && r->kind != AIR_RESOURCE_DEVICE_BUFFER)
          continue;
-      if (r->index < RWA_MAX_VERTEX_BUFFERS && (out->stream_mask & (1u << r->index))) {
+      unsigned metal_index = r->argbuf_set == ~0u ? r->index : r->argbuf_set;
+      if (metal_index < RWA_MAX_VERTEX_BUFFERS && (out->stream_mask & (1u << metal_index))) {
          say(why, why_size, "buffer index %u is a vertex stream in this descriptor and "
                             "%s reads it as [[buffer(%u)]] (%s): Metal has one table "
                             "behind -setVertexBuffer:offset:atIndex: and an index can be "
-                            "a stream or an argument, not both", r->index, vname,
-             r->index, r->name ? r->name : "unnamed");
+                            "a stream or an argument, not both", metal_index, vname,
+             metal_index, r->name ? r->name : "unnamed");
          return false;
       }
    }
@@ -6778,13 +6894,6 @@ blend_operation_name(unsigned op)
 static const char *
 blend_factor_refusal(unsigned f)
 {
-   if (f >= 11 && f <= 14)
-      return "one of Metal's BLEND COLOUR factors, whose colour is ENCODER state "
-             "(-setBlendColorRed:green:blue:alpha:) and not pipeline state: this "
-             "contract has nowhere to carry it and the driver's own setter drops it, so "
-             "the blend would be against the zero a Gallium context starts with -- the "
-             "layer would vanish rather than fail. Serving it is one float[4] in "
-             "rwa_draw and one set_blend_color, on the day something asks";
    if (f >= 15 && f <= 18)
       /* Deliberately short: `why` is 512 bytes here and in the driver, and the prefix
        * naming the field takes some of it, so a longer sentence would arrive truncated
@@ -6819,10 +6928,10 @@ blend_factor_from_metal(unsigned f, bool alpha_channel, unsigned *out, const cha
       PIPE_BLENDFACTOR_DST_ALPHA,          /* ...DestinationAlpha                    8 */
       PIPE_BLENDFACTOR_INV_DST_ALPHA,      /* ...OneMinusDestinationAlpha            9 */
       PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE, /* ...SourceAlphaSaturated               10 */
-      PIPE_BLENDFACTOR_CONST_COLOR,        /* ...BlendColor            11  REFUSED, above */
-      PIPE_BLENDFACTOR_INV_CONST_COLOR,    /* ...OneMinusBlendColor    12  REFUSED */
-      PIPE_BLENDFACTOR_CONST_ALPHA,        /* ...BlendAlpha            13  REFUSED */
-      PIPE_BLENDFACTOR_INV_CONST_ALPHA,    /* ...OneMinusBlendAlpha    14  REFUSED */
+      PIPE_BLENDFACTOR_CONST_COLOR,        /* ...BlendColor            11 */
+      PIPE_BLENDFACTOR_INV_CONST_COLOR,    /* ...OneMinusBlendColor    12 */
+      PIPE_BLENDFACTOR_CONST_ALPHA,        /* ...BlendAlpha            13 */
+      PIPE_BLENDFACTOR_INV_CONST_ALPHA,    /* ...OneMinusBlendAlpha    14 */
       PIPE_BLENDFACTOR_SRC1_COLOR,         /* ...Source1Color          15  REFUSED */
       PIPE_BLENDFACTOR_INV_SRC1_COLOR,     /* ...OneMinusSource1Color  16  REFUSED */
       PIPE_BLENDFACTOR_SRC1_ALPHA,         /* ...Source1Alpha          17  REFUSED */
@@ -7474,7 +7583,7 @@ rwa_render_create(struct rwa_device *device,
 
    /* The vertex stage: translated when a module was supplied, generated otherwise. The
     * generated stage is the road with evidence behind it -- 255 fragment shaders drawn
-    * over a hand-built quad (docs/air.md) -- and the only one this library has run end
+    * over a hand-built quad (docs/dev/air.md) -- and the only one this library has run end
     * to end. A supplied module is translated and bound, but a vertex shader that reads
     * vertex attributes is refused, because the contract carries no layout to feed them.
     */
@@ -7605,7 +7714,7 @@ rwa_render_create(struct rwa_device *device,
     * It is worth saying what the old state did on the phone, because it was not a
     * refusal: CoreAnimation composites with premultiplied alpha, so a label layer whose
     * background is transparent black was drawn as OPAQUE BLACK -- every icon label in a
-    * black box and the Search pill a black rectangle (docs/air.md section 5 has the
+    * black box and the Search pill a black rectangle (docs/dev/air.md section 5 has the
     * measurement and userland/rc.jobs.blend the greps, and the photograph is the test).
     *
     * The tables' own shape is checked first, here rather than at a draw, so that a row
@@ -8212,6 +8321,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                      znear } });
 
    pipe->bind_blend_state(pipe, render->blend);
+   struct pipe_blend_color blend_color = { 0 };
+   if (draw->blend_color)
+      memcpy(blend_color.color, draw->blend_color, sizeof(blend_color.color));
+   pipe->set_blend_color(pipe, &blend_color);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.
     */
@@ -8397,7 +8510,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn
     * must not read as a result, and this is the call that can say which draw did not
-    * come back (docs/air.md section 5). A link error between the stages, which ir3 only
+    * come back (docs/dev/air.md section 5). A link error between the stages, which ir3 only
     * finds now, surfaces as this not finishing.
     */
    /* deferred: queued behind the draws before it, and the caller's rwa_finish waits for all

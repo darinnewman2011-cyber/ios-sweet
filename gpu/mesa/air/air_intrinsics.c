@@ -13,7 +13,7 @@
  * What each name means is not guessed: it is read off Apple's own compiler.
  * AGXCompilerCore carries the whole vocabulary as a table of names at
  * 0x16d082..0x16d400 of the library in this device's shared cache (the list is
- * in docs/air.md section 3.2), and that table distinguishes exactly the
+ * in docs/dev/air.md section 3.2), and that table distinguishes exactly the
  * functions the Metal Shading Language Specification defines -- round from
  * rint, exp from exp2, fmod from mod, pow from powr. Two of this file's
  * handlers were guesses before that table was read; one of them was wrong.
@@ -134,7 +134,7 @@ is_signed_part(const char *s)
  * difference, that difference reaches 253 for two normal floats, so twelve
  * passes of about ten instructions each would be the price, and its exactness
  * ON THE ADRENO could not be established from this machine at all for the
- * frcp reason above. It is not done here; section 4 of docs/air.md carries
+ * frcp reason above. It is not done here; section 4 of docs/dev/air.md carries
  * the condition and the measurement.
  *
  * Over the reference pool this leaves 7 of 264 cases differing, every one of
@@ -559,6 +559,36 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_unpack_unorm_4x8(&c->b, a[0]);
       if (air_nir_bit_size(c, in->base.type) == 16)
          r = nir_f2f16(&c->b, r);
+   } else if (!strcmp(op, "pack") && n->num >= 3 && !strcmp(n->part[1], "unorm") &&
+              !strcmp(n->part[2], "rgb565")) {
+      /* air.pack.unorm.rgb565.<v3f16|v3f32>: Metal's pack_float_to_unorm565 -- red in bits 15..11, green 10..5,
+       * blue 4..0 of a ushort (B5G6R5Unorm's layout). Saturated and rounded like the other unorm packs. */
+      nir_def *x = a[0];
+      if (x->bit_size != 32)
+         x = nir_f2f32(&c->b, x);
+      x = nir_fsat(&c->b, x);
+      nir_def *rr = nir_f2u32(&c->b, nir_fround_even(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, x, 0), 31.0)));
+      nir_def *gg = nir_f2u32(&c->b, nir_fround_even(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, x, 1), 63.0)));
+      nir_def *bb = nir_f2u32(&c->b, nir_fround_even(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, x, 2), 31.0)));
+      r = nir_ior(&c->b, nir_ior(&c->b, nir_ishl_imm(&c->b, rr, 11), nir_ishl_imm(&c->b, gg, 5)), bb);
+      unsigned rbits = air_nir_bit_size(c, in->base.type);
+      if (rbits != 32)
+         r = nir_u2uN(&c->b, r, rbits);
+   } else if (!strcmp(op, "pack") && n->num >= 2 &&
+              (!strcmp(n->part[1], "unorm4x8") || !strcmp(n->part[1], "snorm4x8") ||
+               !strcmp(n->part[1], "unorm2x16") || !strcmp(n->part[1], "snorm2x16"))) {
+      /* air.pack.<unorm|snorm><4x8|2x16>.<v4f16|v4f32|v2f..>: Metal's pack_float_to_*,
+       * GLSL's packUnorm4x8 and friends, component 0 in the low bits. NIR's opcodes
+       * take 32-bit floats, so a half vector is widened first (exact).
+       */
+      nir_def *x = a[0];
+      if (x->bit_size != 32)
+         x = nir_f2f32(&c->b, x);
+      const char *k = n->part[1];
+      r = !strcmp(k, "unorm4x8") ? nir_pack_unorm_4x8(&c->b, x)
+        : !strcmp(k, "snorm4x8") ? nir_pack_snorm_4x8(&c->b, x)
+        : !strcmp(k, "unorm2x16") ? nir_pack_unorm_2x16(&c->b, x)
+                                  : nir_pack_snorm_2x16(&c->b, x);
    } else if (!strcmp(op, "convert")) {
       /* air.convert.<dst sign>.<dst type>.<src sign>.<src type> */
       if (n->num < 5) {
@@ -765,7 +795,7 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
 /* -- barriers ----------------------------------------------------------- */
 
 static bool
-barrier_op(struct air_ctx *c, const struct air_inst *in)
+barrier_op(struct air_ctx *c, const struct air_inst *in, mesa_scope exec_scope)
 {
    /* air.wg.barrier(i32 flags, i32 scope): the flags say which memory is
     * ordered. 2 is threadgroup memory, 1 device, 4 texture; the corpus only
@@ -785,7 +815,25 @@ barrier_op(struct air_ctx *c, const struct air_inst *in)
    if (!modes)
       modes = nir_var_mem_shared;
 
-   nir_barrier(&c->b, .execution_scope = SCOPE_WORKGROUP,
+   /* air.simdgroup.barrier takes the same two words and orders the same memory, but
+    * only the lanes of one SIMD group wait for each other: Panfrost turns a subgroup
+    * execution scope into a scheduling fence alone, which is all a lock-step warp needs.
+    */
+   /* Apple's SIMD group is 32 lanes and Apple's kernels are written for that: MPS's
+    * compute_final_mean_float_statistics adds slots 16..31 of its threadgroup buffer to
+    * 0..15 across a simdgroup_barrier, which on the Mali's 16-lane warps is two warps
+    * that do not wait for each other. The driver reports a threadExecutionWidth of 32 so
+    * such a kernel is given 32 threads; in a kernel, a barrier at the top level of the
+    * function (reached by every thread of the group, so it cannot hang) is then made a
+    * threadgroup barrier, which is what "the 32 lanes wait" means on this GPU. One inside
+    * an if or a loop keeps the subgroup scope: lanes elsewhere may never reach it.
+    */
+   if (exec_scope == SCOPE_SUBGROUP && c->nir->info.stage == MESA_SHADER_COMPUTE) {
+      nir_block *here = nir_cursor_current_block(c->b.cursor);
+      if (here && here->cf_node.parent == &c->b.impl->cf_node)
+         exec_scope = SCOPE_WORKGROUP;
+   }
+   nir_barrier(&c->b, .execution_scope = exec_scope,
                .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
                .memory_modes = modes);
    return true;
@@ -1159,6 +1207,19 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       air_set(c, &in->base, air_val_ssa(c, nir_ffma(&c->b, a, b, d)));
       return true;
    }
+   /* llvm.{u,s}{min,max}.<iN|vNiN>: integer min/max at any width (RenderBox and CoreImage use i16) */
+   if (!strncmp(name, "llvm.umin.", 10) || !strncmp(name, "llvm.umax.", 10) ||
+       !strncmp(name, "llvm.smin.", 10) || !strncmp(name, "llvm.smax.", 10)) {
+      nir_def *a = air_get_ssa(c, in->operands[1]);
+      nir_def *b = air_get_ssa(c, in->operands[2]);
+      if (!a || !b)
+         return false;
+      bool is_signed = name[5] == 's', is_max = name[7] == 'a';
+      nir_def *r = is_signed ? (is_max ? nir_imax(&c->b, a, b) : nir_imin(&c->b, a, b))
+                             : (is_max ? nir_umax(&c->b, a, b) : nir_umin(&c->b, a, b));
+      air_set(c, &in->base, air_val_ssa(c, r));
+      return true;
+   }
    if (!strncmp(name, "llvm.fabs.", 10)) {
       nir_def *a = air_get_ssa(c, in->operands[1]);
       if (!a)
@@ -1175,7 +1236,7 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
  *
  * The largest family and the one with the long tail. Its vocabulary is
  * Apple's, read off AGXCompilerCore the same way the arithmetic was
- * (docs/air.md section 3.2): the names there end in an underscore --
+ * (docs/dev/air.md section 3.2): the names there end in an underscore --
  * air.sample_texture_, air.gather_compare_depth_, air.get_num_mip_levels_texture_
  * -- because the dimensionality is appended to them. That is why the earlier
  * survey counted "about 117 get_*_texture_* variants": it is some twenty
@@ -1606,6 +1667,14 @@ null_texture_query(struct air_ctx *c, const struct air_inst *in, const struct ai
 static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
+   /* air.get_null_texture_<dim> / get_null_depth_<dim>: Metal's `texture2d<T>()` -- a texture handle naming no
+    * texture, used as "no input" in RenderBox and the posters. A pointer naming nothing; asked whether it is null,
+    * it answers true at translation time (null_texture_query's caller below). */
+   if (!strncmp(n->part[0], "get_null_texture", 16) || !strncmp(n->part[0], "get_null_depth", 14)) {
+      struct air_ptr p = { .class = AIR_PTR_NONE, .pointee = NULL };
+      air_set(c, &in->base, air_val_ptr(c, p));
+      return true;
+   }
    struct air_tex_name t;
    if (!parse_tex_name(n->part[0], &t))
       return air_error(c, "intrinsic: air.%s (a texture name this cannot take apart)",
@@ -1634,6 +1703,36 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       return air_error(c, "intrinsic: air.%s (a gradient form of %s, which Metal has no "
                           "signature for)", n->part[0], t.op);
 
+   /* a NULL texture handle (air.get_null_texture_*): asked whether it is null, yes; any other use reads zero, which
+    * is what an unbound texture gives on Apple's GPUs */
+   {
+      struct air_val *hv = in->num_operands > 1 ? air_get(c, in->operands[1]) : NULL;
+      if (hv && hv->kind == AIR_VAL_PTR && hv->ptr.class == AIR_PTR_NONE) {
+         unsigned bits = air_nir_bit_size(c, in->base.type);
+         if (!strcmp(t.op, "is_null")) {
+            air_set(c, &in->base, air_val_ssa(c, bits == 1 ? nir_imm_true(&c->b) : nir_imm_intN_t(&c->b, 1, bits)));
+            return true;
+         }
+         if (in->base.type->kind == AIR_TYPE_VOID)
+            return true;
+         if (in->base.type->kind == AIR_TYPE_STRUCT || in->base.type->kind == AIR_TYPE_ARRAY) {
+            const struct air_type *st = in->base.type;
+            struct air_val *agg = rzalloc(c->mem_ctx, struct air_val);
+            agg->kind = AIR_VAL_AGG;
+            agg->num_elems = st->kind == AIR_TYPE_STRUCT ? st->num_members : (unsigned)st->count;
+            agg->elems = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(agg->num_elems, 1));
+            for (unsigned i = 0; i < agg->num_elems; i++) {
+               const struct air_type *et = st->kind == AIR_TYPE_STRUCT ? st->members[i] : st->elem;
+               if (et->kind != AIR_TYPE_STRUCT && et->kind != AIR_TYPE_ARRAY && et->kind != AIR_TYPE_POINTER)
+                  agg->elems[i] = air_val_ssa(c, nir_imm_zero(&c->b, air_nir_components(et), air_nir_bit_size(c, et)));
+            }
+            air_set(c, &in->base, agg);
+            return c->error[0] == 0;
+         }
+         air_set(c, &in->base, air_val_ssa(c, nir_imm_zero(&c->b, air_nir_components(in->base.type), bits)));
+         return true;
+      }
+   }
    struct air_ptr tex;
    if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
       return false;
@@ -2016,7 +2115,9 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (!strcmp(n.part[0], "is_function_constant_defined"))
       return fc_defined_op(c, in);
    if (n.num >= 2 && !strcmp(n.part[0], "wg") && !strcmp(n.part[1], "barrier"))
-      return barrier_op(c, in);
+      return barrier_op(c, in, SCOPE_WORKGROUP);
+   if (n.num >= 2 && !strcmp(n.part[0], "simdgroup") && !strcmp(n.part[1], "barrier"))
+      return barrier_op(c, in, SCOPE_SUBGROUP);
    if (!strcmp(n.part[0], "atomic"))
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))

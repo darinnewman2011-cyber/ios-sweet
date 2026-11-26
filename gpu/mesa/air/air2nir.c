@@ -120,7 +120,7 @@ stage_name(int stage)
  * buffer loads are replaced by the bytes actually in the buffers. No
  * interpreter is needed: NIR's own constant folding is the interpreter, and
  * what comes out can be compared against LLVM's answer for the same bytes
- * (tools/air/cpuref.py). This is the check docs/air.md section 4 calls the
+ * (tools/air/cpuref.py). This is the check docs/dev/air.md section 4 calls the
  * strongest one, and it needs no GPU.
  */
 

@@ -103,7 +103,7 @@ void rwa_buffer_destroy(struct rwa_buffer *buffer);
  * inside the module; it may be NULL when the module holds exactly one.
  *
  * On failure returns NULL and writes a sentence into `why` -- and the sentences matter, as
- * docs/air.md says: 135 of the corpus's modules are refused for reasons a driver should
+ * docs/dev/air.md says: 135 of the corpus's modules are refused for reasons a driver should
  * repeat to the application rather than swallow.
  */
 struct rwa_compute *rwa_compute_create(struct rwa_device *device, const void *bitcode,
@@ -115,7 +115,7 @@ void rwa_compute_destroy(struct rwa_compute *compute);
  * A texture. The shape comes from Metal's own descriptor, in Metal's own terms, because that
  * is what a driver has in its hand when newTextureWithDescriptor: is called; translating it
  * into Gallium's terms is this library's job, and a format it cannot translate must be
- * refused BY NAME rather than approximated -- docs/air.md is full of reasons to distrust a
+ * refused BY NAME rather than approximated -- docs/dev/air.md is full of reasons to distrust a
  * pixel format that was almost right.
  *
  * `pixel_format` is MTLPixelFormat as Metal defines it. `type` is MTLTextureType. `usage` is
@@ -331,7 +331,7 @@ int rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t s
 
 /*
  * A sampler, as Metal describes one. These fields are deliberately the same ones the front
- * end already decodes out of a shader's `constexpr sampler` word (docs/air.md section 3.3),
+ * end already decodes out of a shader's `constexpr sampler` word (docs/dev/air.md section 3.3),
  * whose behaviour was checked against Apple's own rules in 15 cases: a driver that builds a
  * sampler from MTLSamplerDescriptor and a shader that declares its own must end up at the
  * same place, and keeping one vocabulary is what makes that checkable.
@@ -375,7 +375,7 @@ void rwa_sampler_destroy(struct rwa_sampler *sampler);
  * two-member set declaring `air.arg_type_size 16` and a ten-member set 80 -- and those
  * handles are an Apple GPU's descriptors. They mean nothing to a Gallium driver, which
  * binds by index; and this frontend has already resolved every member of every set to a
- * binding while translating (docs/air.md 8.2), so the handles are not needed either.
+ * binding while translating (docs/dev/air.md 8.2), so the handles are not needed either.
  *
  * So the encoder cannot be a writer here. It is a RECORDER: -setBuffer:offset:atIndex:,
  * -setTexture:atIndex: and -setSamplerState:atIndex: record (resource, Metal id) against
@@ -408,7 +408,7 @@ void rwa_sampler_destroy(struct rwa_sampler *sampler);
  * there is no residency for the application to arrange.
  */
 
-/* RE4's largest set has 43 members (docs/air.md 8.2) and Apple's own limit on an
+/* RE4's largest set has 43 members (docs/dev/air.md 8.2) and Apple's own limit on an
  * argument buffer's entries is higher than this; what this number bounds is the record,
  * and a set with more members than this is refused by name rather than recorded in part.
  */
@@ -450,7 +450,7 @@ struct rwa_argbuf_member {
  * way that is invisible until something runs out. They are 8 bytes per member the set
  * DECLARES -- used or not, which is why the member list below is never compacted -- and
  * 8 bytes, which is what `air.arg_type_size` and `air.arg_type_align_size` say in the
- * metadata of every one of Resident Evil 4's 7 857 sets (docs/air.md 8.2.1).
+ * metadata of every one of Resident Evil 4's 7 857 sets (docs/dev/air.md 8.2.1).
  */
 struct rwa_argbuf_layout {
 	unsigned metal_index;      /* the [[buffer(n)]] the SET is bound at */
@@ -599,7 +599,7 @@ struct rwa_bindings {
  * them, both as Metal counts them.
  *
  * Returns 0, or -1 with a sentence in `why`. A dispatch that the GPU does not finish is a
- * failure here and says so: air_run learned that the hard way (docs/air.md section 5) --
+ * failure here and says so: air_run learned that the hard way (docs/dev/air.md section 5) --
  * before it waited on a fence it printed its own fill pattern as a result, and 21 of 47
  * kernels in one run were vacuous.
  */
@@ -627,6 +627,15 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 			 const unsigned groups[3], const unsigned group_size[3],
 			 char *why, size_t why_size);
 
+/*
+ * rwa_dispatch_buffers with Metal's -setThreadgroupMemoryLength:atIndex: (index 0): the size
+ * of a kernel's threadgroup ARGUMENT, which only the dispatch knows. 0 when there is none.
+ */
+int rwa_dispatch_tg(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+		    const struct rwa_buffer_bind *table, unsigned table_count,
+		    const unsigned groups[3], const unsigned group_size[3],
+		    unsigned threadgroup_length, char *why, size_t why_size);
+
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 /* rwa_finish in two: flush and take the fence; then wait for it (any thread, without the lock). */
@@ -645,7 +654,7 @@ int rwa_fence_wait(struct rwa_device *device, void *fence, char *why, size_t why
  * That is not a convenience: it is the road that already has evidence behind it. air_run
  * draws every fragment shader of the corpus that way -- a generated quad vertex shader plus
  * the real fragment shader -- and 255 of them have been drawn and compared pixel by pixel
- * (docs/air.md). A driver asked for a pipeline whose vertex function is one of Apple's own
+ * (docs/dev/air.md). A driver asked for a pipeline whose vertex function is one of Apple's own
  * three vertex shaders passes both modules instead, and then nothing is generated.
  */
 struct rwa_render;
@@ -683,7 +692,7 @@ struct rwa_depth_stencil;
  * "reads vertex attributes ([[stage_in]]), and this
  * contract carries no vertex attribute layout (rwa_render_shape has no formats, strides
  * or offsets)" -- because the shader's half of that match is all AIR carries
- * (docs/air.md 3.1: Apple's compiler flattens the stage-in struct and the format, the
+ * (docs/dev/air.md 3.1: Apple's compiler flattens the stage-in struct and the format, the
  * offset, the stride and the buffer are nowhere in the module) and the API's half had
  * nowhere to arrive.
  *
@@ -841,11 +850,8 @@ struct rwa_vertex_layout {
  * end.
  *
  * It is in the SHAPE because that is where Metal puts it -- blend state is compiled into
- * the pipeline, not set on the encoder -- with ONE exception that is therefore refused:
- * the four factors that read Metal's BLEND COLOUR
- * (-setBlendColorRed:green:blue:alpha:) are encoder state, this contract has nowhere to
- * carry it, and the driver's own setter is a stub. See the refusal list at
- * rwa_render_create.
+ * the pipeline, not set on the encoder. The constant blend colour itself is
+ * encoder state and is supplied separately in rwa_draw.blend_color.
  */
 struct rwa_color_blend {
 	unsigned blending_enabled;               /* isBlendingEnabled */
@@ -1072,7 +1078,7 @@ void rwa_depth_stencil_destroy(struct rwa_depth_stencil *state);
  *     predicate. The fetch would read a VFD slot nothing was set up for; the gated case
  *     is legal and is the one exception, because the parameter exists whatever the
  *     predicate says and a pipeline whose constants make it false may configure nothing
- *     there (docs/air.md 3.1, and six of QuartzCore's 46 attributes are such).
+ *     there (docs/dev/air.md 3.1, and six of QuartzCore's 46 attributes are such).
  *   - a format whose converted type is not the type the shader declared: an integer
  *     format for a `float` member or a normalised one for a `uint` member. This is what
  *     air_vertex_attribute.base_type is for, and why the frontend keeps INT and UINT
@@ -1107,15 +1113,6 @@ void rwa_depth_stencil_destroy(struct rwa_depth_stencil *state);
  * blend fields were added to end, so each is a sentence with the caller's own words in
  * it:
  *
- *   - MTLBlendFactorBlendColor, OneMinusBlendColor, BlendAlpha and OneMinusBlendAlpha
- *     (11-14). Gallium has all four (PIPE_BLENDFACTOR_CONST_COLOR and friends) and so
- *     does the hardware; what nothing here has is the COLOUR. Metal keeps it on the
- *     encoder, -setBlendColorRed:green:blue:alpha:, so it is not pipeline state and not
- *     in this shape -- and the driver's own setter is a stub that drops it. Honouring
- *     them would blend against the zero a Gallium context starts with, which is
- *     "multiply by nothing": the layer would vanish instead of failing. Serving them is
- *     one float[4] in rwa_draw and one call to set_blend_color, on the day something
- *     asks.
  *   - MTLBlendFactorSource1Color, OneMinusSource1Color, Source1Alpha and
  *     OneMinusSource1Alpha (15-18): dual-source blending, where the second factor comes
  *     from a SECOND fragment output at [[color(0), index(1)]]. Neither this contract nor
@@ -1399,6 +1396,8 @@ struct rwa_draw {
 	const unsigned *color_level;
 	const unsigned *color_layer;
 	unsigned depth_level, depth_layer;
+	/* Encoder blend colour at this draw, or NULL for Metal's zero default. */
+	const float *blend_color;
 };
 
 /* A pass that clears and draws nothing: the attachments, clear values and `deferred` of

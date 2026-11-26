@@ -5,7 +5,7 @@
 
 /*
  * AIR -> NIR: Metal shaders (the LLVM bitcode inside a .metallib) into NIR.
- * See docs/air.md of Darwin on redwood for the design and the mapping
+ * See docs/dev/air.md of Darwin on redwood for the design and the mapping
  * tables this follows.
  */
 
@@ -124,7 +124,7 @@ struct air_resource {
    /* A sampler the shader declares itself (Metal's constexpr sampler) rather
     * than one the API binds: the runtime has to create it from this state
     * word and bind it at .index, which the frontend assigns after the API's
-    * samplers. The word's layout is not decoded yet -- see docs/air.md.
+    * samplers. The word's layout is not decoded yet -- see docs/dev/air.md.
     */
    bool inline_sampler;
    uint64_t sampler_state;         /* the word itself, for a runtime that wants it raw */
@@ -159,7 +159,7 @@ struct air_resource {
     * that it depends on the metadata alone: the runtime's encoder has to answer
     * `encodedLength` for a set whichever of its members this shader reads, and
     * a numbering that skipped the unread ones would differ between two shaders
-    * sharing one set. See docs/air.md section 8.2.
+    * sharing one set. See docs/dev/air.md section 8.2.
     */
    unsigned argbuf_set;
    unsigned argbuf_id;
@@ -217,7 +217,7 @@ struct air_vertex_attribute {
 
    /* The width the SHADER reads, 8, 16 or 32. The NIR input is 32 bits wide
     * whatever this says, and the narrowing is an instruction in the shader --
-    * see docs/air.md: ir3 puts a 16-bit vertex input in the HALF register file
+    * see docs/dev/air.md: ir3 puts a 16-bit vertex input in the HALF register file
     * and then reports it in `ir3_shader_variant.inputs[]`, which has no half
     * flag, as a full register, which is the number fd6_program.cc programs
     * VFD_DEST_CNTL_INSTR_REGID from. A 32-bit input keeps the hardware fetch
