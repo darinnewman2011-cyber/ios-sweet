@@ -4413,6 +4413,10 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     * point, which every consumer of this NIR assumes.
     */
    if (_mesa_hash_table_num_entries(c.fns)) {
+      /* a return in the middle of a callee (nir_lower_goto_ifs leaves its jumps to the end block as returns) is
+       * lowered first: nir_inline_functions assumes there is none, and a release build inlined it wrongly --
+       * SpringBoard's RenderBox shaders crashed this way on the Galaxy S10 port (ios-b1lte B1L-0225/0227) */
+      NIR_PASS(_, c.nir, nir_lower_returns);
       NIR_PASS(_, c.nir, nir_inline_functions);
       NIR_PASS(_, c.nir, nir_opt_deref);
       nir_remove_non_entrypoints(c.nir);
