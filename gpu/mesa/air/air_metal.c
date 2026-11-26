@@ -1185,6 +1185,10 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 551, "MTLPixelFormatBGR10A8_2P_XR10_sRGB (as BGRA8)", PIPE_FORMAT_B8G8R8A8_SRGB },
    { 554, "MTLPixelFormatBGR10_XR (as BGRA8)",             PIPE_FORMAT_B8G8R8A8_UNORM },
    { 555, "MTLPixelFormatBGR10_XR_sRGB (as BGRA8)",        PIPE_FORMAT_B8G8R8A8_SRGB },
+   /* iOS 26 backboardd (CA::OGL::MetalContext::warmup_shaders) asks for 552 at 776x24 and refused
+    * there, never commits a command buffer and never finishes display setup (r26-0957/0958) */
+   { 552, "MTLPixelFormatBGRA10_XR (as BGRA8)",            PIPE_FORMAT_B8G8R8A8_UNORM },
+   { 553, "MTLPixelFormatBGRA10_XR_sRGB (as BGRA8)",       PIPE_FORMAT_B8G8R8A8_SRGB },
    /*
     * ASTC, low dynamic range (G9 run 31): AegirPoster's Earth and Moon maps are 190, 198 and 208, and
     * without them its passes draw from nothing. The Mali decodes ASTC itself; whether THIS screen
