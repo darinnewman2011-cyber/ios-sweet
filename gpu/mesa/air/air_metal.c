@@ -1187,6 +1187,13 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 555, "MTLPixelFormatBGR10_XR_sRGB (as BGRA8)",        PIPE_FORMAT_B8G8R8A8_SRGB },
    /* iOS 26 backboardd (CA::OGL::MetalContext::warmup_shaders) asks for 552 at 776x24 and refused
     * there, never commits a command buffer and never finishes display setup (r26-0957/0958) */
+   /* iOS 26 CA::OGL four_cc_to_mtl_format / image_parameters can ask for the packed 32-bit formats
+    * (10-bit colour surfaces): served when the Mali takes them, which is_format_supported checks at creation */
+   { 90, "MTLPixelFormatRGB10A2Unorm",                     PIPE_FORMAT_R10G10B10A2_UNORM },
+   { 91, "MTLPixelFormatRGB10A2Uint",                      PIPE_FORMAT_R10G10B10A2_UINT },
+   { 92, "MTLPixelFormatRG11B10Float",                     PIPE_FORMAT_R11G11B10_FLOAT },
+   { 93, "MTLPixelFormatRGB9E5Float",                      PIPE_FORMAT_R9G9B9E5_FLOAT },
+   { 94, "MTLPixelFormatBGR10A2Unorm",                     PIPE_FORMAT_B10G10R10A2_UNORM },
    { 552, "MTLPixelFormatBGRA10_XR (as BGRA8)",            PIPE_FORMAT_B8G8R8A8_UNORM },
    { 553, "MTLPixelFormatBGRA10_XR_sRGB (as BGRA8)",       PIPE_FORMAT_B8G8R8A8_SRGB },
    /*

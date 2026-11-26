@@ -871,7 +871,10 @@ discard_op(struct air_ctx *c, const struct air_inst *in)
    if (c->nir->info.stage != MESA_SHADER_FRAGMENT)
       return air_error(c, "intrinsic: air.discard_fragment in a %s shader",
                        gl_shader_stage_name(c->nir->info.stage));
-   nir_demote(&c->b);
+   /* terminate, not demote: the Mali's Bifrost compiler has no demote ("Unhandled intrinsic demote",
+    * iOS 26 backboardd r26-0957), so a demoted pixel was drawn anyway. The only cost is derivatives
+    * taken after the discard in the same quad, which Metal leaves undefined. */
+   nir_terminate(&c->b);
    c->nir->info.fs.uses_discard = true;
    return true;
 }
