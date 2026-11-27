@@ -2966,7 +2966,131 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 			length:(NSUInteger)length;
 @end
 
+/*
+ * MTLSharedEvent / MTLEvent. CoreAnimation fences its GPU work with them (CA::OGL::MetalContext::set_fence encodes a
+ * signal into the command buffer, test_fence reads signaledValue): with -encodeSignalEvent:value: a no-op every fence
+ * stayed unsignaled and backboardd logged "timed out fence" / "timed out batch", ~0.1-1 frames a second on the A8.
+ * The value is set when the command buffer's work has completed (its completed handlers), listeners run on their queue.
+ */
+@interface RedwoodMetalSharedEvent : NSObject {
+@public
+	id _device;
+	NSString *_label;
+	uint64_t _value;
+	NSMutableArray *_waiters;      /* {value, queue, block} */
+	pthread_mutex_t _lock;
+	pthread_cond_t _cond;
+}
+@end
+
+@implementation RedwoodMetalSharedEvent
+- (instancetype)initWithDevice:(id)device
+{
+	if ((self = [super init])) {
+		_device = device;
+		pthread_mutex_init(&_lock, NULL);
+		pthread_cond_init(&_cond, NULL);
+	}
+	return self;
+}
+- (void)dealloc
+{
+	[_label release];
+	[_waiters release];
+	pthread_cond_destroy(&_cond);
+	pthread_mutex_destroy(&_lock);
+	[super dealloc];
+}
+- (id)device { return _device; }
+- (NSString *)label { return _label; }
+- (void)setLabel:(NSString *)label { NSString *old = _label; _label = [label copy]; [old release]; }
+- (uint64_t)signaledValue
+{
+	pthread_mutex_lock(&_lock);
+	uint64_t v = _value;
+	pthread_mutex_unlock(&_lock);
+	return v;
+}
+- (void)setSignaledValue:(uint64_t)value
+{
+	NSMutableArray *ready = nil;
+	pthread_mutex_lock(&_lock);
+	_value = value;
+	pthread_cond_broadcast(&_cond);
+	for (NSUInteger i = 0; i < [_waiters count];) {
+		NSArray *w = [_waiters objectAtIndex:i];
+		if ([[w objectAtIndex:0] unsignedLongLongValue] <= value) {
+			if (ready == nil) {
+				ready = [NSMutableArray array];
+			}
+			[ready addObject:w];
+			[_waiters removeObjectAtIndex:i];
+		} else {
+			i++;
+		}
+	}
+	pthread_mutex_unlock(&_lock);
+	for (NSArray *w in ready) {
+		dispatch_queue_t q = (dispatch_queue_t)[w objectAtIndex:1];
+		void (^block)(id, uint64_t) = [w objectAtIndex:2];
+		uint64_t at = [[w objectAtIndex:0] unsignedLongLongValue];
+		[self retain];
+		dispatch_async(q, ^{ block(self, at); [self release]; });
+	}
+}
+- (void)notifyListener:(id)listener atValue:(uint64_t)value block:(void (^)(id, uint64_t))block
+{
+	if (block == NULL) {
+		return;
+	}
+	dispatch_queue_t q = nil;
+	if ([listener respondsToSelector:@selector(dispatchQueue)]) {
+		q = [listener performSelector:@selector(dispatchQueue)];
+	}
+	if (q == nil) {
+		q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+	}
+	pthread_mutex_lock(&_lock);
+	if (_value >= value) {
+		pthread_mutex_unlock(&_lock);
+		void (^b)(id, uint64_t) = [[block copy] autorelease];
+		[self retain];
+		dispatch_async(q, ^{ b(self, value); [self release]; });
+		return;
+	}
+	if (_waiters == nil) {
+		_waiters = [[NSMutableArray alloc] init];
+	}
+	[_waiters addObject:@[ @(value), q, [[block copy] autorelease] ]];
+	pthread_mutex_unlock(&_lock);
+}
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)ms
+{
+	struct timespec until;
+	clock_gettime(CLOCK_REALTIME, &until);
+	until.tv_sec += ms / 1000;
+	until.tv_nsec += (long)(ms % 1000) * 1000000L;
+	if (until.tv_nsec >= 1000000000L) {
+		until.tv_sec++;
+		until.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&_lock);
+	while (_value < value) {
+		if (pthread_cond_timedwait(&_cond, &_lock, &until) != 0) {
+			break;
+		}
+	}
+	BOOL ok = _value >= value;
+	pthread_mutex_unlock(&_lock);
+	return ok;
+}
+- (id)newSharedEventHandle { return nil; }   /* one process only: no cross-process handles here */
+@end
+
 @implementation RedwoodMetalDevice
+- (id)newSharedEvent { return [[RedwoodMetalSharedEvent alloc] initWithDevice:self]; }
+- (id)newEvent { return [[RedwoodMetalSharedEvent alloc] initWithDevice:self]; }
+- (id)newSharedEventWithHandle:(id)handle { (void)handle; return [[RedwoodMetalSharedEvent alloc] initWithDevice:self]; }
 
 + (void)load
 {
@@ -6592,8 +6716,25 @@ rw_mps_facts(id commandBuffer, id device)
 }
 - (id)resourceStateCommandEncoder { return nil; }
 - (id)accelerationStructureCommandEncoder { return nil; }
-- (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
-- (void)encodeWaitForEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
+- (void)encodeSignalEvent:(id)event value:(uint64_t)value
+{
+	/* set when this command buffer's work has completed: CoreAnimation's GPU fences (see RedwoodMetalSharedEvent) */
+	if (event == nil || ![event respondsToSelector:@selector(setSignaledValue:)]) {
+		return;
+	}
+	[event retain];
+	[self addCompletedHandler:^(id cb) {
+		(void)cb;
+		[event setSignaledValue:value];
+		[event release];
+	}];
+}
+- (void)encodeWaitForEvent:(id)event value:(uint64_t)value
+{
+	/* not waited for: this is encode time, and blocking here could wait on a command buffer this thread commits later */
+	(void)event;
+	(void)value;
+}
 
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)type
 {
