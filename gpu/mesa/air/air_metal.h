@@ -1147,6 +1147,10 @@ void rwa_depth_stencil_destroy(struct rwa_depth_stencil *state);
  *     governs them all when independent blending is off, so the second attachment would
  *     silently get the first one's equation.
  */
+/* the AIR modules (MTLLinkedFunctions) the next rwa_render_create on this thread links into stage 0 (vertex) or
+ * 1 (fragment); n = 0 clears */
+void rwa_render_set_linked(unsigned stage, const void *const *bitcode, const size_t *size, unsigned n);
+
 struct rwa_render *rwa_render_create(struct rwa_device *device,
 				     const void *vertex_bitcode, size_t vertex_size,
 				     const char *vertex_entry,

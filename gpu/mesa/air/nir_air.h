@@ -363,6 +363,13 @@ struct air_to_nir_options {
     * entry point of the corpus and is counted separately.
     */
    bool library_wrapper;
+
+   /* Modules linked into this one: the AIR of MTLLinkedFunctions (functions, privateFunctions), whose defined
+    * functions a call of <f>.MTL_VISIBLE_FN_REF reaches (air_call_in_module). Ported from malthiscode/ios-b1lte
+    * B1L-0234 (BSD 2-Clause, the B2L port authors). */
+   const void *const *linked;
+   const size_t *linked_size;
+   unsigned num_linked;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

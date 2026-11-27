@@ -535,6 +535,7 @@ static struct {
 					    const char *, const void *, size_t, const char *,
 					    const struct rwa_render_shape *,
 					    struct rwa_render_info *, char *, size_t);
+	void (*render_set_linked)(unsigned, const void *const *, const size_t *, unsigned);
 	void (*render_destroy)(struct rwa_render *);
 	int (*render_draw)(struct rwa_render *, const struct rwa_draw *, char *, size_t);
 	struct rwa_depth_stencil *(*depth_stencil_create)(struct rwa_device *,
@@ -626,6 +627,7 @@ mesa_available(void)
 	 * yet draw is a real state of this work, and the driver says so when asked to draw
 	 * rather than refusing to exist. */
 	*(void **)&mesa.render_create = dlsym(mesa.handle, "rwa_render_create");
+	*(void **)&mesa.render_set_linked = dlsym(mesa.handle, "rwa_render_set_linked");   /* linked functions */
 	*(void **)&mesa.render_destroy = dlsym(mesa.handle, "rwa_render_destroy");
 	*(void **)&mesa.render_draw = dlsym(mesa.handle, "rwa_render_draw");
 	/* Depth likewise: a library that can draw and not test depth is a real state of
@@ -3486,6 +3488,33 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 
 	char why[512] = { 0 };
 	struct rwa_render_info info = { 0 };
+	/* The AIR of the functions each stage links (MTLLinkedFunctions functions + privateFunctions; binaryFunctions
+	 * are another GPU's code), for the library to link in: RenderBox's custom effects call custom_fn this way.
+	 * Ported from malthiscode/ios-b1lte B1L-0234 (BSD 2-Clause, the B2L port authors). */
+	const void *linked_bc[2][8];
+	size_t linked_sz[2][8];
+	unsigned linked_n[2] = { 0, 0 };
+	for (unsigned st = 0; st < 2 && mesa.render_set_linked != NULL; st++) {
+		static const char *const linked_sel[2] = { "vertexLinkedFunctions", "fragmentLinkedFunctions" };
+		static const char *const lists[2] = { "functions", "privateFunctions" };
+		SEL sel = sel_getUid(linked_sel[st]);
+		id lf = [descriptor respondsToSelector:sel] ? [descriptor performSelector:sel] : nil;
+		for (unsigned li = 0; lf != nil && li < 2; li++) {
+			SEL ls = sel_getUid(lists[li]);
+			id list = [lf respondsToSelector:ls] ? [lf performSelector:ls] : nil;
+			for (id f in list) {
+				NSData *bc = [f respondsToSelector:sel_getUid("bitcodeData")]
+					     ? [f performSelector:sel_getUid("bitcodeData")] : nil;
+				if (bc == nil || [bc length] < 4 || linked_n[st] >= 8) {
+					continue;
+				}
+				linked_bc[st][linked_n[st]] = [bc bytes];
+				linked_sz[st][linked_n[st]] = [bc length];
+				linked_n[st]++;
+			}
+		}
+		mesa.render_set_linked(st, linked_bc[st], linked_sz[st], linked_n[st]);
+	}
 	uint64_t t_compile = rw_now_ns();
 	struct rwa_render *render = mesa.render_create(_mesa,
 	    vertex_air != nil ? [vertex_air bytes] : NULL,
@@ -3493,6 +3522,10 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
 	    [fragment_air bytes], [fragment_air length], [[fragment name] UTF8String],
 	    &shape, &info, why, sizeof(why));
+	if (mesa.render_set_linked != NULL) {
+		mesa.render_set_linked(0, NULL, NULL, 0);
+		mesa.render_set_linked(1, NULL, NULL, 0);
+	}
 
 	t_compile = rw_now_ns() - t_compile;
 	/* A pipeline that took more than 10 s: keep its stages as Metal handed them to us (the specialised

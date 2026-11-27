@@ -245,6 +245,13 @@ make_key(const void *bitcode, size_t size, const char *entry_point,
    blob_write_bytes(&b, mod, sizeof(mod));
    blob_write_str(&b, entry_point);
    blob_write_uint8(&b, options ? options->library_wrapper : 0);
+   unsigned nlinked = options ? options->num_linked : 0;   /* linked functions change the translation */
+   blob_write_uint32(&b, nlinked);
+   for (unsigned l = 0; l < nlinked; l++) {
+      cache_key lk;
+      module_hash(options->linked[l], options->linked_size[l], lk);
+      blob_write_bytes(&b, lk, sizeof(lk));
+   }
    unsigned n = options ? options->num_constants : 0;
    blob_write_uint32(&b, n);
    for (unsigned i = 0; i < n; i++) {

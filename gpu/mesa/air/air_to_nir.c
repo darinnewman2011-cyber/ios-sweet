@@ -3310,6 +3310,20 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
          break;
       }
    }
+   /* a visible function's reference (<f>.MTL_VISIBLE_FN_REF, only declared here) is a call of the <f> a linked module
+    * defines -- RenderBox's custom effects call custom_fn this way (B1L-0234 of malthiscode/ios-b1lte, BSD-2) */
+   static const char vis_ref[] = ".MTL_VISIBLE_FN_REF";
+   size_t nl = strlen(name), rl = sizeof(vis_ref) - 1;
+   if ((!f || f->is_declaration || !f->num_blocks) && nl > rl && !strcmp(name + nl - rl, vis_ref)) {
+      for (unsigned i = 0; i < c->m->num_functions; i++) {
+         const struct air_function *d = c->m->functions[i];
+         if (d->base.name && strlen(d->base.name) == nl - rl && !strncmp(d->base.name, name, nl - rl) &&
+             !d->is_declaration && d->num_blocks) {
+            f = d;
+            break;
+         }
+      }
+   }
    if (!f)
       return air_error(c, "intrinsic: a call of %s, which is not a function of this "
                           "module", name);
@@ -4242,6 +4256,31 @@ air_to_nir_uncached(void *mem_ctx, const void *bitcode, size_t size, const char 
          *error = ralloc_asprintf(mem_ctx, "reader: %s", read_error);
       ralloc_free(ctx);
       return NULL;
+   }
+   /* the linked modules' globals and defined functions join this module's (static linking, as Metal's compiler does
+    * it for MTLLinkedFunctions; B1L-0234 of malthiscode/ios-b1lte, BSD-2) */
+   for (unsigned l = 0; options && l < options->num_linked; l++) {
+      const struct air_module *lm = air_module_read(ctx, options->linked[l], options->linked_size[l], &read_error);
+      if (!lm) {
+         if (error)
+            *error = ralloc_asprintf(mem_ctx, "reader: linked function %u: %s", l, read_error);
+         ralloc_free(ctx);
+         return NULL;
+      }
+      struct air_module *mm = (struct air_module *)c.m;
+      struct air_global **g = ralloc_array(ctx, struct air_global *, mm->num_globals + lm->num_globals + 1);
+      memcpy(g, mm->globals, mm->num_globals * sizeof(*g));
+      memcpy(g + mm->num_globals, lm->globals, lm->num_globals * sizeof(*g));
+      mm->globals = g;
+      mm->num_globals += lm->num_globals;
+      struct air_function **fs = ralloc_array(ctx, struct air_function *, mm->num_functions + lm->num_functions + 1);
+      memcpy(fs, mm->functions, mm->num_functions * sizeof(*fs));
+      unsigned nf = mm->num_functions;
+      for (unsigned i = 0; i < lm->num_functions; i++)
+         if (!lm->functions[i]->is_declaration && lm->functions[i]->num_blocks)
+            fs[nf++] = lm->functions[i];
+      mm->functions = fs;
+      mm->num_functions = nf;
    }
 
    const struct air_md *entry = NULL;

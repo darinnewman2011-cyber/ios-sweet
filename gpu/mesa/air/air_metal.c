@@ -7364,6 +7364,23 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
    return true;
 }
 
+/* The modules the next rwa_render_create (on this thread) links into its vertex (stage 0) or fragment (stage 1)
+ * function, from MTLRenderPipelineDescriptor's linked functions; kept by pointer until the driver clears them (n = 0)
+ * right after that call. Ported from malthiscode/ios-b1lte B1L-0234 (BSD-2). */
+static __thread const void *const *rwa_linked_bc[2];
+static __thread const size_t *rwa_linked_sz[2];
+static __thread unsigned rwa_linked_n[2];
+
+void
+rwa_render_set_linked(unsigned stage, const void *const *bitcode, const size_t *size, unsigned n)
+{
+   if (stage > 1)
+      return;
+   rwa_linked_bc[stage] = n ? bitcode : NULL;
+   rwa_linked_sz[stage] = n ? size : NULL;
+   rwa_linked_n[stage] = n;
+}
+
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
                   const void *vertex_bitcode, size_t vertex_size,
@@ -7540,7 +7557,9 @@ rwa_render_create(struct rwa_device *device,
       air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
    apply_function_constants(ffc, num_ffc, shape->fragment_constants,
                             shape->fragment_constant_count);
-   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
+   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc,
+                                             .linked = rwa_linked_bc[1], .linked_size = rwa_linked_sz[1],
+                                             .num_linked = rwa_linked_n[1] };
    const char *error;
    int64_t rwa_ta = os_time_get_nano();
    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
@@ -7598,7 +7617,9 @@ rwa_render_create(struct rwa_device *device,
          air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
       apply_function_constants(vfc, num_vfc, shape->vertex_constants,
                                shape->vertex_constant_count);
-      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
+      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc,
+                                                .linked = rwa_linked_bc[0], .linked_size = rwa_linked_sz[0],
+                                                .num_linked = rwa_linked_n[0] };
       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
                       device->nir_options, &render->vinfo, &error);
       if (!vs) {
