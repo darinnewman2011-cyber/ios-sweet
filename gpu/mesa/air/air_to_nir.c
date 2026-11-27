@@ -3667,6 +3667,41 @@ phi_tree_store(struct air_ctx *c, const struct air_val *tree, const struct air_v
  * a missing operand from a reachable block is a refusal and only an edge the
  * entry cannot reach at all is passed over.
  */
+/*
+ * A pointer phi's operand may itself be a run-time choice between two pointers into the SAME buffer (RenderBox's
+ * path_distance / path_exterior / uber binary searches, iOS 26 SpringBoard). Its byte offset is then a bcsel of the two
+ * offsets. Ported by hand from malthiscode/ios-b1lte B1L-0190/B1L-0226 (BSD 2-Clause, the B2L port authors).
+ */
+static bool
+ptr_same_buffer(const struct air_ptr *a, const struct air_ptr *b)
+{
+   return a->class == b->class && a->binding == b->binding && a->is_image == b->is_image &&
+          a->class != AIR_PTR_TEXTURE && a->class != AIR_PTR_SAMPLER && a->class != AIR_PTR_ARGBUF &&
+          a->class != AIR_PTR_NONE;
+}
+
+/* the first resolved pointer under a (tree of) run-time choice(s) */
+static const struct air_val *
+ptr_choice_leaf(const struct air_val *v)
+{
+   while (v && v->kind == AIR_VAL_PTR_SELECT && v->num_elems == 2)
+      v = v->elems[0];
+   return v && v->kind == AIR_VAL_PTR ? v : NULL;
+}
+
+/* the byte offset of `v` into `base`'s buffer: a choice between two is a bcsel of theirs; NULL if it names another */
+static nir_def *
+ptr_offset_into(struct air_ctx *c, const struct air_val *v, const struct air_ptr *base)
+{
+   if (v && v->kind == AIR_VAL_PTR_SELECT && v->num_elems == 2) {
+      nir_def *x = ptr_offset_into(c, v->elems[0], base), *y = ptr_offset_into(c, v->elems[1], base);
+      return x && y ? nir_bcsel(&c->b, v->def, x, y) : NULL;
+   }
+   if (!v || v->kind != AIR_VAL_PTR || !ptr_same_buffer(&v->ptr, base))
+      return NULL;
+   return v->ptr.offset ? v->ptr.offset : nir_imm_int(&c->b, 0);
+}
+
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
@@ -3681,11 +3716,20 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
          continue;
       }
       struct air_val *v = e->data;
+      if (v && v->kind == AIR_VAL_PTR_SELECT) {
+         /* a choice between pointers: its offset goes in the register (checked against the buffer when stored) */
+         const struct air_val *leaf = ptr_choice_leaf(v);
+         if (!leaf || !ptr_same_buffer(&leaf->ptr, &leaf->ptr))
+            return air_error(c, "instruction: a phi of pointers one of whose operands is "
+                                "itself a pointer chosen at run time between resources");
+         if (!first)
+            first = (struct air_val *)leaf;
+         carried = true;
+         continue;
+      }
       if (!v || v->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a phi of pointers one of whose operands is "
-                             "%s", v && v->kind == AIR_VAL_PTR_SELECT
-                                      ? "itself a pointer chosen at run time"
-                                      : "not a resolved pointer");
+                             "not a resolved pointer");
       if (!first)
          first = v;
       else if (!same_ptr(&first->ptr, &v->ptr)) {
@@ -3921,11 +3965,11 @@ translate_body(struct air_ctx *c)
                struct air_val *pv = air_get(c, in->operands[k]);
                if (!pv)
                   return false;
-               if (pv->kind != AIR_VAL_PTR || pv->ptr.class != slot->base.class ||
-                   pv->ptr.binding != slot->base.binding || pv->ptr.is_image != slot->base.is_image)
+               nir_def *po = ptr_offset_into(c, pv, &slot->base);
+               if (!po)
                   return air_error(c, "instruction: a phi of pointers whose loop-carried operand "
                                       "names another resource");
-               nir_store_reg(&c->b, pv->ptr.offset ? pv->ptr.offset : nir_imm_int(&c->b, 0), slot->reg);
+               nir_store_reg(&c->b, po, slot->reg);
             } else if (slot->tree) {
                struct air_val *agg = air_get(c, in->operands[k]);
                if (!agg || !phi_tree_store(c, slot->tree, agg))
