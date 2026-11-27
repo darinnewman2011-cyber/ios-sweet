@@ -388,6 +388,9 @@ nir_shader *air_to_nir(void *mem_ctx, const void *bitcode, size_t size,
 /* The function constants the module declares, with .bits zero: a caller
  * fills in the values it will specialize with. Returns how many there are.
  */
+/* The persistent AIR -> NIR cache (air_cache.c): hits, misses, unreadable entries. */
+void air_nir_cache_stats(uint64_t out[3]);
+
 unsigned air_module_function_constants(void *mem_ctx, const void *bitcode, size_t size,
                                        struct air_constant_value **out);
 

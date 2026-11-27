@@ -4175,8 +4175,9 @@ run_static_initializers(struct air_ctx *c)
 
 /* -- the entry point ---------------------------------------------------- */
 
+/* air_cache.c puts the persistent AIR -> NIR cache in front of this (air_to_nir). */
 nir_shader *
-air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
+air_to_nir_uncached(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
            const struct air_to_nir_options *options,
            const nir_shader_compiler_options *nir_options,
            struct air_shader_info *info, const char **error)

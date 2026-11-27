@@ -250,4 +250,11 @@ bool air_translate_call(struct air_ctx *c, const struct air_inst *in, const char
 /* a call of a function defined in this module, folded in by nir_inline_functions */
 bool air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name);
 
+/* air_to_nir.c: the translator itself; air_to_nir (air_cache.c) puts the persistent cache in front. */
+nir_shader *air_to_nir_uncached(void *mem_ctx, const void *bitcode, size_t size,
+                                const char *entry_point,
+                                const struct air_to_nir_options *options,
+                                const nir_shader_compiler_options *nir_options,
+                                struct air_shader_info *info, const char **error);
+
 #endif /* AIR_PRIVATE_H */
