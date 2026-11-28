@@ -66,6 +66,32 @@
 #include "util/half_float.h"
 #include "util/u_atomic.h"
 #include "util/u_inlines.h"
+
+#ifdef __APPLE__
+#include <os/log.h>
+/* 2026-11-28 ASTC wallpaper scramble: one line per compressed-texture operation (first 400 per
+ * process) to the unified log, subsystem com.beryllium.rwa, so a boot shows which path the
+ * lock-screen snapshots take. */
+static void
+rwa_astc_note(const struct pipe_resource *res, const char *fmt, ...)
+{
+   static int notes;
+   if (!res || !util_format_is_compressed(res->format) || p_atomic_inc_return(&notes) > 400)
+      return;
+   char line[256];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   static os_log_t log;
+   if (!log)
+      log = os_log_create("com.beryllium.rwa", "astc");
+   os_log(log, "RWA ASTC %{public}s %ux%u bind %#x usage %u: %{public}s",
+          util_format_short_name(res->format), res->width0, res->height0, res->bind, res->usage, line);
+}
+#else
+#define rwa_astc_note(...) ((void)0)
+#endif
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/set.h"
@@ -1912,10 +1938,20 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          free(texture);
          return NULL;
       }
+      rwa_astc_note(texture->res, "IMPORT %s id %d row %u offset %u", IMPORT_KIND(import),
+                    import->id, import->row_bytes, import->offset);
       return texture;
    }
 
    texture->res = device->screen->resource_create(device->screen, &templ);
+   if (texture->res) {
+      uint64_t mod = 0;
+      if (device->screen->resource_get_param)
+         device->screen->resource_get_param(device->screen, NULL, texture->res, 0, 0, 0,
+                                            PIPE_RESOURCE_PARAM_MODIFIER, 0, &mod);
+      rwa_astc_note(texture->res, "create usage %#x levels %u modifier %#llx", shape->usage,
+                    mips, (unsigned long long)mod);
+   }
    if (!texture->res) {
       say(why, why_size, "the GPU driver would not allocate a %ux%ux%u %s of %s. After a few "
                          "dozen allocations in one boot this driver starts refusing outright "
@@ -2059,6 +2095,8 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned type
                  unsigned slices, char *why, size_t why_size)
 {
    RWA_GUARD();
+   if (texture)
+      rwa_astc_note(texture->res, "view as Metal format %u type %u", mtl_format, type);
    if (!texture) {
       say(why, why_size, "a view of no texture");
       return NULL;
@@ -2370,6 +2408,8 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     * what -replaceRegion:...bytesPerRow:bytesPerImage: is given when bytesPerImage is
     * the obvious product.
     */
+   rwa_astc_note(texture->res, "write level %u box %d,%d %dx%d stride %zu (asked %zu) base %u",
+                 level, box.x, box.y, box.width, box.height, row, stride, texture->base_level);
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res,
                                           texture->base_level + level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
@@ -6275,9 +6315,15 @@ rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice
          .mask = PIPE_MASK_RGBA,
          .filter = PIPE_TEX_FILTER_NEAREST,
       };
+      rwa_astc_note(src->res, "copy BLIT to %s box %d,%d %dx%d -> %d,%d", dst->format_name,
+                    sbox.x, sbox.y, sbox.width, sbox.height, dbox.x, dbox.y);
       pipe->blit(pipe, &blit);
       return 0;
    }
+   rwa_astc_note(src->res, "copy REGION to %s box %d,%d %dx%d -> %d,%d", dst->format_name,
+                 sbox.x, sbox.y, sbox.width, sbox.height, dbox.x, dbox.y);
+   rwa_astc_note(dst->res, "copy REGION from %s box %d,%d %dx%d -> %d,%d", src->format_name,
+                 sbox.x, sbox.y, sbox.width, sbox.height, dbox.x, dbox.y);
    if (util_format_get_blocksize(f) != util_format_get_blocksize(dst->format)) {
       say(why, why_size, "a copy from %s to %s, whose texels are not the same size",
           src->format_name, dst->format_name);
