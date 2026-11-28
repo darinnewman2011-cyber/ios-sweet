@@ -1471,6 +1471,7 @@ struct rwa_surface_import {
    unsigned offset, row_bytes;
    unsigned chroma_offset, chroma_row_bytes;   /* a two-plane format's second plane; 0: none */
    const char *kind;                           /* what `id` names, for refusals: NULL an IOSurface */
+   bool loose_row;                             /* the panel (rwa_texture_from_panel): 16-byte rows */
 };
 #define IMPORT_KIND(import) ((import)->kind ? (import)->kind : "IOSurface")
 
@@ -1854,7 +1855,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          free(texture);
          return NULL;
       }
-      if (import->row_bytes % 64 != 0) {
+      if (import->row_bytes % (import->loose_row ? 16 : 64) != 0) {
          say(why, why_size, "%s %d has %u bytes a row, which is not a multiple of "
                             "64: this GPU lays out a row aligned to that and its import "
                             "refuses a pitch it would have to change (the kernel's own "
@@ -2011,6 +2012,57 @@ rwa_texture_from_surface_planes(struct rwa_device *device, const struct rwa_text
       .chroma_offset = chroma_offset, .chroma_row_bytes = chroma_row_bytes };
 
    return texture_of_shape(device, shape, &import, why, why_size);
+}
+
+/*
+ * 2026-11-28 (Beryllium, "direct display"): the display panel's own IOSurface (AppleCLCD's
+ * SweetPanelSurface, 1080x2220 at 4320 bytes a row on the Galaxy A8) as a render target. Its rows are
+ * not a multiple of 64 -- the rule above is freedreno's (a6xx pitchalign); panfrost on Bifrost (arch 6)
+ * checks no row alignment for an imported linear image (pan_layout.c: only arch >= 7 rejects the
+ * stride), and a Mali render target needs 16 -- so the panel alone is let in at 16.
+ */
+struct rwa_texture *
+rwa_texture_from_panel(struct rwa_device *device, const struct rwa_texture_shape *shape, int surface_id,
+                       unsigned offset, unsigned row_bytes, char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (surface_id <= 0) {
+      say(why, why_size, "IOSurface %d is not a surface", surface_id);
+      return NULL;
+   }
+   const struct rwa_surface_import import = {
+      .id = surface_id, .offset = offset, .row_bytes = row_bytes, .kind = "panel IOSurface",
+      .loose_row = true };
+
+   return texture_of_shape(device, shape, &import, why, why_size);
+}
+
+/* A scaled copy by the GPU, filtered: `src_rect` (x, y, w, h) of src's level 0 into `dst_rect` of dst's
+ * (the frame into the panel's fit rectangle). Queued like a draw; the next submit carries it. */
+int
+rwa_texture_scale(struct rwa_texture *dst, const unsigned dst_rect[4], struct rwa_texture *src,
+                  const unsigned src_rect[4], char *why, size_t why_size)
+{
+   RWA_GUARD();
+   if (!dst || !src || !dst->res || !src->res) {
+      say(why, why_size, "a scaled copy with no %s", dst ? "source" : "destination");
+      return -1;
+   }
+   struct pipe_blit_info blit = {
+      /* both read as their linear formats: the frame's bytes go to the panel as they are, with no
+       * sRGB decode on one side and none to encode on the other */
+      .dst = { .resource = dst->res, .level = dst->base_level, .format = util_format_linear(dst->format),
+               .box = { .x = (int)dst_rect[0], .y = (int)dst_rect[1], .z = 0,
+                        .width = (int)dst_rect[2], .height = (int)dst_rect[3], .depth = 1 } },
+      .src = { .resource = src->res, .level = src->base_level, .format = util_format_linear(src->format),
+               .box = { .x = (int)src_rect[0], .y = (int)src_rect[1], .z = 0,
+                        .width = (int)src_rect[2], .height = (int)src_rect[3], .depth = 1 } },
+      .mask = PIPE_MASK_RGBA,
+      .filter = PIPE_TEX_FILTER_LINEAR,
+   };
+   rwa_astc_note(src->res, "scale");
+   src->device->pipe->blit(src->device->pipe, &blit);
+   return 0;
 }
 
 /*

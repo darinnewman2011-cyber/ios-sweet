@@ -1411,6 +1411,12 @@ int rwa_render_clear(struct rwa_device *device, const struct rwa_draw *draw, cha
 
 /* MTLBlitCommandEncoder: texture to texture (queued with the draws), buffer to buffer and a
  * fill (through the mappings, after what is queued), and mipmaps. 0, or -1 and a sentence. */
+/* the display panel's IOSurface as a render target (16-byte rows allowed), and a filtered scaled copy */
+struct rwa_texture *rwa_texture_from_panel(struct rwa_device *device,
+					   const struct rwa_texture_shape *shape, int surface_id,
+					   unsigned offset, unsigned row_bytes, char *why, size_t why_size);
+int rwa_texture_scale(struct rwa_texture *dst, const unsigned dst_rect[4], struct rwa_texture *src,
+		      const unsigned src_rect[4], char *why, size_t why_size);
 int rwa_texture_copy(struct rwa_texture *dst, unsigned dst_level, unsigned dst_slice,
 		     const unsigned dst_origin[3], struct rwa_texture *src, unsigned src_level,
 		     unsigned src_slice, const unsigned src_origin[3], const unsigned size[3],

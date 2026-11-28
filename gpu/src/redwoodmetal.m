@@ -553,6 +553,11 @@ static struct {
 			   char *, size_t);
 	int (*buffer_fill)(struct rwa_buffer *, size_t, size_t, unsigned, char *, size_t);
 	int (*texture_mipmaps)(struct rwa_texture *, char *, size_t);
+	/* 2026-11-28 direct display (rw_panel_*) */
+	struct rwa_texture *(*texture_from_panel)(struct rwa_device *, const struct rwa_texture_shape *, int,
+						  unsigned, unsigned, char *, size_t);
+	int (*texture_scale)(struct rwa_texture *, const unsigned[4], struct rwa_texture *, const unsigned[4],
+			     char *, size_t);
 } mesa;
 
 /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
@@ -643,6 +648,8 @@ mesa_available(void)
 	*(void **)&mesa.buffer_copy = dlsym(mesa.handle, "rwa_buffer_copy");
 	*(void **)&mesa.buffer_fill = dlsym(mesa.handle, "rwa_buffer_fill");
 	*(void **)&mesa.texture_mipmaps = dlsym(mesa.handle, "rwa_texture_mipmaps");
+	*(void **)&mesa.texture_from_panel = dlsym(mesa.handle, "rwa_texture_from_panel");
+	*(void **)&mesa.texture_scale = dlsym(mesa.handle, "rwa_texture_scale");
 	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
 	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
 		/* rwa_dispatch's arguments changed when textures were added to the contract, so
@@ -2900,6 +2907,8 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 /* a copy whose GPU writes have to go back out to its surface after the command buffer */
 - (BOOL)redwoodIsCopy;
 - (void)redwoodWriteBackCopy;
+/* the IOSurface this texture was made over (not retained for the caller), or NULL */
+- (void *)redwoodIOSurface;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
  * refuses a depth texture through it by name, so a caller that wants to know what a depth
@@ -5305,6 +5314,7 @@ rw_note_view(const struct rwa_texture_shape *from, NSUInteger format, NSUInteger
 }
 
 - (BOOL)redwoodIsCopy { return _copied && _iosurface != NULL; }
+- (void *)redwoodIOSurface { return _iosurface; }
 
 /*
  * The other direction of -redwoodRefreshCopy: what the GPU wrote into the copy, read back into
@@ -6460,6 +6470,173 @@ rw_mps_facts(id commandBuffer, id device)
 	    [commandBuffer userDictionary] != nil ? "present" : "nil");
 }
 
+/* ---- Beryllium "direct display" (2026-11-28): G8 for Metal ----------------------------------------
+ * The kernel (SweetFramebuffer.cpp) copies every frame CoreAnimation swaps into the panel with the CPU,
+ * scaled from 1125x2436 into the 1025x2220 fit rectangle (presentFit, ~10 MB a frame). libredwood-gl did
+ * this on the GPU (eagl.c, G8) and told the kernel with RedwoodMali request 0x7a, after which the kernel
+ * copies nothing for that surface. Same here: when a command buffer of backboardd's has drawn into an
+ * IOSurface of the display's logical size, the GPU scales that surface into the panel's own IOSurface
+ * (AppleCLCD SweetPanelSurface) in the same submit, and 0x7a follows the submit. Boot-arg mtlpanel=0: off. */
+static struct {
+	int asked, ready;
+	uint32_t surface;
+	unsigned x, y, w, h, lw, lh;
+	RedwoodMetalTexture *texture;
+	io_connect_t gpu;
+	unsigned frames;
+} rw_panel;
+
+static int
+rw_panel_number(io_service_t display, const char *key)
+{
+	CFStringRef name = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+	CFTypeRef value = name ? IORegistryEntryCreateCFProperty(display, name, NULL, 0) : NULL;
+	int32_t number = -1;
+
+	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+		CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, &number);
+	}
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	if (name != NULL) {
+		CFRelease(name);
+	}
+	return number;
+}
+
+static void
+rw_panel_setup(RedwoodMetalDevice *device)
+{
+	char args[1024] = "", why[256] = "";
+	size_t size = sizeof(args) - 1;
+
+	rw_panel.asked = 1;
+	if (strcmp(getprogname(), "backboardd") != 0 || mesa.texture_from_panel == NULL || mesa.texture_scale == NULL) {
+		return;
+	}
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "mtlpanel=0") != NULL) {
+		m2m_log('I', "PANEL", "panel: mtlpanel=0: the kernel copies frames\n");
+		return;
+	}
+	io_service_t display = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AppleCLCD"));
+	if (display == 0) {
+		return;
+	}
+	int sid = rw_panel_number(display, "SweetPanelSurface");
+	int x = rw_panel_number(display, "SweetFitX"), y = rw_panel_number(display, "SweetFitY");
+	int w = rw_panel_number(display, "SweetFitWidth"), h = rw_panel_number(display, "SweetFitHeight");
+	int lw = rw_panel_number(display, "SweetLogicalWidth"), lh = rw_panel_number(display, "SweetLogicalHeight");
+	IOObjectRelease(display);
+	if (sid <= 0 || x < 0 || y < 0 || w <= 0 || h <= 0 || lw <= 0 || lh <= 0) {
+		m2m_log('W', "PANEL", "panel: the display says nothing of where the panel is (surface %d, fit %d,%d %dx%d): "
+		    "the kernel copies frames\n", sid, x, y, w, h);
+		return;
+	}
+	static void *(*lookup)(uint32_t);
+	static size_t (*gw)(void *), (*gh)(void *), (*gr)(void *);
+	*(void **)&lookup = dlsym(RTLD_DEFAULT, "IOSurfaceLookup");
+	*(void **)&gw = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
+	*(void **)&gh = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+	*(void **)&gr = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+	void *ps = lookup != NULL ? lookup((uint32_t)sid) : NULL;
+	if (ps == NULL || gw == NULL || gh == NULL || gr == NULL) {
+		m2m_log('W', "PANEL", "panel: IOSurface %d cannot be looked up: the kernel copies frames\n", sid);
+		if (ps != NULL) CFRelease(ps);
+		return;
+	}
+	unsigned pw = (unsigned)gw(ps), ph = (unsigned)gh(ps), prow = (unsigned)gr(ps);
+	CFRelease(ps);
+	if ((unsigned)(x + w) > pw || (unsigned)(y + h) > ph) {
+		m2m_log('W', "PANEL", "panel: fit %d,%d %dx%d is outside the %ux%u panel\n", x, y, w, h, pw, ph);
+		return;
+	}
+	struct rwa_texture_shape shape;
+	memset(&shape, 0, sizeof(shape));
+	shape.pixel_format = MTLPixelFormatBGRA8Unorm;
+	shape.type = MTLTextureType2D;
+	shape.width = pw;
+	shape.height = ph;
+	shape.depth = 1;
+	shape.array_length = 1;
+	shape.mip_levels = 1;
+	shape.sample_count = 1;
+	shape.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	struct rwa_texture *t = mesa.texture_from_panel([device mesaDevice], &shape, sid, 0, prow, why, sizeof(why));
+	if (t == NULL) {
+		m2m_log('W', "PANEL", "panel: IOSurface %d (%ux%u, %u bytes a row) is no render target here: %s\n",
+		    sid, pw, ph, prow, why);
+		return;
+	}
+	rw_panel.texture = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:device texture:t shape:&shape];
+	io_service_t gpu = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RedwoodMali"));
+	if (rw_panel.texture == nil || gpu == 0 || IOServiceOpen(gpu, mach_task_self(), 0, &rw_panel.gpu) != KERN_SUCCESS) {
+		m2m_log('W', "PANEL", "panel: RedwoodMali cannot be opened: the kernel copies frames\n");
+		if (gpu != 0) IOObjectRelease(gpu);
+		return;
+	}
+	IOObjectRelease(gpu);
+	rw_panel.surface = (uint32_t)sid;
+	rw_panel.x = (unsigned)x; rw_panel.y = (unsigned)y; rw_panel.w = (unsigned)w; rw_panel.h = (unsigned)h;
+	rw_panel.lw = (unsigned)lw; rw_panel.lh = (unsigned)lh;
+	rw_panel.ready = 1;
+	m2m_log('I', "PANEL", "panel: IOSurface %d (%ux%u, %u bytes a row): the %dx%d frame into %d,%d %dx%d by the GPU\n",
+	    sid, pw, ph, prow, lw, lh, x, y, w, h);
+}
+
+/* Queue the scaled copy of this command buffer's display frame, if it drew one: that surface's ID, or 0. */
+static uint32_t
+rw_panel_frame(NSArray *work, RedwoodMetalDevice *device)
+{
+	if (!rw_panel.asked) {
+		rw_panel_setup(device);
+	}
+	if (!rw_panel.ready) {
+		return 0;
+	}
+	RedwoodMetalTexture *frame = nil;
+	for (RedwoodMetalWork *w in work) {
+		if ((w->render != nil || w->clearOnly) && w->colorCount > 0 &&
+		    [w->color[0] isKindOfClass:[RedwoodMetalTexture class]]) {
+			RedwoodMetalTexture *t = w->color[0];
+			if ([t redwoodIOSurface] != NULL && ![t redwoodIsCopy] && [t width] == rw_panel.lw &&
+			    [t height] == rw_panel.lh) {
+				frame = t;
+			}
+		}
+	}
+	if (frame == nil) {
+		return 0;
+	}
+	static uint32_t (*sid)(void *);
+	if (sid == NULL) {
+		*(void **)&sid = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+	}
+	uint32_t id = sid != NULL ? sid([frame redwoodIOSurface]) : 0;
+	char why[256] = "";
+	const unsigned src[4] = { 0, 0, rw_panel.lw, rw_panel.lh };
+	const unsigned dst[4] = { rw_panel.x, rw_panel.y, rw_panel.w, rw_panel.h };
+	if (id == 0 || mesa.texture_scale([rw_panel.texture mesaTexture], dst, [frame mesaTexture], src, why, sizeof(why)) != 0) {
+		m2m_log('W', "PANEL", "panel: the frame (IOSurface %u) could not be scaled into the panel: %s\n", id, why);
+		return 0;
+	}
+	return id;
+}
+
+/* After the submit that carries the scaled copy: the kernel shows that surface as the GPU put it. */
+static void
+rw_panel_tell(uint32_t surface)
+{
+	uint32_t request[2] = { surface, 0 }, answer[2];
+	size_t size = sizeof(answer);
+	kern_return_t kr = IOConnectCallStructMethod(rw_panel.gpu, 0x7a, request, sizeof(request), answer, &size);
+
+	if (rw_panel.frames++ < 3 || kr != KERN_SUCCESS) {
+		m2m_log(kr == KERN_SUCCESS ? 'I' : 'W', "PANEL", "panel: frame %u (IOSurface %u) put on the panel by the GPU (%#x)\n",
+		    rw_panel.frames, surface, kr);
+	}
+}
+
 @implementation RedwoodMetalCommandBuffer {
 	BOOL _tracing;          /* (rwm_trace) this commit is being written out */
 	RedwoodMetalCommandQueue *_queue;
@@ -7081,9 +7258,13 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 	 * while the GPU draws this one (until 25 October -commit waited for the GPU every time: 3-9 ms
 	 * of each commit, the processor and the GPU taking turns). RWM_SYNC=1: the old way.
 	 */
+	uint32_t panelFrame = queued ? rw_panel_frame(_work, [_queue device]) : 0;
 	if (queued && writeBacks == nil && mesa.submit != NULL && mesa.fence_wait != NULL && !_tracing &&
 	    !rw_sync_commits()) {
 		void *fence = mesa.submit([[_queue device] mesaDevice]);
+		if (panelFrame != 0) {
+			rw_panel_tell(panelFrame);
+		}
 		uint64_t t_end = rw_now_ns();
 
 		rw_commit_report(draws, t_end - t_start, 0, top, topn, ntop);
@@ -7100,6 +7281,9 @@ rw_commit_report(uint64_t draws, uint64_t commit_ns, uint64_t wait_ns,
 		m2m_log('E', "CMD", "the command buffer's draws did not finish: %s\n", why);
 		[self failWith:why];
 		goto done;
+	}
+	if (panelFrame != 0) {
+		rw_panel_tell(panelFrame);
 	}
 	{
 		uint64_t t_end = rw_now_ns();
