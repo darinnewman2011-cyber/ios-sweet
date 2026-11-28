@@ -6512,7 +6512,12 @@ rw_panel_setup(RedwoodMetalDevice *device)
 	size_t size = sizeof(args) - 1;
 
 	rw_panel.asked = 1;
-	if (strcmp(getprogname(), "backboardd") != 0 || mesa.texture_from_panel == NULL || mesa.texture_scale == NULL) {
+	if (strcmp(getprogname(), "backboardd") != 0) {
+		return;
+	}
+	m2m_log('I', "PANEL", "panel: setting up (library %s)\n",
+	    mesa.texture_from_panel != NULL && mesa.texture_scale != NULL ? "has the panel calls" : "LACKS the panel calls");
+	if (mesa.texture_from_panel == NULL || mesa.texture_scale == NULL) {
 		return;
 	}
 	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "mtlpanel=0") != NULL) {
@@ -6521,6 +6526,7 @@ rw_panel_setup(RedwoodMetalDevice *device)
 	}
 	io_service_t display = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AppleCLCD"));
 	if (display == 0) {
+		m2m_log('W', "PANEL", "panel: no AppleCLCD service to ask where the panel is: the kernel copies frames\n");
 		return;
 	}
 	int sid = rw_panel_number(display, "SweetPanelSurface");
@@ -6596,16 +6602,38 @@ rw_panel_frame(NSArray *work, RedwoodMetalDevice *device)
 	}
 	RedwoodMetalTexture *frame = nil;
 	for (RedwoodMetalWork *w in work) {
-		if ((w->render != nil || w->clearOnly) && w->colorCount > 0 &&
-		    [w->color[0] isKindOfClass:[RedwoodMetalTexture class]]) {
-			RedwoodMetalTexture *t = w->color[0];
-			if ([t redwoodIOSurface] != NULL && ![t redwoodIsCopy] && [t width] == rw_panel.lw &&
-			    [t height] == rw_panel.lh) {
-				frame = t;
+		if ((w->render != nil || w->clearOnly) && w->colorCount > 0) {
+			for (unsigned i = 0; i < w->colorCount && i < 8; i++) {
+				if (![w->color[i] isKindOfClass:[RedwoodMetalTexture class]]) {
+					continue;
+				}
+				RedwoodMetalTexture *t = w->color[i];
+				if ([t redwoodIOSurface] != NULL && ![t redwoodIsCopy] && [t width] == rw_panel.lw &&
+				    [t height] == rw_panel.lh) {
+					frame = t;
+				}
 			}
 		}
 	}
 	if (frame == nil) {
+		/* the first few command buffers that drew without a display frame: what their targets were */
+		static unsigned told;
+		if (told < 6) {
+			for (RedwoodMetalWork *w in work) {
+				if ((w->render != nil || w->clearOnly) && w->colorCount > 0 && told < 6) {
+					for (unsigned i = 0; i < w->colorCount && i < 8; i++) {
+						id c = w->color[i];
+						if ([c isKindOfClass:[RedwoodMetalTexture class]]) {
+							RedwoodMetalTexture *t = c;
+							m2m_log('I', "PANEL", "panel: not a display frame: colour %u %lux%lu surface %p copy %d\n", i,
+							    (unsigned long)[t width], (unsigned long)[t height], [t redwoodIOSurface],
+							    (int)[t redwoodIsCopy]);
+						}
+					}
+					told++;
+				}
+			}
+		}
 		return 0;
 	}
 	static uint32_t (*sid)(void *);
